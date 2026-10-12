@@ -4,7 +4,7 @@ WoWBridge brings the look and feel of vanilla World of Warcraft into Skyrim Spec
 
 The current build is for early testing. The default character is a night elf druid. There are working spells, forms, talents, equipment previews, bags, ground mounts and a WoW-style minimap. Skyrim's dialogue and merchant menus handle conversations and trade.
 
-The project has been tested on Linux through Proton. Installation and gameplay on native Windows still need independent testing.
+The project has been tested on Linux through Proton and Windows 11.
 
 Much of the code is AI-generated. This project is for testing purposes only.<br>
 No level of performance is warranted or guaranteed.
