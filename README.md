@@ -12,13 +12,14 @@ No level of performance is warranted or guaranteed.
 ## Requirements
 
 Download and install these yourself before running setup. Setup uses existing local files and makes no network requests.
+None of these files are provided, sponsored, nor hosted by me. Download at your own risk.
 
 | Requirement | Version or files needed |
 | --- | --- |
 | [Skyrim Special Edition](https://store.steampowered.com/app/489830/The_Elder_Scrolls_V_Skyrim_Special_Edition/) | The current build targets runtime **1.7.104.0**. Other runtimes have not been verified. |
 | [Skyrim Script Extender, SKSE64](https://skse.silverlock.org/) | **2.3.1**, installed for that Skyrim runtime. Setup checks for its loader and runtime DLL. |
 | [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444?tab=files) | The matching library containing `versionlib-1-7-104-0.bin`. |
-| World of Warcraft vanilla client | **1.12.1, build 5875**, enUS. Supply your own existing installation, keeping `WoW.exe` and `Data` together. |
+| [World of Warcraft vanilla client](https://archive.org/details/WoW_1.12.1-5875) | **1.12.1, build 5875**, enUS. Supply your own existing installation, keeping `WoW.exe` and `Data` together. |
 | [CMaNGOS Classic source ZIP](https://github.com/cmangos/mangos-classic/archive/8ec338a1704e7dcb1c0213eb7ed58f9231ade40f.zip) | The pinned source version described below, extracted into a local folder. |
 | [Visual C++ runtime, x64 download](https://aka.ms/vc14/vc_redist.x64.exe) | Microsoft Visual C++ v14 Redistributable. See [Microsoft's download page](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist). |
 | [Python for Windows](https://www.python.org/downloads/windows/) or [other platforms](https://www.python.org/downloads/) | **3.10 or newer**. No additional Python packages are needed to play. |
