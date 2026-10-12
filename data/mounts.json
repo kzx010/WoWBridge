@@ -1,0 +1,240 @@
+{
+  "version": 1,
+  "source": {
+    "spell_sha256": "913d01c0376d88310ed4a44ea1115f30fd8be15af64ce304f4f17b6bc51cf15b",
+    "classicdb_sha256": "4f92db520868ab4e566726f68b5b2e380ae781209beaf22237b4f7f04600d0c0"
+  },
+  "mounts": [
+    {
+      "key": "swift_mistsaber",
+      "spell": 23219,
+      "name": "Swift Mistsaber",
+      "creature": 14555,
+      "display": 14332,
+      "model": "Creature\\FrostSabre\\PVPRidingFrostSabre.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_BlackPanther"
+    },
+    {
+      "key": "swift_dawnsaber",
+      "spell": 23220,
+      "name": "Swift Dawnsaber",
+      "creature": 14557,
+      "display": 14329,
+      "model": "Creature\\FrostSabre\\PVPRidingFrostSabre.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_JungleTiger"
+    },
+    {
+      "key": "swift_frostsaber",
+      "spell": 23221,
+      "name": "Swift Frostsaber",
+      "creature": 14556,
+      "display": 14331,
+      "model": "Creature\\FrostSabre\\PVPRidingFrostSabre.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_WhiteTiger"
+    },
+    {
+      "key": "swift_yellow_mechanostrider",
+      "spell": 23222,
+      "name": "Swift Yellow Mechanostrider",
+      "creature": 14551,
+      "display": 14377,
+      "model": "Creature\\MechaStrider\\PvPMechaStrider.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_MechaStrider"
+    },
+    {
+      "key": "swift_white_mechanostrider",
+      "spell": 23223,
+      "name": "Swift White Mechanostrider",
+      "creature": 14552,
+      "display": 14376,
+      "model": "Creature\\MechaStrider\\PvPMechaStrider.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_MechaStrider"
+    },
+    {
+      "key": "swift_green_mechanostrider",
+      "spell": 23225,
+      "name": "Swift Green Mechanostrider",
+      "creature": 14553,
+      "display": 14374,
+      "model": "Creature\\MechaStrider\\PvPMechaStrider.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_MechaStrider"
+    },
+    {
+      "key": "swift_palomino",
+      "spell": 23227,
+      "name": "Swift Palomino",
+      "creature": 14559,
+      "display": 14582,
+      "model": "Creature\\RidingHorse\\RidingHorsePvPT2.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_RidingHorse"
+    },
+    {
+      "key": "swift_white_steed",
+      "spell": 23228,
+      "name": "Swift White Steed",
+      "creature": 14560,
+      "display": 14338,
+      "model": "Creature\\RidingHorse\\RidingHorsePvPT2.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_RidingHorse"
+    },
+    {
+      "key": "swift_brown_steed",
+      "spell": 23229,
+      "name": "Swift Brown Steed",
+      "creature": 14561,
+      "display": 14583,
+      "model": "Creature\\RidingHorse\\RidingHorsePvPT2.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_RidingHorse"
+    },
+    {
+      "key": "swift_brown_ram",
+      "spell": 23238,
+      "name": "Swift Brown Ram",
+      "creature": 14546,
+      "display": 14347,
+      "model": "Creature\\Ram\\PVPRidingRam.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_MountainRam"
+    },
+    {
+      "key": "swift_gray_ram",
+      "spell": 23239,
+      "name": "Swift Gray Ram",
+      "creature": 14548,
+      "display": 14576,
+      "model": "Creature\\Ram\\PVPRidingRam.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_MountainRam"
+    },
+    {
+      "key": "swift_white_ram",
+      "spell": 23240,
+      "name": "Swift White Ram",
+      "creature": 14547,
+      "display": 14346,
+      "model": "Creature\\Ram\\PVPRidingRam.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_MountainRam"
+    },
+    {
+      "key": "swift_blue_raptor",
+      "spell": 23241,
+      "name": "Swift Blue Raptor",
+      "creature": 14545,
+      "display": 14339,
+      "model": "Creature\\RidingRaptor\\PvPRidingRaptor.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Raptor"
+    },
+    {
+      "key": "swift_olive_raptor",
+      "spell": 23242,
+      "name": "Swift Olive Raptor",
+      "creature": 14543,
+      "display": 14344,
+      "model": "Creature\\RidingRaptor\\PvPRidingRaptor.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Raptor"
+    },
+    {
+      "key": "swift_orange_raptor",
+      "spell": 23243,
+      "name": "Swift Orange Raptor",
+      "creature": 14544,
+      "display": 14342,
+      "model": "Creature\\RidingRaptor\\PvPRidingRaptor.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Raptor"
+    },
+    {
+      "key": "purple_skeletal_warhorse",
+      "spell": 23246,
+      "name": "Purple Skeletal Warhorse",
+      "creature": 14558,
+      "display": 10721,
+      "model": "Creature\\MountedDeathKnight\\RidingUndeadWarHorse.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Undeadhorse"
+    },
+    {
+      "key": "great_white_kodo",
+      "spell": 23247,
+      "name": "Great White Kodo",
+      "creature": 14542,
+      "display": 14349,
+      "model": "Creature\\Kodobeast\\KodoBeastPvPT2.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Kodo_01"
+    },
+    {
+      "key": "great_gray_kodo",
+      "spell": 23248,
+      "name": "Great Gray Kodo",
+      "creature": 14550,
+      "display": 14579,
+      "model": "Creature\\Kodobeast\\KodoBeastPvPT2.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Kodo_01"
+    },
+    {
+      "key": "great_brown_kodo",
+      "spell": 23249,
+      "name": "Great Brown Kodo",
+      "creature": 14549,
+      "display": 14578,
+      "model": "Creature\\Kodobeast\\KodoBeastPvPT2.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Kodo_03"
+    },
+    {
+      "key": "swift_brown_wolf",
+      "spell": 23250,
+      "name": "Swift Brown Wolf",
+      "creature": 14540,
+      "display": 14573,
+      "model": "Creature\\DireWolf\\PvPRidingDireWolf.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_BlackDireWolf"
+    },
+    {
+      "key": "swift_timber_wolf",
+      "spell": 23251,
+      "name": "Swift Timber Wolf",
+      "creature": 14539,
+      "display": 14575,
+      "model": "Creature\\DireWolf\\PvPRidingDireWolf.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_WhiteDireWolf"
+    }
+  ]
+}

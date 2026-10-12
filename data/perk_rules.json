@@ -1,0 +1,1132 @@
+{
+  "rules": [
+    {
+      "perks": {
+        "DestructionNovice00": 1
+      },
+      "select": {
+        "skill": "destruction",
+        "tier": 0,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "DestructionApprentice25": 1
+      },
+      "select": {
+        "skill": "destruction",
+        "tier": 1,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "DestructionAdept50": 1
+      },
+      "select": {
+        "skill": "destruction",
+        "tier": 2,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "DestructionExpert75": 1
+      },
+      "select": {
+        "skill": "destruction",
+        "tier": 3,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "DestructionMaster100": 1
+      },
+      "select": {
+        "skill": "destruction",
+        "tier": 4,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "RestorationNovice00": 1
+      },
+      "select": {
+        "skill": "restoration",
+        "tier": 0,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "RestorationApprentice25": 1
+      },
+      "select": {
+        "skill": "restoration",
+        "tier": 1,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "RestorationAdept50": 1
+      },
+      "select": {
+        "skill": "restoration",
+        "tier": 2,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "RestorationExpert75": 1
+      },
+      "select": {
+        "skill": "restoration",
+        "tier": 3,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "RestorationMaster100": 1
+      },
+      "select": {
+        "skill": "restoration",
+        "tier": 4,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "AlterationNovice00": 1
+      },
+      "select": {
+        "skill": "alteration",
+        "tier": 0,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "AlterationApprentice25": 1
+      },
+      "select": {
+        "skill": "alteration",
+        "tier": 1,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "AlterationAdept50": 1
+      },
+      "select": {
+        "skill": "alteration",
+        "tier": 2,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "AlterationExpert75": 1
+      },
+      "select": {
+        "skill": "alteration",
+        "tier": 3,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "AlterationMaster100": 1
+      },
+      "select": {
+        "skill": "alteration",
+        "tier": 4,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "IllusionNovice00": 1
+      },
+      "select": {
+        "skill": "illusion",
+        "tier": 0,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "IllusionApprentice25": 1
+      },
+      "select": {
+        "skill": "illusion",
+        "tier": 1,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "IllusionAdept50": 1
+      },
+      "select": {
+        "skill": "illusion",
+        "tier": 2,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "IllusionExpert75": 1
+      },
+      "select": {
+        "skill": "illusion",
+        "tier": 3,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "IllusionMaster100": 1
+      },
+      "select": {
+        "skill": "illusion",
+        "tier": 4,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "ConjurationNovice00": 1
+      },
+      "select": {
+        "skill": "conjuration",
+        "tier": 0,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "ConjurationApprentice25": 1
+      },
+      "select": {
+        "skill": "conjuration",
+        "tier": 1,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "ConjurationAdept50": 1
+      },
+      "select": {
+        "skill": "conjuration",
+        "tier": 2,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "ConjurationExpert75": 1
+      },
+      "select": {
+        "skill": "conjuration",
+        "tier": 3,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "ConjurationMaster100": 1
+      },
+      "select": {
+        "skill": "conjuration",
+        "tier": 4,
+        "mana": true
+      },
+      "mods": {
+        "14": -50
+      },
+      "reason": "Halve only the matching school and tier, as the vanilla casting-perk condition does."
+    },
+    {
+      "perks": {
+        "AugmentedFlames": 25,
+        "AugmentedFlames60": 50
+      },
+      "select": {
+        "school": 2,
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Elemental damage, including periodic damage; WoW Nature is the lightning counterpart. Highest rank replaces its predecessor."
+    },
+    {
+      "perks": {
+        "AugmentedFrost": 25,
+        "AugmentedFrost60": 50
+      },
+      "select": {
+        "school": 4,
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Elemental damage, including periodic damage; WoW Nature is the lightning counterpart. Highest rank replaces its predecessor."
+    },
+    {
+      "perks": {
+        "AugmentedShock": 25,
+        "AugmentedShock60": 50
+      },
+      "select": {
+        "school": 3,
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Elemental damage, including periodic damage; WoW Nature is the lightning counterpart. Highest rank replaces its predecessor."
+    },
+    {
+      "perks": {
+        "Regeneration": 50
+      },
+      "select": {
+        "role": "heal",
+        "exclude_chains": [
+          18562
+        ]
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Healing magnitude, including periodic and channel healing, is 50% stronger. Swiftmend consumes already-modified HoT ticks and inherits this bonus without applying it again."
+    },
+    {
+      "perks": {
+        "Respite": 1
+      },
+      "select": {
+        "role": "heal"
+      },
+      "mods": {},
+      "reason": "Restore Skyrim stamina equal to the converted healing amount, on the healed target.",
+      "finish": "respite"
+    },
+    {
+      "perks": {
+        "Stability": 50
+      },
+      "select": {
+        "skill": "alteration",
+        "lasting": true
+      },
+      "mods": {
+        "1": "rank"
+      },
+      "reason": "Extend Alteration utility and protective auras by 50%; do not extend destructive spells or forms with indefinite duration."
+    },
+    {
+      "perks": {
+        "MageArmor30": 100,
+        "MageArmor50": 150,
+        "MageArmor70": 200
+      },
+      "select": {
+        "role": "armor_ward"
+      },
+      "mods": {
+        "8": "rank"
+      },
+      "reason": "Double / 2.5x / triple positive magical armor while wearing no light or heavy armor; never amplify stats or resistance effects.",
+      "condition": "unarmored",
+      "effect_role": "armor"
+    },
+    {
+      "perks": {
+        "Armsman00": 20,
+        "Armsman20": 40,
+        "Armsman40": 60,
+        "Armsman60": 80,
+        "Armsman80": 100
+      },
+      "select": {
+        "skill": "one_handed",
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Scale damaging abilities of the class line; white attacks follow the actual weapon skill (feral follows One-handed).",
+      "white": true
+    },
+    {
+      "perks": {
+        "Barbarian00": 20,
+        "Barbarian20": 40,
+        "Barbarian40": 60,
+        "Barbarian60": 80,
+        "Barbarian80": 100
+      },
+      "select": {
+        "skill": "two_handed",
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Scale damaging abilities of the class line; white attacks follow the actual weapon skill (feral follows One-handed).",
+      "white": true
+    },
+    {
+      "perks": {
+        "Overdraw00": 20,
+        "Overdraw20": 40,
+        "Overdraw40": 60,
+        "Overdraw60": 80,
+        "Overdraw80": 100
+      },
+      "select": {
+        "skill": "archery",
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Scale damaging abilities of the class line; white attacks follow the actual weapon skill (feral follows One-handed).",
+      "white": true
+    },
+    {
+      "perks": {
+        "Bladesman30": 1,
+        "Bladesman60": 2,
+        "Bladesman90": 3
+      },
+      "select": {
+        "skill": "one_handed",
+        "role": "direct_attack"
+      },
+      "mods": {
+        "7": [
+          10,
+          15,
+          20
+        ],
+        "15": [
+          0,
+          25,
+          50
+        ]
+      },
+      "reason": "Translate the weapon critical proc to WoW critical chance +10/15/20 points and critical bonus +0/25/50%, using the class line rather than Skyrim weapon material.",
+      "white": true
+    },
+    {
+      "perks": {
+        "DeepWounds30": 1,
+        "DeepWounds60": 2,
+        "DeepWounds90": 3
+      },
+      "select": {
+        "skill": "two_handed",
+        "role": "direct_attack"
+      },
+      "mods": {
+        "7": [
+          10,
+          15,
+          20
+        ],
+        "15": [
+          0,
+          25,
+          50
+        ]
+      },
+      "reason": "Translate the weapon critical proc to WoW critical chance +10/15/20 points and critical bonus +0/25/50%, using the class line rather than Skyrim weapon material.",
+      "white": true
+    },
+    {
+      "perks": {
+        "CriticalShot30": 1,
+        "CriticalShot60": 2,
+        "CriticalShot90": 3
+      },
+      "select": {
+        "skill": "archery",
+        "role": "direct_attack"
+      },
+      "mods": {
+        "7": [
+          10,
+          15,
+          20
+        ],
+        "15": [
+          0,
+          25,
+          50
+        ]
+      },
+      "reason": "Translate the weapon critical proc to WoW critical chance +10/15/20 points and critical bonus +0/25/50%, using the class line rather than Skyrim weapon material.",
+      "white": true
+    },
+    {
+      "perks": {
+        "FightingStance": 1
+      },
+      "select": {
+        "skill": "one_handed",
+        "role": "direct_attack"
+      },
+      "mods": {
+        "14": -25
+      },
+      "reason": "WoW offensive weapon abilities are the stamina-spending power-attack counterpart: 25% less rage/energy/mana cost; exclude utility."
+    },
+    {
+      "perks": {
+        "ChampionsStance": 1
+      },
+      "select": {
+        "skill": "two_handed",
+        "role": "direct_attack"
+      },
+      "mods": {
+        "14": -25
+      },
+      "reason": "WoW offensive weapon abilities are the stamina-spending power-attack counterpart: 25% less rage/energy/mana cost; exclude utility."
+    },
+    {
+      "perks": {
+        "SavageStrike": 25
+      },
+      "select": {
+        "skill": "one_handed",
+        "role": "heavy_attack"
+      },
+      "mods": {
+        "0": "rank"
+      },
+      "reason": "Heavy strikes receive the 25% standing power-attack damage bonus; no decapitation in the WoW protocol."
+    },
+    {
+      "perks": {
+        "DevastatingBlow": 25
+      },
+      "select": {
+        "skill": "two_handed",
+        "role": "heavy_attack"
+      },
+      "mods": {
+        "0": "rank"
+      },
+      "reason": "Heavy strikes receive the 25% standing power-attack damage bonus; no decapitation in the WoW protocol."
+    },
+    {
+      "perks": {
+        "HackAndSlash30": 1,
+        "HackAndSlash60": 2,
+        "HackAndSlash90": 3
+      },
+      "select": {
+        "skill": "one_handed",
+        "role": "bleed"
+      },
+      "mods": {
+        "22": [
+          25,
+          50,
+          75
+        ]
+      },
+      "reason": "Translate the material-dependent axe bleed proc to +25/50/75% existing physical bleed ticks; no extra proc or invented weapon material."
+    },
+    {
+      "perks": {
+        "Limbsplitter30": 1,
+        "Limbsplitter60": 2,
+        "Limbsplitter90": 3
+      },
+      "select": {
+        "skill": "two_handed",
+        "role": "bleed"
+      },
+      "mods": {
+        "22": [
+          25,
+          50,
+          75
+        ]
+      },
+      "reason": "Translate the material-dependent axe bleed proc to +25/50/75% existing physical bleed ticks; no extra proc or invented weapon material."
+    },
+    {
+      "perks": {
+        "Backstab": 100
+      },
+      "select": {
+        "role": "stealth_attack"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Double stealth opener damage (Ravage, Shred, Pounce; Ambush, Backstab, Garrote, Cheap Shot where damaging).",
+      "condition": "stealthed",
+      "stack_group": "stealth_melee"
+    },
+    {
+      "perks": {
+        "AssassinsBlade": 400
+      },
+      "select": {
+        "role": "stealth_attack"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Vanilla dagger total is 6 x 2.5 = 15 versus 3 unperked: translate to 5x opener damage. Replaces Backstab rather than multiplying twice.",
+      "condition": "stealthed",
+      "stack_group": "stealth_melee"
+    },
+    {
+      "perks": {
+        "DeadlyAim": 50
+      },
+      "select": {
+        "skill": "archery",
+        "role": "damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Vanilla bow sneak bonus multiplier 1.5 becomes 50% more damaging shots from stealth.",
+      "condition": "stealthed"
+    },
+    {
+      "perks": {
+        "ShieldWall00": 10,
+        "ShieldWall20": 20,
+        "ShieldWall40": 30,
+        "ShieldWall60": 40,
+        "ShieldWall80": 50
+      },
+      "select": {
+        "skill": "block",
+        "role": "armor_ward"
+      },
+      "mods": {
+        "8": "rank"
+      },
+      "reason": "Improve protective Block-line armor wards (e.g. Devotion Aura). Native shield blocking remains Skyrim-owned.",
+      "effect_role": "armor"
+    },
+    {
+      "perks": {
+        "DeadlyBash": 400
+      },
+      "select": {
+        "skill": "block",
+        "role": "bash"
+      },
+      "mods": {
+        "0": "rank"
+      },
+      "reason": "Fivefold damage to Shield Bash/Shield Slam, not interrupts or dispels; native shield-bash damage is not replayed."
+    },
+    {
+      "perks": {
+        "Alchemist00": 20,
+        "Alchemist20": 40,
+        "Alchemist40": 60,
+        "Alchemist60": 80,
+        "Alchemist80": 100
+      },
+      "select": {
+        "skill": "alchemy",
+        "role": "poison_damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Amplify damaging WoW poison effects only, not all Assassination attacks or poison recipe item counts."
+    },
+    {
+      "perks": {
+        "Poisoner": 25
+      },
+      "select": {
+        "skill": "alchemy",
+        "role": "poison_damage"
+      },
+      "mods": {
+        "0": "rank",
+        "22": "rank"
+      },
+      "reason": "Damaging poisons gain 25%, sharing the additive WoW spell-mod pool with Alchemist and talents."
+    }
+  ],
+  "roles": {
+    "stealth_attack": [
+      53,
+      703,
+      1833,
+      8676,
+      5221,
+      6785,
+      9005
+    ],
+    "heavy_attack": [
+      1464,
+      12294,
+      2098,
+      8676,
+      6807,
+      5221,
+      6785,
+      22568
+    ],
+    "bash": [
+      72,
+      23922
+    ]
+  },
+  "code_links": {
+    "22842": [
+      22845
+    ]
+  },
+  "dispositions": [
+    {
+      "perks": [
+        "AlterationDualCasting",
+        "ConjurationDualCasting",
+        "DestructionDualCasting",
+        "IllusionDualCasting",
+        "RestorationDualCasting"
+      ],
+      "status": "no analogue",
+      "reason": "WoW has one cast and GCD, with no two-hand spell composition or dual-cast resource surcharge. No extra potency, duration, or cost is invented."
+    },
+    {
+      "perks": [
+        "Recovery30",
+        "Recovery50"
+      ],
+      "status": "native",
+      "reason": "PERK adds PerkMagickaRecovery1/2 abilities (006C3D0/006C3D1), whose EFIT magnitudes are +25/+50 magicka regeneration. Skyrim already regenerates the magicka spent on WoW spells; do not add a second service regen bonus."
+    },
+    {
+      "perks": [
+        "AvoidDeath"
+      ],
+      "status": "native",
+      "reason": "PERK adds PerkAvoidDeathAbility (00A3F65) and its native death-ward script. WoW damage/heals change real Skyrim health, so the same emergency-heal ability observes it; there is no service-owned incoming-damage/day timer to duplicate."
+    },
+    {
+      "perks": [
+        "Necromage"
+      ],
+      "status": "native",
+      "reason": "Target Undead/vampire conditions on ModSpellMagnitude (+25%) and ModSpellDuration (+50%) can match keyword-free carrier spells. Leave these entry points to Skyrim; adding the same service modifiers would double-apply. Service amounts/timers are before this native target-only adjustment."
+    },
+    {
+      "perks": [
+        "wardAbsorb"
+      ],
+      "status": "no analogue",
+      "reason": "Ward Absorb changes incoming ward magicka absorption. WoW Power Word: Shield absorbs health damage, not spell magicka, and the plugin has no ward-collision event; do not turn shield healing into resource generation."
+    },
+    {
+      "perks": [
+        "MagicResistance30",
+        "MagicResistance50",
+        "MagicResistance70",
+        "atronach"
+      ],
+      "status": "native",
+      "reason": "PERK grants native spell absorption (30%) or magic resistance (+10/+20/+30). Incoming Skyrim magic already uses these defenses. They do not increase outgoing WoW spells, and health carriers intentionally skip a second resist/absorb roll."
+    },
+    {
+      "perks": [
+        "QuietCasting"
+      ],
+      "status": "native",
+      "reason": "The unconditional Skyrim casting-sound entry point already makes native carrier casts silent for detection. WoW audiovisual effects are presentation; damaging an actor still provokes combat. Do not invent a threat reduction or invisibility modifier."
+    },
+    {
+      "perks": [
+        "Animage",
+        "AspectOfTerror",
+        "HypnoticGaze",
+        "KindredMage",
+        "MasterOfTheMind",
+        "Rage"
+      ],
+      "status": "no analogue",
+      "reason": "These adjust Illusion target-level caps or permit new creature types. Classic fear/sleep/charm have explicit target masks and resistance, not Skyrim level-cap magnitudes. Preserve those rules rather than changing durations or allowing forbidden targets. Hibernate remains the class-data Alteration utility override."
+    },
+    {
+      "perks": [
+        "RuneMaster"
+      ],
+      "status": "no analogue",
+      "reason": "Requires a placed-rune range entry point. Hurricane is a channeled storm; Hunter traps are a different progression line and require trap ownership/placement mechanics. No class spell is treated as a Skyrim rune."
+    },
+    {
+      "perks": [
+        "DeepFreeze",
+        "Disintegrate",
+        "Impact",
+        "IntenseFlames"
+      ],
+      "status": "no analogue",
+      "reason": "These are linked elemental critical-health/dual-cast secondary effects. The current combat protocol has no post-hit health fraction, disintegration, or dual-cast state; adding automatic fear, paralysis, execution or stagger to ordinary WoW hits would change their spell mechanics."
+    },
+    {
+      "perks": [
+        "Atromancy",
+        "DarkSouls",
+        "ElementalPotency",
+        "MysticBinding",
+        "Necromancy",
+        "OblivionBinding",
+        "SoulStealer",
+        "Summoner30",
+        "Summoner70",
+        "TwinSouls"
+      ],
+      "status": "no analogue",
+      "reason": "These require summoned/reanimated actor duration, health, count, bound-weapon identity, soul capture, or summon placement. The plugin has no pet/summoned-actor lifecycle. Rebirth revives an existing ally permanently, and forms transform the caster; neither is a temporary summon. Conjuration cost perks still affect the class line."
+    },
+    {
+      "perks": [
+        "BoneBreaker30",
+        "BoneBreaker60",
+        "BoneBreaker90",
+        "Skullcrusher30",
+        "Skullcrusher60",
+        "Skullcrusher90"
+      ],
+      "status": "no analogue",
+      "reason": "Native mace-specific armor penetration requires weapon identity. Feral attacks have no mace material/subtype, and the service spell-mod protocol has no armor-penetration op. Preserve target armor rather than reinterpreting penetration as arbitrary flat damage."
+    },
+    {
+      "perks": [
+        "CriticalCharge",
+        "GreatCriticalCharge"
+      ],
+      "status": "no analogue",
+      "reason": "Needs sprint power-attack state and its critical proc. WoW Charge/Feral Charge are movement/control and have no corresponding critical weapon strike; no damage or crit is invented."
+    },
+    {
+      "perks": [
+        "DualFlurry30",
+        "DualFlurry50",
+        "DualSavagery",
+        "ParalyzingStrike",
+        "Sweep",
+        "Warmaster"
+      ],
+      "status": "no analogue",
+      "reason": "Requires backwards/sprinting/dual-wield power attacks, swing speed, paralysis or multi-target hit events absent from the class casting protocol. Existing Swipe/Whirlwind target counts and cast/attack timings remain their WoW values."
+    },
+    {
+      "perks": [
+        "BlockRunner",
+        "DeflectArrows",
+        "DisarmingBash",
+        "ElementalProtection",
+        "PowerBashPerk",
+        "QuickReflexes",
+        "ShieldCharge"
+      ],
+      "status": "native",
+      "reason": "These belong to actual Skyrim shield use, projectile deflection, elemental blocking, movement, disarm/stagger and slow time. Native blocking keeps them; WoW Shield Bash is an interrupt and Shield Wall is percentage mitigation, not those physical shield events."
+    },
+    {
+      "perks": [
+        "Bullseye",
+        "EagleEye30",
+        "HuntersDiscipline",
+        "PowerShot",
+        "QuickShot",
+        "Ranger",
+        "SteadyHand40",
+        "SteadyHand60"
+      ],
+      "status": "native",
+      "reason": "Native bow zoom/slow time, draw speed, stagger/paralysis, arrow recovery and aiming movement stay in Skyrim. There is no WoW ammunition/draw/aim event in the plugin; do not change spell cooldowns, ranges or apply a bow proc twice."
+    },
+    {
+      "perks": [
+        "LightFoot",
+        "MuffledMovement",
+        "ShadowWarrior",
+        "Silence",
+        "SilentRoll",
+        "Stealth00",
+        "Stealth20",
+        "Stealth40",
+        "Stealth60",
+        "Stealth80"
+      ],
+      "status": "native",
+      "reason": "Prowl/Shadowmeld use real Skyrim sneak and detection. Native sneak skill, movement noise, traps, rolls and combat hide already apply there; do not turn detection percentages into extra damage, spell cost or a second stealth aura."
+    },
+    {
+      "perks": [
+        "Benefactor",
+        "ConcentratedPoison",
+        "Experimenter50",
+        "Experimenter70",
+        "Experimenter90",
+        "GreenThumb",
+        "Physician",
+        "Purity",
+        "Snakeblood"
+      ],
+      "status": "native",
+      "reason": "These improve crafted restoration potions, beneficial potion effects, ingredient knowledge, poison resistance, purity, weapon poison doses or harvesting. WoW heal spells are not brewed potions. Recipe casts only create items; current casting has no consumable-dose/inventory crafting event to multiply. Snakeblood already affects real Skyrim incoming poison."
+    },
+    {
+      "perks": [
+        "AgileDefender00",
+        "AgileDefender20",
+        "AgileDefender40",
+        "AgileDefender60",
+        "AgileDefender80",
+        "CustomFit",
+        "DeftMovement",
+        "MatchingSet",
+        "Unhindered",
+        "WindWalker"
+      ],
+      "status": "native",
+      "reason": "Native worn-light-armor rating, matching/full-set checks, weight, stamina regeneration and hit avoidance already belong to Skyrim equipment. Mark/Barkskin/form armor are magical effects, not worn armor pieces; do not multiply them with equipment-only perks."
+    },
+    {
+      "perks": [
+        "Conditioning",
+        "Cushioned",
+        "FistsOfSteel",
+        "Juggernaut00",
+        "Juggernaut20",
+        "Juggernaut40",
+        "Juggernaut60",
+        "Juggernaut80",
+        "MatchingSetHeavy",
+        "ReflectBlows",
+        "TowerOfStrength",
+        "WellFitted"
+      ],
+      "status": "native",
+      "reason": "Native worn-heavy-armor rating, matching/full-set checks, weight, unarmed gauntlets, fall/stagger mitigation and reflected blows belong to Skyrim equipment/events. Feral paws are service attacks, not native gauntlet punches; no additional outgoing spell multiplier is implied."
+    },
+    {
+      "perks": [
+        "CorpusEnchanter",
+        "Enchanter00",
+        "Enchanter20",
+        "Enchanter40",
+        "Enchanter60",
+        "Enchanter80",
+        "ExtraEffect",
+        "FireEnchanter",
+        "FrostEnchanter",
+        "InsightfulEnchanter",
+        "SoulSiphon",
+        "SoulSqueezer",
+        "StormEnchanter"
+      ],
+      "status": "native",
+      "reason": "These affect actual enchantment crafting, charges, soul capture and enchantment slots. Mark, Thorns and shaman imbues are temporary spell auras, not crafted Skyrim enchantments; do not grant them Enchanter potency or extra slots. Native enchanted items keep their normal perk-built values."
+    },
+    {
+      "perks": [
+        "AdvancedArmors",
+        "ArcaneBlacksmith",
+        "DaedricSmithing",
+        "DragonArmor",
+        "DwarvenSmithing",
+        "EbonySmithing",
+        "ElvenSmithing",
+        "GlassSmithing",
+        "OrcishSmithing",
+        "SteelSmithing"
+      ],
+      "status": "native",
+      "reason": "Material crafting/tempering and enchanting-item repair affect actual Skyrim equipment, not WoW spell magnitudes. The service never manufactures weapon stats from a smithing perk."
+    },
+    {
+      "perks": [
+        "AdeptLocks50",
+        "ApprenticeLocks25",
+        "ExpertLocks75",
+        "GoldenTouch",
+        "Locksmith",
+        "MasterLocks100",
+        "NoviceLocks00",
+        "QuickHands",
+        "TreasureHunter",
+        "Unbreakable",
+        "WaxKey"
+      ],
+      "status": "native",
+      "reason": "Lock difficulty, sweet spots, picks, loot and keys belong to the Skyrim lock interface. Knowing WoW Pick Lock neither bypasses Skyrim locks nor supplies a lock minigame result; no cost/damage spell modifier fits."
+    },
+    {
+      "perks": [
+        "Cutpurse",
+        "ExtraPockets",
+        "KeyMaster",
+        "LightFingers00",
+        "LightFingers20",
+        "LightFingers40",
+        "LightFingers60",
+        "LightFingers80",
+        "Misdirection",
+        "NightThief",
+        "PerfectTouch",
+        "Poisoned"
+      ],
+      "status": "native",
+      "reason": "The native theft interface owns success, worn-item stealing, keys, capacity and reverse-pickpocket poisoning. WoW Pick Pocket does not implement that inventory/crime operation; no combat modifier fits."
+    },
+    {
+      "perks": [
+        "Allure",
+        "Bribery",
+        "Haggling00",
+        "Haggling20",
+        "Haggling40",
+        "Haggling60",
+        "Haggling80",
+        "Intimidation",
+        "Investor",
+        "MasterTrader",
+        "Merchant",
+        "Persuasion",
+        "fence"
+      ],
+      "status": "native",
+      "reason": "Native buying/selling, persuasion, bribery, investment and stolen-goods rules own these benefits. Combat taunts/fears are not vendor prices or dialogue skill checks."
+    }
+  ]
+}

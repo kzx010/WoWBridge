@@ -1,0 +1,7 @@
+## Interface: 11200
+## Title: WBOracle
+## Notes: WoWBridge reference recorder (combat log, stats and API answers into SavedVariables)
+## SavedVariables: WBOracleDB, WBOracleAPI, WBOracleEvents
+WBOracleProbes.lua
+WBOracle.lua
+WBFidelity.lua

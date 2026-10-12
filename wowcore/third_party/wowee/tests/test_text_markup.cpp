@@ -1,0 +1,389 @@
+// The inline markup a label carries: colour, links, line breaks, textures.
+//
+// The case that made this a file of its own: |Hitem:3299|h[Fractured Canine]|h
+// drew as nothing at all. The parser skipped from the opening marker to the
+// next bar - which is the |h *before* the display text - and then skipped
+// again from there to the |h after it, so the name between them went with the
+// payload. "You receive loot: [Fractured Canine]." rendered as "You receive
+// loot: ." on every FrameXML surface that draws a link, which is the loot
+// stream, quest rewards, achievement text and every tooltip carrying one.
+//
+// It went unnoticed because the function lived inside widget_renderer.cpp with
+// ImGui, where nothing could reach it.
+#include "catch_amalgamated.hpp"
+#include "ui/text_markup.hpp"
+
+#include <string>
+
+using wowee::ui::parseMarkup;
+using wowee::ui::WrapRun;
+using wowee::ui::caretStepLeft;
+using wowee::ui::caretStepRight;
+using wowee::ui::caretSnap;
+
+namespace {
+/// Everything the runs would draw, which is what the reader sees.
+std::string drawn(const std::string& in) {
+    std::string out;
+    for (const WrapRun& r : parseMarkup(in)) out += r.text;
+    return out;
+}
+}  // namespace
+
+TEST_CASE("a link keeps its display text", "[markup]") {
+    SECTION("the name between the markers survives") {
+        REQUIRE(drawn("|Hitem:6948:0:0:0:0:0:0:0|h[Hearthstone]|h") == "[Hearthstone]");
+    }
+
+    SECTION("and the text around it") {
+        REQUIRE(drawn("You receive loot: |cff9d9d9d|Hitem:3299|h[Fractured Canine]|h|r.")
+                == "You receive loot: [Fractured Canine].");
+    }
+
+    SECTION("two links in one line stay separate runs") {
+        const auto runs = parseMarkup("|Hitem:1|h[A]|h and |Hspell:2|h[B]|h");
+        std::string first, second;
+        for (const WrapRun& r : runs) {
+            if (r.link == "item:1")  first  += r.text;
+            if (r.link == "spell:2") second += r.text;
+        }
+        REQUIRE(first == "[A]");
+        REQUIRE(second == "[B]");
+    }
+
+    SECTION("the payload is carried, so a click can name what it hit") {
+        const auto runs = parseMarkup("|Hquest:1234:60|h[Kill Ten Rats]|h");
+        bool found = false;
+        for (const WrapRun& r : runs) {
+            if (r.text == "[Kill Ten Rats]") {
+                REQUIRE(r.link == "quest:1234:60");
+                found = true;
+            }
+        }
+        REQUIRE(found);
+    }
+
+    SECTION("text after the closing marker is not part of the link") {
+        for (const WrapRun& r : parseMarkup("|Hitem:1|h[A]|h tail")) {
+            if (r.text.find("tail") != std::string::npos) REQUIRE(r.link.empty());
+        }
+    }
+}
+
+TEST_CASE("the other escapes still behave", "[markup]") {
+    SECTION("a colour escape sets the run's colour and draws nothing itself") {
+        const auto runs = parseMarkup("|cffff0000red|r");
+        REQUIRE(drawn("|cffff0000red|r") == "red");
+        REQUIRE(runs.front().hasColor);
+    }
+    SECTION("|n is a line break") { REQUIRE(drawn("a|nb") == "a\nb"); }
+    SECTION("|| is a literal bar") { REQUIRE(drawn("a||b") == "a|b"); }
+    SECTION("an inline texture contributes no letters") {
+        REQUIRE(drawn("a|TInterface\\Icons\\X:16|tb") == "ab");
+    }
+    SECTION("an unterminated link does not run off the end") {
+        REQUIRE(drawn("|Hitem:1") == "");
+    }
+}
+
+// ── Inline textures ─────────────────────────────────────────────────────────
+//
+// A price is written as a number followed by a picture of a coin:
+// GOLD_AMOUNT_TEXTURE is "%d|TInterface\MoneyFrame\UI-GoldIcon:%d:%d:2:0|t".
+// The escape used to be skipped over, so every amount in the interface came
+// out as bare digits with nothing to say which coin it counted - a tooltip's
+// sell price read "19 81 56".
+
+TEST_CASE("an inline texture becomes a run that names its file", "[markup]") {
+    const auto runs = parseMarkup("19|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t");
+    REQUIRE(runs.size() == 2);
+    CHECK(runs[0].text == "19");
+    CHECK(runs[0].texture.empty());
+    CHECK(runs[1].texture == "Interface\\MoneyFrame\\UI-GoldIcon");
+    CHECK(runs[1].text.empty());
+}
+
+TEST_CASE("the size fields are read, and zero means the line's height",
+          "[markup]") {
+    const auto sized = parseMarkup("|TInterface\\Icons\\X:16:12:2:0|t");
+    REQUIRE(sized.size() == 1);
+    CHECK(sized[0].texHeight == 16.0f);
+    CHECK(sized[0].texWidth == 12.0f);
+
+    // What every coin escape sends: zero for both.
+    const auto coin = parseMarkup("|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t");
+    REQUIRE(coin.size() == 1);
+    CHECK(coin[0].texHeight == 0.0f);
+    CHECK(coin[0].texWidth == 0.0f);
+}
+
+TEST_CASE("a price keeps a coin beside each amount", "[markup]") {
+    // The whole string GetCoinTextureString builds for 19g 81s 56c.
+    const std::string price =
+        "19|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t "
+        "81|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t "
+        "56|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t";
+    const auto runs = parseMarkup(price);
+
+    int coins = 0;
+    std::string letters;
+    for (const auto& r : runs) {
+        if (!r.texture.empty()) ++coins;
+        letters += r.text;
+    }
+    CHECK(coins == 3);
+    CHECK(letters == "19 81 56");
+    // And no letter 'g', 's' or 'c' anywhere: the picture is what says which
+    // coin it is, exactly as the real client writes it.
+    CHECK(letters.find('g') == std::string::npos);
+}
+
+TEST_CASE("a texture with no path is not a run", "[markup]") {
+    CHECK(parseMarkup("|T|t").empty());
+    CHECK(parseMarkup("a|T|tb").size() == 1);
+}
+
+TEST_CASE("an unterminated texture does not run off the end", "[markup]") {
+    const auto runs = parseMarkup("a|TInterface\\Icons\\X");
+    // The 'a' and the texture, and nothing past the end of the string.
+    CHECK(runs.size() == 2);
+    CHECK(runs[1].texture == "Interface\\Icons\\X");
+}
+
+TEST_CASE("a stray closing marker draws nothing", "[markup]") {
+    CHECK(drawn("a|tb") == "ab");
+}
+
+TEST_CASE("a texture keeps the colour it sits inside", "[markup]") {
+    // A coin inside a coloured span is still that span's run, so the icon is
+    // tinted the way the surrounding text is.
+    const auto runs = parseMarkup("|cffff0000x|TInterface\\Icons\\X:0:0|ty|r");
+    REQUIRE(runs.size() == 3);
+    CHECK(runs[1].texture == "Interface\\Icons\\X");
+    CHECK(runs[1].hasColor);
+    CHECK(runs[1].rgba[0] == 1.0f);
+}
+
+
+// ── The caret walks what is drawn ───────────────────────────────────────────
+//
+// Only reachable since links became clickable: shift-clicking one puts the
+// whole "|Hitem:3299|h[Fractured Canine]|h" into the edit box, and the box
+// draws its display text. A caret stepping one byte at a time would sit still
+// for forty keypresses crossing the payload and then jump a word.
+TEST_CASE("the caret steps by drawn characters", "[markup]") {
+    const std::string line = "hi |Hitem:1|h[AB]|h x";
+
+    SECTION("right from the start crosses the plain text one at a time") {
+        REQUIRE(caretStepRight(line, 0) == 1);
+        REQUIRE(caretStepRight(line, 1) == 2);
+    }
+
+    SECTION("a link is one step whole, so the caret never rests inside it") {
+        // "hi " is three characters and the link runs from 3 to the end. One
+        // step from 3 clears all of it - payload, display text and closing
+        // marker - because a caret inside a link is a caret that can leave
+        // half an escape behind when something is erased.
+        REQUIRE(caretStepRight(line, 3) == 19);
+        REQUIRE(line.substr(19) == " x");
+    }
+
+    SECTION("left is the inverse of right, everywhere along the line") {
+        for (size_t p = 0; p < line.size();) {
+            const size_t next = caretStepRight(line, p);
+            if (next >= line.size()) break;
+            REQUIRE(caretStepLeft(line, next) == p);
+            p = next;
+        }
+    }
+
+    SECTION("neither runs past an end") {
+        REQUIRE(caretStepRight(line, line.size()) == line.size());
+        REQUIRE(caretStepLeft(line, 0) == 0);
+    }
+
+    SECTION("a colour escape draws nothing, so the caret does not stop in it") {
+        // "a|cffff0000b|rc": the escape is ten bytes drawing nothing, so a
+        // step from after 'a' crosses it and 'b' together.
+        const std::string coloured = "a|cffff0000b|rc";
+        REQUIRE(coloured.substr(11, 1) == "b");
+        REQUIRE(caretStepRight(coloured, 1) == 12);
+    }
+}
+
+
+// ── Erasing uses the same step, so the two cannot disagree ─────────────────
+//
+// Backspace over a link has to take the whole link. Removing a byte leaves
+// half an escape behind, which the parser then reads as whatever the wreckage
+// resembles - and the text is the player's own message, so the damage is
+// visible and unrecoverable by pressing the key again.
+namespace {
+
+/// Backspace, as the edit box performs it: erase back to the previous caret
+/// position.
+std::string backspaceAt(std::string s, size_t& at) {
+    const size_t from = caretStepLeft(s, at);
+    s.erase(from, at - from);
+    at = from;
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("erasing removes what draws as one character", "[markup]") {
+    SECTION("backspace over a link takes all of it") {
+        std::string s = "hi |Hitem:1|h[AB]|h";
+        size_t at = s.size();
+        // One press: the link is a single unit.
+        s = backspaceAt(s, at);
+        REQUIRE(s == "hi ");
+        REQUIRE(at == 3);
+    }
+
+    SECTION("and never leaves half an escape") {
+        std::string s = "a|cffff0000b|rc";
+        size_t at = s.size();
+        while (at > 0) {
+            s = backspaceAt(s, at);
+            // Whatever is left must still parse to something sane: every bar
+            // in it is either doubled or opens an escape that closes.
+            REQUIRE(parseMarkup(s).size() <= 3);
+        }
+        REQUIRE(s.empty());
+    }
+}
+
+
+TEST_CASE("a position from outside is snapped to one the caret can occupy", "[markup]") {
+    const std::string line = "hi |Hitem:1|h[AB]|h x";
+
+    SECTION("a position inside a link comes back to its start") {
+        // Anywhere from the opening bar to the last byte of the closing marker
+        // is inside the link, and all of it snaps to where the link begins.
+        for (size_t at = 4; at < 19; ++at) REQUIRE(caretSnap(line, at) == 3);
+    }
+
+    SECTION("positions outside one are left alone") {
+        REQUIRE(caretSnap(line, 0) == 0);
+        REQUIRE(caretSnap(line, 3) == 3);
+        REQUIRE(caretSnap(line, 19) == 19);
+        REQUIRE(caretSnap(line, line.size()) == line.size());
+    }
+
+    SECTION("every snapped position is one stepping can reach") {
+        for (size_t at = 0; at <= line.size(); ++at) {
+            const size_t snapped = caretSnap(line, at);
+            bool reachable = (snapped == 0);
+            for (size_t p = 0; !reachable && p < line.size();) {
+                const size_t next = caretStepRight(line, p);
+                if (next <= p) break;
+                if (next == snapped) reachable = true;
+                p = next;
+            }
+            REQUIRE(reachable);
+        }
+    }
+}
+
+// Replacing a selected run, which is what makes autocomplete usable.
+//
+// The interface writes the completed name and highlights the part it added, so
+// the next character typed replaces the completion instead of landing after
+// it. Everything about that is byte offsets, and both ends are easy to get
+// wrong in ways nobody sees until a name comes out doubled.
+TEST_CASE("A selected run is replaced, and only that run", "[edit][selection]") {
+    using wowee::ui::EditSelection;
+    using wowee::ui::replaceSelection;
+
+    SECTION("the completion is taken and the typed prefix kept") {
+        // "Thr" was typed, autocomplete wrote "Thrall" and highlighted "all".
+        std::string t = "Thrall";
+        const size_t c = replaceSelection(t, 6, {true, 3, 6});
+        CHECK(t == "Thr");
+        CHECK(c == 3);
+    }
+    SECTION("a run in the middle leaves both sides") {
+        std::string t = "abcdef";
+        const size_t c = replaceSelection(t, 6, {true, 2, 4});
+        CHECK(t == "abef");
+        CHECK(c == 2);
+    }
+    SECTION("all of it") {
+        std::string t = "Thrall";
+        const size_t c = replaceSelection(t, 6, {true, 0, 6});
+        CHECK(t.empty());
+        CHECK(c == 0);
+    }
+
+    // The three shapes that must do nothing. FrameXML clears a highlight by
+    // passing equal offsets, and a zero-width run that still counted would eat
+    // the next character typed - somewhere far from whatever set it.
+    SECTION("no selection changes nothing") {
+        std::string t = "Thrall";
+        CHECK(replaceSelection(t, 4, {false, 0, 6}) == 4);
+        CHECK(t == "Thrall");
+    }
+    SECTION("an empty range changes nothing") {
+        std::string t = "Thrall";
+        CHECK(replaceSelection(t, 4, {true, 3, 3}) == 4);
+        CHECK(t == "Thrall");
+    }
+    SECTION("an inverted range changes nothing") {
+        std::string t = "Thrall";
+        CHECK(replaceSelection(t, 4, {true, 5, 2}) == 4);
+        CHECK(t == "Thrall");
+    }
+    SECTION("a range past the end changes nothing") {
+        // Rather than clamping: a stale range means the text moved under the
+        // selection, and erasing some other run is worse than erasing none.
+        std::string t = "Thr";
+        CHECK(replaceSelection(t, 3, {true, 1, 99}) == 3);
+        CHECK(t == "Thr");
+    }
+}
+
+// What a letter limit counts.
+//
+// An edit box's limit is in characters shown, not bytes held, unless the box
+// asked for countInvisibleLetters. The chat box does not ask - it declares
+// letters="255" and nothing else - so the escapes a shift-clicked item link
+// brings with it must not be charged against it.
+TEST_CASE("A letter limit counts what is shown, not what is stored",
+          "[edit][markup]") {
+    using wowee::ui::visibleLength;
+
+    SECTION("plain text is its own length") {
+        CHECK(visibleLength("hello") == 5);
+        CHECK(visibleLength("") == 0);
+    }
+    SECTION("a colour escape shows nothing") {
+        // Ten bytes of escape around four shown.
+        CHECK(visibleLength("|cffff0000fire|r") == 4);
+    }
+    SECTION("an item link shows only its name") {
+        const std::string link =
+            "|cff9d9d9d|Hitem:3299:0:0:0:0:0:0:0|h[Fractured Canine]|h|r";
+        CHECK(visibleLength(link) == std::string("[Fractured Canine]").size());
+        // And the whole point: the stored form is far longer, so charging
+        // bytes against a 255 limit would let three links fill a message WoW
+        // would have carried a dozen in.
+        CHECK(link.size() > visibleLength(link) * 3);
+    }
+    SECTION("a message with a link keeps its own words") {
+        const std::string msg =
+            "look at |cff9d9d9d|Hitem:3299|h[Fractured Canine]|h|r now";
+        CHECK(visibleLength(msg) ==
+              std::string("look at [Fractured Canine] now").size());
+    }
+}
+
+// SecondsToTime's "%d |4Sec:Sec;" drew raw in the battleground queue tooltip:
+// "Time in queue: 13 |4Sec:Sec;".
+TEST_CASE("the plural escape picks its word by the number before it", "[markup]") {
+    REQUIRE(drawn("13 |4Sec:Sec;") == "13 Sec");
+    REQUIRE(drawn("1 |4Min:Mins;") == "1 Min");
+    REQUIRE(drawn("2 |4Min:Mins; 5 |4Sec:Sec;") == "2 Mins 5 Sec");
+    REQUIRE(drawn("11 |4hour:hours;") == "11 hours");
+    REQUIRE(drawn("|4one:many;") == "many");
+}

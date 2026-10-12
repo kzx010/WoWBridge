@@ -1,0 +1,60 @@
+{
+ "runtime": "1.7.104.0",
+ "hooks": [
+  {
+   "name": "input_dispatch (SpellHotbar2/SMF3)",
+   "kind": "call",
+   "site": "68617+0x7B",
+   "target": 68655
+  },
+  {
+   "name": "render_world (SkyCraft)",
+   "kind": "call",
+   "site": "36559+0x85E",
+   "target": 107142
+  },
+  {
+   "name": "late_pass_probe (SkyCraft)",
+   "kind": "call",
+   "site": "107142+0x2DF",
+   "target": 106438
+  },
+  {
+   "name": "NiCamera::WindowPointToRay",
+   "kind": "function",
+   "id": 70630
+  },
+  {
+   "name": "Actor::SetHeading",
+   "kind": "function",
+   "id": 37230
+  },
+  {
+   "name": "TESObjectREFR::ApplyEffectShader",
+   "kind": "function",
+   "id": 19872
+  },
+  {
+   "name": "hkpWorld::CastRay",
+   "kind": "function",
+   "id": 61399
+  },
+  {
+   "name": "PlayerCharacter vtbl[0x AD] Update",
+   "kind": "vtable",
+   "id": 208040,
+   "index": 173
+  },
+  {
+   "name": "hkpWorld::CastRay(collector)",
+   "kind": "function",
+   "id": 61400
+  },
+  {
+   "name": "RaceSexMenu naming/setup update",
+   "kind": "vtable",
+   "id": 215885,
+   "index": 5
+  }
+ ]
+}

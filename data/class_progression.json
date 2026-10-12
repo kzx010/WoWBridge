@@ -1,0 +1,244 @@
+{
+  "schema": 1,
+  "curve": {
+    "skill_min": 15,
+    "skill_max": 100,
+    "level_min": 1,
+    "level_max": 60
+  },
+  "classes": {
+    "warrior": {
+      "id": 1,
+      "name": "Warrior",
+      "default_skill": "one_handed",
+      "lines": {
+        "26": {
+          "skill": "two_handed",
+          "tab": 1
+        },
+        "256": {
+          "skill": "one_handed",
+          "tab": 2
+        },
+        "257": {
+          "skill": "block",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true
+    },
+    "paladin": {
+      "id": 2,
+      "name": "Paladin",
+      "default_skill": "restoration",
+      "lines": {
+        "594": {
+          "skill": "restoration",
+          "tab": 1
+        },
+        "267": {
+          "skill": "block",
+          "tab": 2
+        },
+        "184": {
+          "skill": "two_handed",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true
+    },
+    "hunter": {
+      "id": 3,
+      "name": "Hunter",
+      "default_skill": "archery",
+      "lines": {
+        "50": {
+          "skill": "conjuration",
+          "tab": 1
+        },
+        "163": {
+          "skill": "archery",
+          "tab": 2
+        },
+        "51": {
+          "skill": "sneak",
+          "tab": 3
+        },
+        "261": {
+          "skill": "conjuration",
+          "tab": 1
+        }
+      },
+      "include_cast_requirements": true,
+      "trainer_types": [
+        0,
+        3
+      ],
+      "line_prerequisites": {
+        "261": 5149
+      },
+      "auto_sources": [
+        "quest",
+        "skill"
+      ],
+      "external_line_sources": {
+        "261": "pet"
+      }
+    },
+    "rogue": {
+      "id": 4,
+      "name": "Rogue",
+      "default_skill": "one_handed",
+      "lines": {
+        "253": {
+          "skill": "alchemy",
+          "tab": 1
+        },
+        "38": {
+          "skill": "one_handed",
+          "tab": 2
+        },
+        "39": {
+          "skill": "sneak",
+          "tab": 3
+        },
+        "40": {
+          "skill": "alchemy",
+          "tab": 1
+        },
+        "633": {
+          "skill": "lockpicking",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true,
+      "line_prerequisites": {
+        "40": 2842
+      },
+      "auto_sources": [
+        "quest",
+        "skill"
+      ],
+      "wow_skill_mappings": {
+        "40": {
+          "skill": "alchemy",
+          "values_per_level": 5,
+          "required_spell": 2842
+        }
+      }
+    },
+    "priest": {
+      "id": 5,
+      "name": "Priest",
+      "default_skill": "restoration",
+      "lines": {
+        "613": {
+          "skill": "alteration",
+          "tab": 1
+        },
+        "56": {
+          "skill": "restoration",
+          "tab": 2
+        },
+        "78": {
+          "skill": "illusion",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true
+    },
+    "shaman": {
+      "id": 7,
+      "name": "Shaman",
+      "default_skill": "destruction",
+      "lines": {
+        "375": {
+          "skill": "destruction",
+          "tab": 1
+        },
+        "373": {
+          "skill": "one_handed",
+          "tab": 2
+        },
+        "374": {
+          "skill": "restoration",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true
+    },
+    "mage": {
+      "id": 8,
+      "name": "Mage",
+      "default_skill": "alteration",
+      "lines": {
+        "237": {
+          "skill": "alteration",
+          "tab": 1
+        },
+        "8": {
+          "skill": "destruction",
+          "tab": 2
+        },
+        "6": {
+          "skill": "destruction",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true
+    },
+    "warlock": {
+      "id": 9,
+      "name": "Warlock",
+      "default_skill": "conjuration",
+      "lines": {
+        "355": {
+          "skill": "illusion",
+          "tab": 1
+        },
+        "354": {
+          "skill": "conjuration",
+          "tab": 2
+        },
+        "593": {
+          "skill": "destruction",
+          "tab": 3
+        }
+      },
+      "include_cast_requirements": true
+    },
+    "druid": {
+      "id": 11,
+      "name": "Druid",
+      "default_skill": "alteration",
+      "lines": {
+        "574": {
+          "skill": "destruction",
+          "tab": 1
+        },
+        "134": {
+          "skill": "one_handed",
+          "tab": 2
+        },
+        "573": {
+          "skill": "restoration",
+          "tab": 3
+        }
+      },
+      "utility_chains": [
+        1126,
+        770,
+        2637,
+        2908,
+        22812,
+        5225,
+        20719,
+        5487,
+        768,
+        783,
+        1066
+      ],
+      "utility_skill": "alteration"
+    }
+  }
+}

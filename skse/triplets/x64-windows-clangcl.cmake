@@ -1,0 +1,6 @@
+# Same as CommonLibSSE-NG's linux-cross-compile triplet, but chainloads our wrapper toolchain.
+set(VCPKG_TARGET_ARCHITECTURE x64)
+set(VCPKG_CRT_LINKAGE dynamic)
+set(VCPKG_LIBRARY_LINKAGE static)
+set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../cmake/toolchain.cmake")
+set(VCPKG_ENV_PASSTHROUGH COMMONLIB_DIR XWIN_SYSROOT LLVM_MINGW_BIN WINEPREFIX WINEDEBUG WINEDLLOVERRIDES)

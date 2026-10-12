@@ -1,0 +1,221 @@
+{
+  "required_level": 0,
+  "sets": {
+    "arcanist": 201,
+    "prophecy": 202,
+    "felheart": 203,
+    "nightslayer": 204,
+    "cenarion": 205,
+    "giantstalker": 206,
+    "earthfury": 207,
+    "lawbringer": 208,
+    "might": 209,
+    "stormrage": 214
+  },
+  "items": [
+    873,
+    5201,
+    22398,
+    22397,
+    19019,
+    17182,
+    19364,
+    18842,
+    18713,
+    18715,
+    18608,
+    18609,
+    18816,
+    18348,
+    1168
+  ],
+  "set_adaptations": {
+    "21894": {
+      "effects": [
+        [
+          499965,
+          15
+        ]
+      ],
+      "reason": "Meditation: +15% native magicka regeneration; Skyrim has no five-second mana rule."
+    },
+    "21895": {
+      "effects": [
+        [
+          300292,
+          10
+        ]
+      ],
+      "reason": "Totem radius: +10 magicka; totems are not available to this druid."
+    },
+    "23572": {
+      "effects": [
+        [
+          499965,
+          8.75
+        ]
+      ],
+      "reason": "Mana Surge: 25% x 35% expected mana recovery becomes +8.75% native magicka regeneration."
+    },
+    "23573": {
+      "effects": [
+        [
+          499969,
+          10
+        ]
+      ],
+      "reason": "Chain Healing Wave: +10% native Restoration cost reduction; Skyrim has no chain healing."
+    },
+    "23554": {
+      "effects": [
+        [
+          499960,
+          15
+        ]
+      ],
+      "reason": "Drain Life/Mana bonus: +15% native health regeneration."
+    },
+    "21741": {
+      "effects": [
+        [
+          299946,
+          22.5
+        ],
+        [
+          752181,
+          33.333333333333336
+        ]
+      ],
+      "reason": "Demonic Ally: pet stamina and resistance benefit the wearer (15 Stamina, 100 resistance)."
+    },
+    "23553": {
+      "effects": [
+        [
+          499958,
+          15
+        ]
+      ],
+      "reason": "Shadow mana cost: +15% native Destruction cost reduction."
+    },
+    "23560": {
+      "effects": [
+        [
+          499969,
+          30
+        ],
+        [
+          499960,
+          10
+        ]
+      ],
+      "reason": "Mend Pet: 30% Restoration cost reduction and 10% health regeneration for the wearer."
+    },
+    "21926": {
+      "effects": [
+        [
+          299946,
+          45
+        ],
+        [
+          752181,
+          13.333333333333334
+        ]
+      ],
+      "reason": "Nature's Ally: pet stamina and resistance benefit the wearer (30 Stamina, 40 resistance)."
+    },
+    "23566": {
+      "effects": [
+        [
+          499966,
+          15
+        ]
+      ],
+      "reason": "Volley/Multi-shot: +15% native bow damage."
+    },
+    "23564": {
+      "effects": [
+        [
+          499960,
+          10
+        ]
+      ],
+      "reason": "Judgement of Light trigger chance: +10% native health regeneration."
+    },
+    "21838": {
+      "effects": [
+        [
+          499973,
+          10
+        ]
+      ],
+      "reason": "Rage from incoming hits: +10% native stamina regeneration."
+    },
+    "23561": {
+      "effects": [
+        [
+          499967,
+          15
+        ],
+        [
+          499974,
+          15
+        ]
+      ],
+      "reason": "Sunder Armor threat: +15% native melee damage; Skyrim has no Sunder Armor."
+    },
+    "21874": {
+      "effects": [
+        [
+          499971,
+          30
+        ]
+      ],
+      "reason": "Vanish cooldown: +30% native sneak advantage."
+    },
+    "21975": {
+      "effects": [
+        [
+          300295,
+          15
+        ]
+      ],
+      "reason": "Vigor: +10 Energy becomes +15 native stamina using the gear resource ratio."
+    },
+    "23582": {
+      "effects": [
+        [
+          499960,
+          20
+        ]
+      ],
+      "reason": "Clean Escape: +20% native health regeneration in place of the unavailable Vanish heal."
+    },
+    "21973": {
+      "effects": [
+        [
+          499969,
+          10
+        ]
+      ],
+      "reason": "Flash Heal cast time: +10% native Restoration cost reduction (Skyrim cannot accelerate one unavailable spell)."
+    },
+    "21092": {
+      "effects": [
+        [
+          499969,
+          2
+        ]
+      ],
+      "reason": "Holy critical chance: +2% native Restoration cost reduction; WoW Holy crit remains available in the service."
+    },
+    "23550": {
+      "effects": [
+        [
+          499969,
+          25
+        ]
+      ],
+      "reason": "Prayer of Healing criticals: +25% native Restoration cost reduction."
+    }
+  }
+}

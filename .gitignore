@@ -1,0 +1,21 @@
+build/
+__pycache__/
+*.pyc
+/dist/
+/tools/.deploy-manifest.json
+missing_api.txt
+lua_errors.txt
+
+# Machine-local credentials/configuration and diagnostic output are private.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.local.json
+
+# Tester setup writes private paths, extracted inputs and logs here.
+/local/
