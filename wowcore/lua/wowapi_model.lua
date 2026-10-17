@@ -93,7 +93,7 @@ function MT:AdvanceTime()
 end
 
 -- SetPortraitTexture(texture, unit): the unit's portrait in that texture. The host fills every texture so marked with the
--- unit's live render each frame - her face in the player frame, the character micro button, the character sheet - and
+-- unit's live render each frame - their face in the player frame, the character micro button, the character sheet - and
 -- leaves a unit with no render (a creature) empty. (WoWee's own binding is in game-state code WoWBridge leaves out.)
 function SetPortraitTexture(texture, unit)
   if type(texture) == "table" and unit and __WBPortraitUnit then __WBPortraitUnit(texture, strlower(unit)) end

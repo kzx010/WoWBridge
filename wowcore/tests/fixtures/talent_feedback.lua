@@ -22,7 +22,7 @@ function __WBFeralFeedbackFixture()
   for _, id in ipairs({9850,9830,8983}) do table.insert(rows,{spell=id,skill_line=134,tab=2,passive=false}) end
   __WBClassSpells({class='druid',class_id=11,known_spells=ids,spells=rows,unlearned_spells={},
     lines={['134']={name='Feral Combat',tab=2}},
-    spell_tooltips={['9850']={effects={{138,138},{1,1},{0,0}}},['8983']={duration_ms=5000}}})
+    spell_tooltips={['9850']={effects={{138,138},{1,1},{0,0}},health_factor=7/96.5},['8983']={duration_ms=5000}}})
   __WB.resolve('player').skyrim = {}
   __WB.skyrimCosts = {[9850]=40,[9830]=48,[9881]=10,[16979]=5,[16857]=0}
   __WB.actions[2],__WB.actions[3],__WB.actions[4] = {spell=9850},{spell=8983},{spell=9830}

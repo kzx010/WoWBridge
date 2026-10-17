@@ -85,6 +85,12 @@ local function norm(s) return (string.gsub(s, "`", "'")) end
 -- these commands, and General carrying the combat log, answer otherwise on purpose and are not compared.
 local DEPARTED = { "ATTACKTARGET", "TARGETPREVIOUSENEMY", "GetChatWindowMessages(1)" }
 local function departed(p, want)
+  -- The bridge adds three binding rows after the generated vanilla list. Loot tests
+  -- check those rows; keep comparing every vanilla row and all other API answers here.
+  if string.find(p, "^GetNumBindings%(") then return true end
+  local row = tonumber(string.match(p, "^GetBinding%((%d+)%)$"))
+  local vanillaRows = table.getn(__WB.defaultBindings)
+  if row and row > vanillaRows and row <= vanillaRows + 3 then return true end
   for _, c in ipairs(DEPARTED) do
     if string.find(p, c, 1, true) or string.find(want, c, 1, true) then return true end
   end

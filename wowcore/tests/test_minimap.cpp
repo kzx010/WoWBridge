@@ -1,6 +1,7 @@
 #include <catch_amalgamated.hpp>
 
 #include "wowcore/minimap.hpp"
+#include "wowcore/model.hpp"
 #include "wowcore/dbc.hpp"
 #include "wowcore/mpq.hpp"
 #include "wowcore/soft_raster.hpp"
@@ -106,6 +107,47 @@ TEST_CASE("minimap inverse UV sampling respects native capture orientation and c
     CHECK_FALSE(wowcore::minimapSampleUv(view, northUp, {1, 1}));
 }
 
+TEST_CASE("interior floor plan shows her storey inside the rim, with its walls", "[minimap]") {
+    wowcore::MinimapView view;
+    view.player = {100, 200}; view.radius = 10;
+    using T = wowcore::MinimapFloorTriangle;
+    const std::vector<T> floor = {
+        T{{100, 200}, {105, 200}, {100, 205}, 0.5, 0b001},   // their room; wall along a-b
+        T{{100, 200}, {100, 205}, {95, 200}, 6.0, 0b111},    // the storey above
+        T{{108, 200}, {130, 200}, {108, 210}, 0.0, 0},       // across the rim
+        T{{300, 300}, {301, 300}, {300, 301}, 0.0, 0b111},   // far away
+    };
+    const auto mesh = wowcore::minimapFloorMesh(view, floor, 0.0, 0.01);
+    REQUIRE(mesh.floor.size() >= 6);
+    REQUIRE(mesh.floor.size() % 3 == 0);
+    for (const auto& p : mesh.floor) REQUIRE(std::hypot(p.x, p.y) <= 1 + 1e-9);
+    // Their room is drawn exactly; the clipped one starts at its own x.
+    REQUIRE(std::abs(mesh.floor[1].x - 0.5) < 1e-9);
+    // One wall band (a quad: two triangles), 0.02 disc units across, along y = 0.
+    REQUIRE(mesh.walls.size() == 6);
+    for (const auto& p : mesh.walls) REQUIRE(std::abs(p.y) <= 0.01 + 1e-9);
+    // Climbing to the upper storey shows it instead.
+    const auto upper = wowcore::minimapFloorMesh(view, floor, 6.0, 0.01);
+    REQUIRE(upper.walls.size() == 18);
+    // A long ramp (8 yards of rise) stays under the player at either end.
+    T ramp{{100, 200}, {104, 200}, {100, 204}, 4.0, 0};
+    ramp.rise = 4.0;
+    REQUIRE(wowcore::minimapFloorMesh(view, {ramp}, 0.0, 0.01).floor.size() == 3);
+    REQUIRE(wowcore::minimapFloorMesh(view, {ramp}, 8.0, 0.01).floor.size() == 3);
+    REQUIRE(wowcore::minimapDiscTriangles().size() == 62 * 3);
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data = env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (std::filesystem::exists(data / "interface.MPQ")) {   // plain, opaque white: the flat colours are the vertices'
+        const auto bytes = wowcore::Mpq(data).read(wowcore::kMinimapFloorTexture);
+        REQUIRE(bytes);
+        const auto image = wowee::pipeline::BLPLoader::load(*bytes);
+        REQUIRE(image.width > 0);
+        const auto* texel = &image.data[((image.height / 2) * image.width + image.width / 2) * 4];
+        INFO("rgba " << int(texel[0]) << " " << int(texel[1]) << " " << int(texel[2]) << " " << int(texel[3]));
+        REQUIRE((texel[0] > 240 && texel[1] > 240 && texel[2] > 240 && texel[3] > 240));
+    }
+}
+
 TEST_CASE("minimap mask rejects out-of-range points and blips whose glyph crosses the rim", "[minimap]") {
     const wowcore::MinimapView view{{}, 100, 0, false};
     CHECK(wowcore::minimapContains({0, 0}));
@@ -200,6 +242,138 @@ TEST_CASE("1.12 minimap buttons use widget zoom and player map answers remain ma
     const auto* minimap = ui.engine().widgets().findByName("Minimap");
     REQUIRE(minimap);
     CHECK(minimap->zoomLevel == 0);
+}
+
+TEST_CASE("minimap native art CVar uses the client Controls checkbox and testing toggle", "[client][api][minimap]") {
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    auto mpq = std::make_shared<wowcore::Mpq>(env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data");
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 1280, 720);
+    std::string error; REQUIRE(ui.start(&error)); auto* L = ui.lua();
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    REQUIRE(luaL_dostring(L, "__WBFixture('idle')") == 0);
+    REQUIRE(ui.loadInterface(&error));
+    const int rc = luaL_dostring(L, R"(
+        __WBLogin(); __WBSkyrimMenus()
+        assert(GetCVar('wbMinimapNativeArt') == '1' and GetCVarDefault('wbMinimapNativeArt') == '1')
+        assert(UIOptionsFrameCheckButtons.WB_MINIMAP_NATIVE_ART_TEXT.cvar == 'wbMinimapNativeArt')
+        assert(UIOptionsFrameCheckButton72:GetParent() == BasicOptionsGeneral)
+        assert(UIOptionsFrameCheckButton72:GetWidth() == 26 and UIOptionsFrameCheckButton72:GetHeight() == 26)
+        UIOptionsFrame_Load()
+        assert(UIOptionsFrameCheckButton72:GetChecked())
+        UIOptionsFrameCheckButton72:SetChecked(false)
+        UIOptionsFrame_Save()
+        assert(GetCVar('wbMinimapNativeArt') == '0')
+        UIOptionsFrame_SetDefaults()
+        assert(UIOptionsFrameCheckButton72:GetChecked())
+        UIOptionsFrame_Save()
+        assert(GetCVar('wbMinimapNativeArt') == '1')
+        __WBLoadCVars('SET wbMinimapNativeArt "0"')
+        UIOptionsFrame_Load()
+        assert(not UIOptionsFrameCheckButton72:GetChecked())
+        __WBTestPanelToggle()
+        WBTestPanelTab11:Click()
+        WBTestPanelSearch:SetText('Minimap icons:')
+        WBTestPanelSearch:GetScript('OnTextChanged')()
+        assert(WBTestPanelRow1:GetText() == 'Minimap icons: WoW', WBTestPanelRow1:GetText())
+        WBTestPanelRow1:Click()
+        assert(GetCVar('wbMinimapNativeArt') == '1' and WBTestPanelRow1:GetText() == 'Minimap icons: Skyrim')
+        WBTestPanelRow1:Click()
+        assert(GetCVar('wbMinimapNativeArt') == '0')
+        WBTestPanel:Hide()
+    )");
+    INFO((rc ? lua_tostring(L, -1) : "")); REQUIRE(rc == 0);
+    CHECK(ui.engine().lastError().empty());
+}
+
+TEST_CASE("1.12 minimap clicks deliver world-anchored pings to the stock model and sound handler", "[client][api][minimap][ping]") {
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    auto mpq = std::make_shared<wowcore::Mpq>(env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data");
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 768, 768);
+    std::string error;
+    REQUIRE(ui.start(&error));
+    auto* L = ui.lua();
+    const auto run = [&](const char* script) {
+        const int result = luaL_dostring(L, script);
+        INFO((result ? lua_tostring(L, -1) : script)); REQUIRE(result == 0);
+    };
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&error));
+    run(R"(
+        __WBLogin()
+        for _, f in ipairs({UIParent:GetChildren()}) do if f ~= MinimapCluster then f:Hide() end end
+        Minimap:ClearAllPoints(); Minimap:SetPoint('CENTER', UIParent, 'CENTER', 0, 0)
+        Minimap:SetZoom(0); SetCVar('rotateMinimap', 0)
+        pingEvents, pingSounds = {}, {}
+        local recorder = CreateFrame('Frame')
+        recorder:RegisterEvent('MINIMAP_PING')
+        recorder:SetScript('OnEvent', function() table.insert(pingEvents, {arg1, arg2, arg3}) end)
+        local sound = PlaySound
+        PlaySound = function(name) table.insert(pingSounds, name); return sound(name) end
+        __WBApplyLive({minimap={worldspace='Test', x=1000, y=2000, heading=0}})
+        assert(MiniMapPing:GetModel() == 'Interface\\MiniMap\\Ping\\MinimapPing.m2')
+        assert(not MiniMapPing:IsShown())
+        local x, y = Minimap:GetPingPosition(); assert(x == 0 and y == 0)
+    )");
+    const auto render = [&](float elapsed = 0.016f) {
+        ui.applyLiveMinimap(nullptr);
+        auto* draw = ui.frame(elapsed); textures.sync(draw);
+        wowcore::Image im(768, 768); wowcore::rasterize(draw, textures, im); return im;
+    };
+    render();
+    const auto click = [&](float x, float y) {
+        ui.pointer(x, y); render();
+        ImGui::SetCurrentContext(ui.imguiContext());
+        ui.engine().dispatchMouse(x, y, 768, {true, false, false});
+        ui.engine().dispatchMouse(x, y, 768, {});
+    };
+    click(426, 410); // stock cursor offsets -7,-9 -> local (35,-35)
+    run(R"(
+        assert(table.getn(pingEvents) == 1)
+        assert(pingEvents[1][1] == 'player' and pingEvents[1][2] == .25 and pingEvents[1][3] == -.25,
+            tostring(pingEvents[1][1])..' '..tostring(pingEvents[1][2])..' '..tostring(pingEvents[1][3]))
+        assert(pingSounds[1] == 'MapPing' and Minimap.timer == 5)
+        assert(MiniMapPing:IsShown())
+        local _, _, _, x, y = MiniMapPing:GetPoint(); assert(x == 35 and y == -35)
+        local px, py = Minimap:GetPingPosition(); assert(px == .25 and py == -.25)
+    )");
+    const auto first = render();
+    for (int i = 0; i < 8; ++i) render(); // actual client textures become resident
+    const auto shown = render();
+    const auto* pingFrame = ui.engine().widgets().findByName("MiniMapPing");
+    REQUIRE(pingFrame);
+    CHECK(pingFrame->rectW == Catch::Approx(50)); CHECK(pingFrame->rectH == Catch::Approx(50));
+    CHECK(pingFrame->left + pingFrame->rectW/2 == Catch::Approx(419));
+    CHECK(pingFrame->bottom + pingFrame->rectH/2 == Catch::Approx(349));
+    CHECK(first.rgba != shown.rgba); // the native M2 animation advances
+    int pixels = 0;
+    for (int y = 400; y < 440; ++y) for (int x = 397; x < 446; ++x)
+        pixels += shown.rgba[(y * shown.w + x) * 4 + 3] > 0;
+    CHECK(pixels > 0); // the stock MiniMapPing model actually draws
+    run("__WB.minimap.x = 1050"); render();
+    run("local x,y=Minimap:GetPingPosition(); assert(math.abs(x-.125)<1e-9 and y==-.25)");
+    run("Minimap:SetZoom(1)"); render();
+    run("local x,y=Minimap:GetPingPosition(); assert(math.abs(x-.125*sqrt(2))<1e-9 and math.abs(y+.25*sqrt(2))<1e-9)");
+    run("__WB.minimap.heading=math.pi/2; SetCVar('rotateMinimap',1)"); render();
+    run("local x,y=Minimap:GetPingPosition(); assert(math.abs(x-.25*sqrt(2))<1e-9 and math.abs(y-.125*sqrt(2))<1e-9)");
+    ui.fire("MINIMAP_PING", {"party1", "-0.2", "0.1"});
+    run("assert(pingEvents[2][1]=='party1' and pingEvents[2][2]==-.2 and pingEvents[2][3]==.1); "
+        "local x,y=Minimap:GetPingPosition(); assert(math.abs(x+.2)<1e-9 and math.abs(y-.1)<1e-9)");
+    render(5.1f); run("assert(MiniMapPing.fadeOut and MiniMapPing.fadeOutTimer==.5)");
+    render(.51f); run("assert(not MiniMapPing:IsShown() and not MiniMapPing.fadeOut)");
+    click(451, 326); // inside rectangular hit area, outside circle after cursor offsets
+    run("assert(table.getn(pingEvents)==2)");
+    run("Minimap:PingLocation(0/0,0); assert(table.getn(pingEvents)==2); Minimap:PingLocation(0,0)");
+    render(); run("assert(MiniMapPing:IsShown() and table.getn(pingEvents)==3)");
+    run("__WB.minimap.worldspace='Other'"); render();
+    run("assert(not MiniMapPing:IsShown())");
+    run("Minimap:PingLocation(140/3,20); local e=pingEvents[4]; "
+        "assert(type(e[2])=='number' and type(e[3])=='number' and math.abs(e[2]-1/3)<1e-15)");
+    CHECK(ui.engine().lastError().empty());
 }
 
 TEST_CASE("static minimap finds negative and offset terrain cells without wrapping holes", "[minimap]") {
@@ -384,6 +558,20 @@ TEST_CASE("static minimap widget draws terrain, client arrow, zoom, alpha and em
     CHECK(channel(interior, 384, 384, 3) == 0);
     REQUIRE(luaL_dostring(L, "local x,y=GetPlayerMapPosition('player'); assert(x==0 and y==0)") == 0);
     CHECK_FALSE(ui.engine().widgets().findByName("Minimap")->hostModel);
+    // Indoors with a floor plan: their storey over darkness inside the rim, nothing outside it.
+    using T = wowcore::MinimapFloorTriangle;
+    ui.setMinimapFloor({T{{-100, -100}, {100, -100}, {0, 100}, 0, 0b001}});
+    REQUIRE(luaL_dostring(L, "__WB.minimap = { worldspace = 'interior:0001', x = 0, y = 0, z = 0, heading = 0 }") == 0);
+    ui.applyLiveMinimap(&atlas);
+    ImDrawData* draw = nullptr;
+    for (int i = 0; i < 8; ++i) { draw = ui.frame(0.016f); textures.sync(draw); }
+    wowcore::Image indoors(768, 768);
+    wowcore::rasterize(draw, textures, indoors);
+    CHECK(ui.engine().widgets().findByName("Minimap")->hostModel);
+    CHECK(int(channel(indoors, 385, 385, 3)) >= 126);                          // drawn (UIParent is at half alpha here)
+    CHECK(int(channel(indoors, 385, 385, 0)) > int(channel(indoors, 340, 340, 0)));   // their floor, lighter than the dark beyond it
+    CHECK(int(channel(indoors, 340, 340, 3)) >= 126);                          // that darkness fills the disc
+    CHECK(int(channel(indoors, 315, 315, 3)) == 0);                            // nothing outside the rim
 }
 
 TEST_CASE("tracking glyphs clip at the rim without dropping in-range units", "[minimap][tracking]") {
@@ -398,6 +586,125 @@ TEST_CASE("tracking glyphs clip at the rim without dropping in-range units", "[m
     }
     CHECK(wowcore::minimapGlyphTriangles({1.001,0}, {0.1,0.1}, {}, {1,1}).empty());
     CHECK(wowcore::minimapGlyphTriangles({}, {}, {}, {1,1}).empty());
+}
+
+TEST_CASE("minimap presentation uses the 1.12 atlas cells model dimensions and rim placement", "[client][minimap][presentation]") {
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    auto mpq = std::make_shared<wowcore::Mpq>(env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data");
+    const wowcore::ClientDb db(*mpq);
+    const auto areas = wowcore::Dbc::load(*mpq, "DBFilesClient\\AreaPOI.dbc");
+    REQUIRE(areas); REQUIRE(areas->cols() == 29);
+    for (const auto [name, icon] : {std::pair{"Aerie Peak", 4u}, {"Algaz Station", 6u}, {"Gold Mine", 16u},
+            {"Lumber Mill", 21u}, {"Blacksmith", 26u}, {"Farm", 31u}, {"Stables", 36u}}) {
+        bool found = false;
+        for (uint32_t i = 0; i < areas->rows(); ++i)
+            found |= std::string(areas->str(i, 10)) == name && areas->u32(i, 2) == icon;
+        CHECK(found);
+    }
+    const auto load = [&](const char* file, int size) {
+        const auto bytes = mpq->read(file); REQUIRE(bytes);
+        auto image = wowee::pipeline::BLPLoader::load(*bytes);
+        REQUIRE(image.width == size); REQUIRE(image.height == size);
+        return image.data.empty() ? wowee::pipeline::BLPLoader::decodeBaseLevel(image) : image.data;
+    };
+    const auto poiArt = load("Interface\\Minimap\\POIIcons.blp", 128);
+    const auto objectArt = load("Interface\\Minimap\\ObjectIcons.blp", 128);
+    const auto playerArt = load("Interface\\Minimap\\MinimapArrow.blp", 32);
+    const auto guideArt = load("Interface\\Minimap\\Rotating-MinimapGuideArrow.blp", 32);
+    const auto corpseArt = load("Interface\\Minimap\\Rotating-MinimapCorpseArrow.blp", 32);
+    const auto playerModel = wowcore::loadModel(*mpq, "Interface\\Minimap\\MinimapArrow.mdx");
+    REQUIRE(playerModel); REQUIRE(playerModel->vertices.size() == 4);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 768, 768);
+    std::string error; REQUIRE(ui.start(&error)); auto* L = ui.lua();
+    const auto run = [&](const std::string& script) {
+        const int rc = luaL_dostring(L, script.c_str());
+        INFO((rc ? lua_tostring(L, -1) : script)); REQUIRE(rc == 0);
+    };
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    run(R"(
+        __WBFixture('idle'); __WBAuraAdd('player',5225,false,0)
+        Minimap=CreateFrame('Minimap','Minimap',UIParent)
+        Minimap:SetWidth(140); Minimap:SetHeight(140); Minimap:SetPoint('CENTER',UIParent,'CENTER',0,0)
+        __WBApplyLive({minimap={worldspace='Test',x=0,y=0,heading=0,trackingMask=64}})
+    )");
+    const auto render = [&]() {
+        ui.applyLiveMinimap(nullptr); ImDrawData* draw = nullptr;
+        for (int i = 0; i < 8; ++i) { draw = ui.frame(.016f); textures.sync(draw); }
+        return draw;
+    };
+    const auto vertices = [&](const ImDrawData* draw, const std::vector<uint8_t>& art) {
+        std::vector<ImDrawVert> out;
+        for (const auto* list : draw->CmdLists) for (const auto& cmd : list->CmdBuffer) {
+            if (cmd.UserCallback) continue;
+            const auto* image = textures.get(static_cast<uint64_t>(cmd.GetTexID()));
+            if (!image || image->empty() || image->front().rgba != art) continue;
+            for (unsigned i = 0; i < cmd.ElemCount; ++i)
+                out.push_back(list->VtxBuffer[cmd.VtxOffset + list->IdxBuffer[cmd.IdxOffset + i]]);
+        }
+        return out;
+    };
+    std::string phase = "POI cells";
+    struct Bounds { float x0=FLT_MAX, y0=FLT_MAX, x1=-FLT_MAX, y1=-FLT_MAX, u0=1, v0=1, u1=0, v1=0; };
+    const auto bounds = [&](const std::vector<ImDrawVert>& verts) {
+        INFO(phase);
+        REQUIRE_FALSE(verts.empty()); Bounds b;
+        for (const auto& v : verts) {
+            b.x0=std::min(b.x0,v.pos.x); b.y0=std::min(b.y0,v.pos.y);
+            b.x1=std::max(b.x1,v.pos.x); b.y1=std::max(b.y1,v.pos.y);
+            b.u0=std::min(b.u0,v.uv.x); b.v0=std::min(b.v0,v.uv.y);
+            b.u1=std::max(b.u1,v.uv.x); b.v1=std::max(b.v1,v.uv.y);
+        }
+        return b;
+    };
+    for (const int icon : {4,5,6,16,21,26,31,36,41,42}) {
+        INFO(icon);
+        run("__WB.minimap.pois={{kind='location',name='Area',x=100,y=0,icon=" + std::to_string(icon) + "}}");
+        const auto verts = vertices(render(), poiArt); const auto b = bounds(verts);
+        CHECK(b.x1-b.x0 == Catch::Approx(16)); CHECK(b.y1-b.y0 == Catch::Approx(16));
+        CHECK(b.u0 == Catch::Approx((icon%8)/8.0).margin(1e-6)); CHECK(b.u1 == Catch::Approx((icon%8+1)/8.0).margin(1e-6));
+        CHECK(b.v0 == Catch::Approx((icon/8)/8.0).margin(1e-6)); CHECK(b.v1 == Catch::Approx((icon/8+1)/8.0).margin(1e-6));
+        for (const auto& v : verts) CHECK(v.col == IM_COL32_WHITE); // no invented undiscovered dimming
+    }
+    phase = "resize";
+    run("__WB.minimap.pois[1].discovered=true; Minimap:SetWidth(280); Minimap:SetHeight(280)");
+    const auto wide = bounds(vertices(render(), poiArt)); CHECK(wide.x1-wide.x0 == Catch::Approx(16));
+    run("Minimap:SetZoom(1)");
+    const auto resized = bounds(vertices(render(), poiArt)); CHECK(resized.x1-resized.x0 == Catch::Approx(16));
+    run("Minimap:SetScale(1.5)");
+    const auto scaled = bounds(vertices(render(), poiArt)); CHECK(scaled.x1-scaled.x0 == Catch::Approx(24));
+    phase = "player model";
+    run("Minimap:SetScale(1); Minimap:SetZoom(0); __WB.minimap.pois={}");
+    const auto player = bounds(vertices(render(), playerArt));
+    CHECK(player.x0 == Catch::Approx(384 + playerModel->vertices[0].position.x * 1280));
+    CHECK(player.y0 == Catch::Approx(384 - playerModel->vertices[0].position.y * 1280));
+    CHECK(player.x1-player.x0 == Catch::Approx(.0262199 * 1280).margin(.001));
+    CHECK(player.u0 == Catch::Approx(.0004995).margin(.000001));
+    for (const auto [kind, art] : {std::pair{"quest", &corpseArt}, {"custom", &guideArt}}) {
+        phase = kind;
+        run(std::string("__WB.minimap.pois={{kind='") + kind + "',name='Destination',x=0,y=1000}}");
+        const auto b = bounds(vertices(render(), *art));
+        CHECK(b.x1-b.x0 == Catch::Approx(38.4).margin(.001)); CHECK(b.y1-b.y0 == Catch::Approx(38.4).margin(.001));
+        CHECK((b.y0+b.y1)/2 == Catch::Approx(384 - 56.32 + .0001269 * 768).margin(.001));
+    }
+    run("__WB.minimap.pois={{kind='location',name='Beyond rim',x=0,y=1000,icon=4}}");
+    auto* draw = render();
+    CHECK(vertices(draw, poiArt).empty()); CHECK(vertices(draw, guideArt).empty());
+    phase = "custom blip";
+    run("__WB.minimap.pois={{kind='custom',name='Destination',x=-100,y=0}}");
+    const auto custom = bounds(vertices(render(), objectArt));
+    CHECK(custom.x1-custom.x0 == Catch::Approx(8)); CHECK(custom.u0==0); CHECK(custom.u1==.25);
+    CHECK(custom.v0==.25); CHECK(custom.v1==.5);
+    run("__WB.minimap.pois={}");
+    for (const int reaction : {1,3,4,5,8}) {
+        phase = "tracking blip";
+        run("__WB.minimap.blips={{x=100,y=0,reaction=" + std::to_string(reaction) + "}}");
+        const auto b = bounds(vertices(render(), objectArt)); const int cell = reaction<=3 ? 1 : reaction==4 ? 0 : 2;
+        CHECK(b.x1-b.x0 == Catch::Approx(8)); CHECK(b.y1-b.y0 == Catch::Approx(8));
+        CHECK(b.u0 == Catch::Approx(cell/4.0).margin(1e-6)); CHECK(b.u1 == Catch::Approx((cell+1)/4.0).margin(1e-6));
+        CHECK(b.v0==0); CHECK(b.v1==.25);
+    }
+    CHECK(ui.engine().lastError().empty());
 }
 
 TEST_CASE("client tracking icon tooltip buff and right click follow the authoritative aura", "[client][api][minimap][tracking]") {
@@ -517,6 +824,31 @@ TEST_CASE("minimap draws actual tracked glyphs with zoom rotation movement alpha
     run("__WBApplyLive({minimap=false})");
     const auto interior=render(); CHECK(pixel(interior,419,384,3)==0);
     CHECK_FALSE(ui.engine().widgets().findByName("Minimap")->hostModel);
+
+    // Resource tracking shares the actual yellow ObjectIcons renderer, but never
+    // accepts a stale creature snapshot (or leaves resource dots after cancellation).
+    run(R"(
+        UIParent:SetAlpha(1); SetCVar('rotateMinimap',0); Minimap:SetZoom(0)
+        __WBResetCombat(); __WBAuraAdd('player',2481,false,0)
+        assert(__WB.trackingResourceMask()==32 and GetTrackingTexture()==__WB.spellInfo(2481).icon)
+        __WBApplyLive({minimap={worldspace='Test',x=1000,y=2000,heading=0,trackingMask=65568,resourceTrackingMask=32,blips={
+          {guid=10,name='Treasure chest',resource=6,x=1100,y=2000,reaction=4}}}})
+    )");
+    ui.pointer(-100,-100);
+    const auto treasure=render(); CHECK(pixel(treasure,419,384,0)>pixel(treasure,419,384,2));
+    ui.pointer(419,384); render(); run("assert(__WB.minimapHover=='Treasure chest')");
+    run("Minimap:SetZoom(4)");
+    const auto resourceZoom=render(); CHECK(pixel(resourceZoom,419,384,3)==0);
+    run("Minimap:SetZoom(0); __WB.minimap.heading=math.pi/2; SetCVar('rotateMinimap',1)");
+    const auto resourceTurn=render(); CHECK(pixel(resourceTurn,384,349,0)>pixel(resourceTurn,384,349,2));
+    run("SetCVar('rotateMinimap',0); UIParent:SetAlpha(0.5)");
+    const auto resourceFade=render(); CHECK(pixel(resourceFade,419,384,3)>=120); CHECK(pixel(resourceFade,419,384,3)<=129);
+    run("__WBAuraRemove('player',2481)");
+    const auto resourceEnd=render(); CHECK(pixel(resourceEnd,419,384,3)==0);
+    run("assert(__WB.minimapHover==nil and __WB.trackingResourceMask()==0); __WBAuraAdd('player',5225,false,0)");
+    const auto changedTracker=render(); CHECK(pixel(changedTracker,419,384,3)==0);
+    run("assert(__WB.trackingCreatureMask()==64); __WBAuraRemove('player',5225); __WBAuraAdd('player',2481,false,0); __WB.minimap.trackingMask=64");
+    const auto oldCreature=render(); CHECK(pixel(oldCreature,419,384,3)==0);
 }
 
 TEST_CASE("compass POIs retain positions or point along the rim at every zoom and heading", "[minimap][poi]") {
@@ -589,7 +921,7 @@ TEST_CASE("minimap compass art and client tooltip follow pose zoom rotation and 
     };
     const auto pixel = [](const wowcore::Image& im,int x,int y,int c) {return im.rgba[(y*im.w+x)*4+c];};
     const auto normal=render();
-    CHECK(pixel(normal,419,384,0)>pixel(normal,419,384,1)); // actual red quest !
+    CHECK(pixel(normal,419,384,0)>pixel(normal,419,384,1)); // actual client red flag
     CHECK(pixel(normal,356,384,2)>pixel(normal,356,384,0)); // actual blue custom marker
     CHECK(pixel(normal,384,356,3)>0); // location house
     int rimPixels=0;
@@ -598,14 +930,14 @@ TEST_CASE("minimap compass art and client tooltip follow pose zoom rotation and 
     ui.pointer(419,384); render();
     run("assert(__WB.minimapHover=='Talk to Alvor' and GameTooltip:IsOwned(Minimap) and GameTooltip:IsShown()); "
         "assert(GameTooltipTextLeft1:GetText()=='Talk to Alvor')");
-    ui.pointer(438,348); render();
+    ui.pointer(431,353); render();
     run("assert(__WB.minimapHover=='A distant objective')");
     ui.pointer(-100,-100); render();
     run("assert(__WB.minimapHover==nil and not GameTooltip:IsShown())");
     run("Minimap:SetZoom(4)");
     const auto zoomed=render();
     CHECK(pixel(zoomed,419,384,3)==0); // quest is now a rim arrow, no old icon
-    ui.pointer(449,384); render(); run("assert(__WB.minimapHover=='Talk to Alvor')");
+    ui.pointer(440,384); render(); run("assert(__WB.minimapHover=='Talk to Alvor')");
     run("Minimap:SetZoom(0); __WB.minimap.heading=math.pi/2; SetCVar('rotateMinimap',1)");
     ui.pointer(-100,-100);
     const auto rotated=render();
@@ -616,7 +948,7 @@ TEST_CASE("minimap compass art and client tooltip follow pose zoom rotation and 
     run("__WB.minimap.x=1000; UIParent:SetAlpha(0.5)"); ui.pointer(-100,-100);
     const auto faded=render(); CHECK(pixel(faded,419,384,3)>0); CHECK(pixel(faded,419,384,3)<=129);
     run("__WB.minimap.pois={}"); render();
-    CHECK_FALSE(ui.engine().widgets().findByName("Minimap")->hostModel);
+    CHECK(ui.engine().widgets().findByName("Minimap")->hostModel); // player arrow survives missing terrain/POIs
     run("__WBApplyLive({minimap=false})");
     const auto interior=render(); CHECK(pixel(interior,419,384,3)==0);
     run("assert(__WB.minimapHover==nil and not __WB.minimapTileExists)");
@@ -642,7 +974,8 @@ TEST_CASE("child terrain takes precedence and sparse holes and outer coverage us
     for(int x : {-4,0,4}) for(int y : {-4,0,4}) tile("parent",x,y,false);
     tile("child",1,1,true); tile("child",9,1,true); // offset grid, hole at (5,1)
     std::istringstream index(rows.str()); const auto atlas=wowcore::MinimapAtlas::read(index);
-    auto mpq=std::make_shared<wowcore::Mpq>(WOWBRIDGE_ROOT "/../WoW/client/Data",std::filesystem::path{},root);
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    auto mpq=std::make_shared<wowcore::Mpq>(env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data",std::filesystem::path{},root);
     const wowcore::ClientDb db(*mpq); wowcore::SoftTextures textures;
     wowcore::UiSession ui(mpq,db,textures,768,768); std::string error; REQUIRE(ui.start(&error));
     auto* L=ui.lua();
@@ -674,10 +1007,138 @@ TEST_CASE("child terrain takes precedence and sparse holes and outer coverage us
     run("__WBApplyLive({minimap=false})"); render(); run("assert(not __WB.minimapTileExists and __WB.minimapTile==nil)");
 }
 
+TEST_CASE("native compass rows switch between WoW positions and Skyrim rim art", "[client][minimap][presentation][native-compass]") {
+    // A portable atlas fixture exercises texture selection even without generated Skyrim art.
+    const auto root = std::filesystem::temp_directory_path() / ("wowcore-minimap-native-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root);
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{root};
+    std::vector<uint8_t> bytes(1172 + 512 * 512 * 4, 0);
+    const auto u32 = [&](size_t at, uint32_t value) { for (int i=0;i<4;++i) bytes[at+i]=static_cast<uint8_t>(value>>(i*8)); };
+    std::copy_n("BLP2", 4, bytes.begin()); u32(4, 1); bytes[8]=3; bytes[9]=8;
+    u32(12, 512); u32(16, 512); u32(20, 1172); u32(84, 512*512*4);
+    for (size_t at=1172; at<bytes.size(); at+=4) { bytes[at]=200; bytes[at+2]=200; bytes[at+3]=255; }
+    std::ofstream(root/"WB_Compass.blp", std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    auto mpq = std::make_shared<wowcore::Mpq>(env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data", root);
+    const wowcore::ClientDb db(*mpq);
+    const auto load = [&](const char* file) {
+        const auto data = mpq->read(file); REQUIRE(data);
+        auto image = wowee::pipeline::BLPLoader::load(*data);
+        return image.data.empty() ? wowee::pipeline::BLPLoader::decodeBaseLevel(image) : image.data;
+    };
+    const auto nativeArt = load("Interface\\Icons\\WB_Compass.blp");
+    const auto poiArt = load("Interface\\Minimap\\POIIcons.blp");
+    const auto objectArt = load("Interface\\Minimap\\ObjectIcons.blp");
+    const auto corpseArt = load("Interface\\Minimap\\Rotating-MinimapCorpseArrow.blp");
+    const auto guideArt = load("Interface\\Minimap\\Rotating-MinimapGuideArrow.blp");
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 768, 768);
+    std::string error; REQUIRE(ui.start(&error)); auto* L = ui.lua();
+    const auto run = [&](const std::string& script) {
+        const int rc = luaL_dostring(L, script.c_str());
+        INFO((rc ? lua_tostring(L, -1) : script)); REQUIRE(rc == 0);
+    };
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    run(R"(
+        __WBFixture('idle')
+        Minimap=CreateFrame('Minimap','Minimap',UIParent)
+        Minimap:SetWidth(140); Minimap:SetHeight(140); Minimap:SetPoint('CENTER',UIParent,'CENTER',0,0)
+        Minimap:EnableMouse(true)
+        GameTooltip=CreateFrame('GameTooltip','GameTooltip',UIParent); GameTooltip:Hide()
+        __WBApplyLive({minimap={worldspace='Test',x=1000,y=2000,heading=0,compass=true,pois={
+            {kind='location',name='Native location',x=1100,y=2050,bearing=90,placed=true,icon=16,
+             discovered=false,native=5,opacity=.5,scale=.5}}}})
+        assert(GetCVar('wbMinimapNativeArt') == '1')
+    )");
+    const auto render = [&]() {
+        ui.applyLiveMinimap(nullptr); ImDrawData* draw = nullptr;
+        for (int i=0;i<8;++i) { draw=ui.frame(.016f); textures.sync(draw); }
+        return draw;
+    };
+    const auto vertices = [&](const ImDrawData* draw, const std::vector<uint8_t>& art) {
+        std::vector<ImDrawVert> out;
+        for (const auto* list : draw->CmdLists) for (const auto& cmd : list->CmdBuffer) {
+            if (cmd.UserCallback) continue;
+            const auto* image = textures.get(static_cast<uint64_t>(cmd.GetTexID()));
+            if (!image || image->empty() || image->front().rgba != art) continue;
+            for (unsigned i=0;i<cmd.ElemCount;++i)
+                out.push_back(list->VtxBuffer[cmd.VtxOffset + list->IdxBuffer[cmd.IdxOffset + i]]);
+        }
+        return out;
+    };
+    const auto checkGlyph = [&](const std::vector<ImDrawVert>& verts, float x, float y, float size,
+                                wowcore::MapPoint lo, wowcore::MapPoint hi, ImU32 colour) {
+        REQUIRE_FALSE(verts.empty());
+        float x0=FLT_MAX, y0=FLT_MAX, x1=-FLT_MAX, y1=-FLT_MAX, u0=1, v0=1, u1=0, v1=0;
+        for (const auto& v : verts) {
+            x0=std::min(x0,v.pos.x); y0=std::min(y0,v.pos.y); x1=std::max(x1,v.pos.x); y1=std::max(y1,v.pos.y);
+            u0=std::min(u0,v.uv.x); v0=std::min(v0,v.uv.y); u1=std::max(u1,v.uv.x); v1=std::max(v1,v.uv.y);
+            CHECK(v.col == colour);
+        }
+        CHECK((x0+x1)/2 == Catch::Approx(x)); CHECK((y0+y1)/2 == Catch::Approx(y));
+        CHECK(x1-x0 == Catch::Approx(size)); CHECK(y1-y0 == Catch::Approx(size));
+        CHECK(u0 == Catch::Approx(lo.x).margin(1e-6)); CHECK(v0 == Catch::Approx(lo.y).margin(1e-6));
+        CHECK(u1 == Catch::Approx(hi.x).margin(1e-6)); CHECK(v1 == Catch::Approx(hi.y).margin(1e-6));
+    };
+    for (const bool placed : {true, false}) for (const int native : {0, 1}) {
+        INFO("placed=" << placed << " nativeArt=" << native);
+        run(std::string("__WB.minimap.pois[1].placed=") + (placed ? "true" : "false") +
+            "; SetCVar('wbMinimapNativeArt'," + std::to_string(native) + ")");
+        auto* draw = render();
+        if (placed && native == 0) {
+            CHECK(vertices(draw, nativeArt).empty());
+            checkGlyph(vertices(draw, poiArt), 419, 366.5, 16, {0,.25}, {.125,.375}, IM_COL32_WHITE);
+            ui.pointer(419,366.5); render(); run("assert(__WB.minimapHover=='Native location')");
+            ui.pointer(444,384); render(); run("assert(__WB.minimapHover==nil)");
+        } else {
+            CHECK(vertices(draw, poiArt).empty());
+            checkGlyph(vertices(draw, nativeArt), 444, 384, 9, {128.5/512,.5/512}, {159.5/512,31.5/512}, IM_COL32(255,255,255,127));
+            ui.pointer(444,384); render(); run("assert(__WB.minimapHover=='Native location')");
+        }
+        ui.pointer(-100,-100);
+    }
+    run("SetCVar('wbMinimapNativeArt',0); __WB.minimap.pois[1].placed=true");
+    for (const auto* kind : {"quest", "custom", "enemy"}) {
+        INFO(kind);
+        run(std::string("__WB.minimap.pois[1].kind='") + kind + "'");
+        auto* draw = render(); CHECK(vertices(draw, nativeArt).empty());
+        if (std::string(kind) == "quest")
+            checkGlyph(vertices(draw, poiArt), 419, 366.5, 16, {.75,0}, {.875,.125}, IM_COL32_WHITE);
+        else if (std::string(kind) == "custom")
+            checkGlyph(vertices(draw, objectArt), 419, 366.5, 8, {0,.25}, {.25,.5}, IM_COL32_WHITE);
+        else
+            checkGlyph(vertices(draw, objectArt), 419, 366.5, 8, {.25,0}, {.5,.25}, IM_COL32_WHITE);
+    }
+    run("__WB.minimap.pois[1].x=1000; __WB.minimap.pois[1].y=3000");
+    for (const auto* kind : {"location", "quest", "custom", "enemy"}) {
+        INFO(kind);
+        run(std::string("__WB.minimap.pois[1].kind='") + kind + "'");
+        auto* draw = render();
+        CHECK(vertices(draw, nativeArt).empty()); CHECK(vertices(draw, poiArt).empty()); CHECK(vertices(draw, objectArt).empty());
+        if (std::string(kind) == "quest" || std::string(kind) == "custom") {
+            const auto& art = std::string(kind) == "quest" ? corpseArt : guideArt;
+            const auto adapted = vertices(draw, art); REQUIRE_FALSE(adapted.empty());
+            run("__WB.minimap.pois[1].native=nil");
+            const auto ordinary = vertices(render(), art); REQUIRE(ordinary.size() == adapted.size());
+            for (size_t i=0;i<ordinary.size();++i) {
+                CHECK(ordinary[i].pos.x == adapted[i].pos.x); CHECK(ordinary[i].pos.y == adapted[i].pos.y);
+                CHECK(ordinary[i].uv.x == adapted[i].uv.x); CHECK(ordinary[i].uv.y == adapted[i].uv.y);
+                CHECK(ordinary[i].col == adapted[i].col);
+            }
+            run("__WB.minimap.pois[1].native=5");
+        } else {
+            CHECK(vertices(draw, corpseArt).empty()); CHECK(vertices(draw, guideArt).empty());
+        }
+    }
+    CHECK(ui.engine().lastError().empty());
+}
+
 TEST_CASE("Native compass badges retain bearings across zoom and use native opacity", "[client][minimap][poi][native-compass]") {
     const auto root=std::filesystem::path(WOWBRIDGE_ROOT)/"build/compass";
     if (!std::filesystem::exists(root/"WB_Compass.blp")) SKIP("Generate local Skyrim compass atlas first");
-    auto mpq=std::make_shared<wowcore::Mpq>(WOWBRIDGE_ROOT "/../WoW/client/Data",root);
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    auto mpq=std::make_shared<wowcore::Mpq>(env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data",root);
     const wowcore::ClientDb db(*mpq); wowcore::SoftTextures textures; wowcore::UiSession ui(mpq,db,textures,768,768);
     std::string error; REQUIRE(ui.start(&error)); auto* L=ui.lua();
     const auto run=[&](const char* code) { const int rc=luaL_dostring(L,code); INFO((rc ? lua_tostring(L,-1) : code)); REQUIRE(rc==0); };

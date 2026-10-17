@@ -1,6 +1,7 @@
 #include "render/ItemPreview.h"
 #include "Integration.h"
 
+#include "Armory.h"
 #include "Character.h"
 #include "Config.h"
 #include "Gear.h"
@@ -26,6 +27,11 @@ namespace ItemPreview
 		std::map<std::uint32_t, std::shared_ptr<const Asset>> g_assets;
 		using DisplayKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
 		std::map<DisplayKey, std::shared_ptr<const Asset>> g_displays;
+		// The Armory's items load when a menu or the ground first shows one (its 8,500 are not preloaded): a queue one
+		// background worker drains, each entry asked once until their race or sex changes.
+		std::set<std::uint32_t> g_wanted;
+		std::deque<std::pair<std::uint32_t, bool>> g_queue;   // entry, the player has a character to dress
+		bool g_working = false;
 		RE::TESBoundObject* g_selected = nullptr;
 		std::uint32_t g_entry = 0;
 		std::uint64_t g_generation = 0;
@@ -57,7 +63,7 @@ namespace ItemPreview
 
 		void Select(RE::TESBoundObject* form, const char* why)
 		{
-			std::lock_guard lock(g_lock);
+			std::unique_lock lock(g_lock);
 			if (form != g_selected || !form) {
 				g_selected = form;
 				g_entry = form ? Gear::EntryOf(form) : 0;
@@ -71,6 +77,9 @@ namespace ItemPreview
 				g_routeFailed = false;
 			}
 			logger::info("item preview: {} form={:08X} entry={} generation={}", why, form ? form->GetFormID() : 0, g_entry, g_generation);
+			const auto entry = g_entry;
+			lock.unlock();
+			if (entry) { Want(entry); }
 		}
 
 		// Stand at t=0; measure vertices referenced by visible batches, using the same pose as DrawItem.
@@ -577,6 +586,46 @@ namespace ItemPreview
 
 	namespace
 	{
+		// Each entry's item-alone assets (one display, inventory type, race and sex share one), on the loading worker.
+		void Load(const wowcore::Mpq& mpq, const wowcore::ItemDisplayCatalog& catalog, const std::vector<std::uint32_t>& entries,
+			const wowcore::Appearance& looks, bool hasCharacter, std::uint64_t appearanceGeneration, bool all)
+		{
+			for (const auto entry : entries) {
+				const auto type = catalog.at(entry).inventoryType;
+				const bool armorOnly = wowcore::characterPreviewSlot(type).has_value();
+				const bool appearanceDependent = armorOnly || type == 1;
+				if (!all && !appearanceDependent) { continue; }
+				if (appearanceDependent) {
+					std::lock_guard lock(g_lock);
+					if (!hasCharacter || appearanceGeneration != g_appearanceGeneration) { continue; }
+				}
+				try {
+					const DisplayKey key{ catalog.at(entry).displayId, type,
+						appearanceDependent ? looks.race : 0, appearanceDependent ? looks.sex : 0 };
+					{
+						std::lock_guard lock(g_lock);
+						if (const auto it = g_displays.find(key); it != g_displays.end()) {
+							if (!appearanceDependent || appearanceGeneration == g_appearanceGeneration) { g_assets[entry] = it->second; }
+							continue;
+						}
+					}
+					auto item = std::make_shared<wowcore::ItemPreview>(armorOnly ?
+						wowcore::loadArmorItemPreview(mpq, entry, catalog, looks) : wowcore::loadItemPreview(mpq, entry, catalog, looks));
+					logger::info("item preview: preload entry={} display={} status={} detail={} parts={} armorOnly={} appearanceGeneration={}", entry, item->displayId,
+						wowcore::itemPreviewStatusName(item->status), item->detail, item->parts.size(), item->armorOnly, appearanceGeneration);
+					if (item->status != wowcore::ItemPreviewStatus::Ready) { continue; }
+					auto asset = std::make_shared<Asset>();
+					asset->item = std::move(item);
+					asset->inventoryType = type;
+					if (!Bounds(*asset)) { logger::warn("item preview: entry={} unsupported material/bones/bounds; Skyrim retained", entry); continue; }
+					logger::info("item preview: ready entry={} centre=({},{},{}) radius={}", entry, asset->centre.x, asset->centre.y, asset->centre.z, asset->radius);
+					std::lock_guard lock(g_lock);
+					g_displays[key] = asset;
+					if (!appearanceDependent || appearanceGeneration == g_appearanceGeneration) { g_assets[entry] = std::move(asset); }
+				} catch (const std::exception& e) { logger::warn("item preview: entry={} preload failed: {}; Skyrim retained", entry, e.what()); }
+			}
+		}
+
 		void Preload(bool all)
 		{
 			const auto looks = Character::Looks();
@@ -589,6 +638,7 @@ namespace ItemPreview
 				std::erase_if(g_assets, [](const auto& entry) {
 					return entry.second->item->armorOnly || entry.second->inventoryType == 1;  // helmets are race/sex variants too
 				});
+				g_wanted.clear();   // the Armory's are asked again as they show
 				++g_generation;  // any in-flight draw must not hide the native node for the previous appearance
 				g_info.generation = g_generation;
 				g_info.wow = g_info.armorOnly = false;
@@ -605,40 +655,7 @@ namespace ItemPreview
 					std::vector<std::uint32_t> entries;
 					for (const auto entry : { 873u, 16897u }) { if (catalog.contains(entry)) { entries.push_back(entry); } }
 					for (const auto& [entry, display] : catalog) { if (entry != 873 && entry != 16897) { entries.push_back(entry); } }
-					for (const auto entry : entries) {
-						const auto type = catalog.at(entry).inventoryType;
-						const bool armorOnly = wowcore::characterPreviewSlot(type).has_value();
-						const bool appearanceDependent = armorOnly || type == 1;
-						if (!all && !appearanceDependent) { continue; }
-						if (appearanceDependent) {
-							std::lock_guard lock(g_lock);
-							if (!hasCharacter || appearanceGeneration != g_appearanceGeneration) { continue; }
-						}
-						try {
-							const DisplayKey key{ catalog.at(entry).displayId, type,
-								appearanceDependent ? looks.race : 0, appearanceDependent ? looks.sex : 0 };
-							{
-								std::lock_guard lock(g_lock);
-								if (const auto it = g_displays.find(key); it != g_displays.end()) {
-									if (!appearanceDependent || appearanceGeneration == g_appearanceGeneration) { g_assets[entry] = it->second; }
-									continue;
-								}
-							}
-							auto item = std::make_shared<wowcore::ItemPreview>(armorOnly ?
-								wowcore::loadArmorItemPreview(mpq, entry, catalog, looks) : wowcore::loadItemPreview(mpq, entry, catalog, looks));
-							logger::info("item preview: preload entry={} display={} status={} detail={} parts={} armorOnly={} appearanceGeneration={}", entry, item->displayId,
-								wowcore::itemPreviewStatusName(item->status), item->detail, item->parts.size(), item->armorOnly, appearanceGeneration);
-							if (item->status != wowcore::ItemPreviewStatus::Ready) { continue; }
-							auto asset = std::make_shared<Asset>();
-							asset->item = std::move(item);
-							asset->inventoryType = type;
-							if (!Bounds(*asset)) { logger::warn("item preview: entry={} unsupported material/bones/bounds; Skyrim retained", entry); continue; }
-							logger::info("item preview: ready entry={} centre=({},{},{}) radius={}", entry, asset->centre.x, asset->centre.y, asset->centre.z, asset->radius);
-							std::lock_guard lock(g_lock);
-							g_displays[key] = asset;
-							if (!appearanceDependent || appearanceGeneration == g_appearanceGeneration) { g_assets[entry] = std::move(asset); }
-						} catch (const std::exception& e) { logger::warn("item preview: entry={} preload failed: {}; Skyrim retained", entry, e.what()); }
-					}
+					Load(mpq, catalog, entries, looks, hasCharacter, appearanceGeneration, all);
 				} catch (const std::exception& e) { logger::error("item preview: preload failed: {}; Skyrim retained", e.what()); }
 			}).detach();
 		}
@@ -659,6 +676,39 @@ namespace ItemPreview
 	}
 
 	void Reset() { Select(nullptr, "reset"); }
+
+	void Want(std::uint32_t a_entry)
+	{
+		if (!Armory::Find(a_entry)) { return; }   // WoWBridge.esp's are preloaded
+		{
+			std::lock_guard lock(g_lock);
+			if (!g_started || g_assets.contains(a_entry) || !g_wanted.insert(a_entry).second) { return; }
+			g_queue.emplace_back(a_entry, !Character::Get().name.empty());
+			if (g_working) { return; }
+			g_working = true;
+		}
+		std::thread([root = Config::ClientData()] {
+			std::lock_guard loading(g_loading);
+			std::optional<wowcore::Mpq> mpq;
+			for (;;) {
+				std::pair<std::uint32_t, bool> next;
+				wowcore::Appearance looks;
+				std::uint64_t generation;
+				{
+					std::lock_guard lock(g_lock);
+					if (g_queue.empty()) { g_working = false; return; }
+					next = g_queue.front();
+					g_queue.pop_front();
+					looks = g_appearance, generation = g_appearanceGeneration;
+				}
+				try {
+					if (!mpq) { mpq.emplace(root); }
+					const auto& look = Armory::Find(next.first)->look;   // read-only after data load
+					Load(*mpq, { { next.first, { look.displayId, look.inventoryType } } }, { next.first }, looks, next.second, generation, true);
+				} catch (const std::exception& e) { logger::warn("item preview: entry={} load failed: {}; Skyrim retained", next.first, e.what()); }
+			}
+		}).detach();
+	}
 	std::shared_ptr<const Asset> AssetFor(std::uint32_t a_entry)
 	{
 		std::lock_guard lock(g_lock);

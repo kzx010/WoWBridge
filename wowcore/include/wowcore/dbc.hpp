@@ -28,10 +28,20 @@ private:
     std::unordered_map<uint32_t, uint32_t> index_;
 };
 
+struct HelmetVisibility {
+    uint32_t id = 0;
+    bool hair = false, facialHair = false, ears = false;  // true means hidden
+};
+// ItemDisplayInfo.HelmetGeosetVisID[sex] -> HelmetGeosetVisData.HideGeoset[5], build 1.12.1.5875.
+// The masks use the race ID as the bit index (Human = 1 << 1). No visibility ID means nothing hidden.
+std::optional<HelmetVisibility> helmetVisibility(const Dbc& displays, const Dbc& visibility,
+    uint32_t displayId, uint32_t race, uint32_t sex);
+
 struct SpellEffect {
     uint32_t effect = 0, aura = 0, chainTargets = 0, periodMs = 0;
     int32_t basePoints = 0, dieSides = 0, baseDice = 0, misc = 0;
     float pointsPerLevel = 0, radius = 0, chainAmplitude = 1;
+    float multiple = 0, comboPoints = 0;   // EffectMultipleValue ($e), EffectPointsPerComboPoint ($b)
 };
 
 struct SpellInfo {
@@ -39,6 +49,7 @@ struct SpellInfo {
     SpellEffect effects[3];
     uint32_t spellLevel = 0, baseLevel = 0, maxLevel = 0, attributesExB = 0, shapeshiftMask = 0, manaCostPct = 0;
     uint32_t procCharges = 0, procChance = 0;
+    uint32_t stackAmount = 0, maxTargetLevel = 0, maxTargets = 0;   // $u, $v, $i
     std::vector<std::pair<uint32_t, uint32_t>> reagents;   // item, count
     std::string name, rank, description, auraDescription, icon;   // icon: full texture path
     uint32_t attributes = 0, attributesEx = 0, shapeshiftExclude = 0;
@@ -109,6 +120,14 @@ struct LevelUpEffect {
     uint32_t soundId = 0;              // SoundEntries LEVELUPSOUND; resolve with ClientDb::sound
 };
 
+// A text emote (EmotesText, by its slash token: "DANCE"): what the player sees in chat, alone or at a target, the animation
+// it plays (Emotes) and the race/sex's voice (EmotesTextSound). specProc: 0 once, 1 a stand state (sit, sleep, kneel),
+// 2 a loop until the player moves (dance).
+struct EmoteText {
+    uint32_t id = 0, anim = 0, specProc = 0, standState = 0, sound = 0;   // standState: 1 sit, 3 sleep, 8 kneel
+    std::string alone, atTarget;   // "You burst into dance.", "You dance with %s."
+};
+
 class ClientDb {
 public:
     explicit ClientDb(const Mpq& mpq);
@@ -135,11 +154,14 @@ public:
     // A form is Creature regardless of the equipped weapon. No match returns nullopt; no sound returns id 0.
     std::optional<MeleeSounds> meleeSounds(MeleeSoundSource source, uint32_t id = 0,
         uint32_t parryType = 0, uint32_t impactIndex = 0, bool crit = false) const;
+    std::optional<EmoteText> emote(std::string_view token, uint32_t race, uint32_t sex) const;
     bool ok() const { return ok_; }
 
 private:
     std::optional<Dbc> spell_, icon_, cast_, duration_, range_, skillAbility_, skillLine_, dispel_, radius_, forms_, sounds_,
-        visuals_, kits_, effectNames_, swings_, impacts_, subclasses_, creatureDisplays_, creatureModels_, creatureSounds_, itemDisplays_;
+        visuals_, kits_, effectNames_, swings_, impacts_, subclasses_, creatureDisplays_, creatureModels_, creatureSounds_, itemDisplays_,
+        emotesText_, emotes_, emotesTextData_, emotesTextSound_;
+    std::unordered_map<std::string, uint32_t> emoteTokens_;   // upper-case token -> EmotesText row
     std::unordered_map<uint32_t, SoundInfo> soundsById_;
     std::unordered_map<std::string, uint32_t> soundNames_;   // lower case -> id (the first of a name)
     mutable std::unordered_map<uint32_t, SpellInfo> spells_;

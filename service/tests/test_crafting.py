@@ -22,6 +22,28 @@ class Crafting(unittest.TestCase):
         for level in (15, 30, 60):
             self.assertEqual(self.stats({**self.caster, 'level': level})['attack_rating'], level * 5)
 
+    def test_vanilla_weapon_and_bare_hands_swing_at_their_native_damage(self):
+        # A vanilla weapon (no WoW entry) and bare hands (the plugin's UnarmedDamage) govern the swing like a WoW
+        # weapon's Skyrim damage: WoW's roll lends spread/table/crits only, attack power widens nothing. Before, both
+        # fell back to scaling the whole WoW roll (AP included): a Daedric warhammer swung as WoW's 1-2 fist.
+        target = {'level': 60, 'alive': True, 'attackable': True, 'in_front': False}
+        vanilla = {**self.caster, 'items': [], 'equipment_modifiers': {'weapon_entry': 0, 'weapon_skill': 'TwoHanded',
+                   'weapon_damage': 25, 'temper_multiplier': 1}}
+        fists = {**self.caster, 'items': [], 'equipment_modifiers': {'weapon_entry': 0, 'weapon_skill': 'OneHanded',
+                 'weapon_damage': 4, 'weapon_unarmed': True}}
+        legacy = {**self.caster, 'items': [], 'equipment_modifiers': {}}
+        def average(caster):
+            total = n = 0
+            for seed in range(300):
+                out = self.service.handle({'op': 'melee', 'target': target, 'seed': seed, 'caster': caster})
+                if out.get('outcome') == 'hit' and out.get('damage', 0) > 0:
+                    total += out['damage']; n += 1
+            return total / n if n else 0.0
+        hammer, punch, old = average(vanilla), average(fists), average(legacy)
+        self.assertGreater(hammer, punch * 3)                 # the warhammer is not a fist
+        self.assertLess(punch, old)                           # a punch no longer carries the whole WoW roll's AP
+        self.assertAlmostEqual(hammer / punch, 25 / 4, delta=1.5)   # both at their native damage, same multiplier
+
     def test_tempering_changes_cached_stats_and_same_seed_combat(self):
         before = self.stats(self.caster)
         improved = {**self.caster, 'equipment_modifiers': {
@@ -80,6 +102,12 @@ class Crafting(unittest.TestCase):
         free = copy.deepcopy(enchanted)
         free['equipment_modifiers']['enchantments'].append({'av': 110, 'magnitude': 75})
         self.assertEqual(costs(free), 0)
+        # A potion or blessing: Skyrim's live Fortify Destruction value replaces the worn enchantments' sum.
+        potion = copy.deepcopy(self.caster)
+        potion['equipment_modifiers'] = {'enchantments': [{'av': 110, 'magnitude': 25}], 'live': {'110': 50}}
+        self.assertAlmostEqual(costs(potion), costs(self.caster) * .5, delta=1)
+        with self.assertRaises(Exception):
+            costs({**self.caster, 'equipment_modifiers': {'live': {'110': 'nan'}}})
 
     def test_feral_claws_ignore_weapon_tempering_and_weapon_enchants(self):
         caster = {**self.caster, 'form': 'cat'}

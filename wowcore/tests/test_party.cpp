@@ -5,6 +5,7 @@
 #include "wowcore/soft_raster.hpp"
 #include "addons/lua_engine.hpp"
 #include "ui/widget_tree.hpp"
+#include "core/app_clock.hpp"
 extern "C" {
 #include <lauxlib.h>
 }
@@ -169,4 +170,191 @@ TEST_CASE("Skyrim party snapshots drive client frames, aliases, auras and target
     INFO((result ? lua_tostring(reloaded.lua(),-1) : ""));
     REQUIRE(result==0);
     CHECK(reloaded.engine().lastError().empty());
+}
+
+TEST_CASE("Her say and yell show in chat and over her head as the client's bubble", "[client][api][chat]") {
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data = env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data / "interface.MPQ")) SKIP("WoW 1.12 client data not present");
+    auto mpq = std::make_shared<wowcore::Mpq>(data);
+    for (const char* art : {"Interface\\Tooltips\\ChatBubble-Background.blp", "Interface\\Tooltips\\ChatBubble-Backdrop.blp",
+            "Interface\\Tooltips\\ChatBubble-Tail.blp"}) {
+        INFO(art); CHECK(mpq->exists(art));
+    }
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 1280, 720);
+    std::string err;
+    REQUIRE(ui.start(&err));
+    auto* L = ui.lua();
+    auto run = [&](const char* script) {
+        const int result = luaL_dostring(L, script);
+        INFO((result ? lua_tostring(L, -1) : ""));
+        REQUIRE(result == 0);
+    };
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&err));
+    run(R"(
+        __WBLogin() __WBSkyrimMenus()
+        __WB.playerHead={x=0.5,y=0.4}
+        local me=UnitName('player')
+        __WBFire('CHAT_MSG_SAY','Well met.',me,GetDefaultLanguage('player'))
+        assert(WBChatBubble and WBChatBubble:IsShown() and WBChatBubbleText:GetText()=='Well met.')
+        local r,g,b=WBChatBubbleText:GetTextColor() assert(r>0.9 and g>0.9 and b>0.9)
+        __WBFire('CHAT_MSG_YELL','For the Kaldorei!',me,GetDefaultLanguage('player'))
+        r,g,b=WBChatBubbleText:GetTextColor() assert(r>0.9 and g<0.5 and WBChatBubbleText:GetText()=='For the Kaldorei!')
+        WBChatBubble:Hide()
+        __WBFire('CHAT_MSG_SAY','Someone else.','Lucan Valerius','Common')
+        assert(not WBChatBubble:IsShown())
+        SetCVar('ChatBubbles','0')
+        __WBFire('CHAT_MSG_SAY','Hidden.',me,GetDefaultLanguage('player'))
+        assert(not WBChatBubble:IsShown())
+        SetCVar('ChatBubbles','1')
+    )");
+}
+
+// What people say near the player shows over their heads as the client's own bubble (wowapi_bubbles.lua: CGChatBubbleFrame's
+// font, sizes, colours, timings and fades), at the point the host projects with their nameplate rows.
+TEST_CASE("People's speech shows the client's chat bubble over them, follows them and fades", "[client][api][chat][bubbles]") {
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data = env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data / "interface.MPQ")) SKIP("WoW 1.12 client data not present");
+    wowee::core::setAppTimeSeconds(100);
+    auto mpq = std::make_shared<wowcore::Mpq>(data);
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 1280, 720);
+    std::string err;
+    REQUIRE(ui.start(&err));
+    auto* L = ui.lua();
+    auto run = [&](const char* script) {
+        const int result = luaL_dostring(L, script);
+        INFO((result ? lua_tostring(L, -1) : ""));
+        REQUIRE(result == 0);
+    };
+    auto at = [&](double t) {
+        wowee::core::setAppTimeSeconds(100 + t); textures.sync(ui.frame(1.0f / 60));
+        INFO(ui.engine().lastError()); CHECK(ui.engine().lastError().empty());
+    };
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&err));
+    run(R"(
+        __WBLogin() __WBSkyrimMenus()
+        local function row(guid,bx,by,yards) return {guid=guid,name='Person '..guid,level=20,health=100,healthMax=100,
+          reaction=5,attackable=false,classification='normal',distance=yards,x=bx,y=by+0.05,bx=bx,by=by} end
+        bubbleRows={row(20,0.4,0.3,5),row(21,0.7,0.35,8),row(23,0.2,0.2,12),row(26,0.6,0.6,4)}
+        __WBApplyLive({nameplates={epoch=3,units=bubbleRows}})
+        __WBSay('Whiterun Guard','Watch the skies, traveler.',20,5)
+        __WBSay('Lydia','I am sworn to carry your burdens.',21,8)
+        __WBSay('Far Away','Nobody near hears this.',22,25)
+        __WBSay('Nobody','Only in chat.')
+        assert(string.find(ChatFrame1:GetMessageInfo(ChatFrame1:GetNumMessages()),'Nobody says: Only in chat.',1,true))
+        local a,b=__WBChatBubbleFrame(20),__WBChatBubbleFrame(21)
+        assert(a and b and a~=b and a:IsShown() and b:IsShown() and a:GetAlpha()==0, 'two speakers, two bubbles')
+        assert(not __WBChatBubbleFrame(22) and not __WBChatBubbleFrame(nil), 'beyond 20 yards or no unit: chat only')
+        assert(a.text:GetText()=='Watch the skies, traveler.' and b.text:GetText()=='I am sworn to carry your burdens.')
+        local r,g,bl=a.text:GetTextColor() local c=ChatTypeInfo.MONSTER_SAY
+        assert(math.abs(r-c.r)<.01 and math.abs(g-c.g)<.01 and math.abs(bl-c.b)<.01 and bl<.7, 'MONSTER_SAY colour')
+        local w,h=__WBViewportSize() local diag=math.sqrt(w*w+h*h)
+        local font,size,flags=a.text:GetFont()
+        assert(font==NAMEPLATE_FONT and math.abs(size-0.01*diag)<.01 and flags=='', tostring(font)..' '..size..' '..flags)
+        local natural=a.text:GetStringWidth()
+        assert(natural>32 and natural<0.2*diag and math.abs(a:GetWidth()-natural-0.02*diag)<.01, 'its own width')
+        assert(math.abs(a:GetHeight()-a.text:GetStringHeight()-0.02*diag)<.01 and a.text:GetStringHeight()<2*size, 'one line')
+        assert(a.life==5 and b.life==2+0.75*7, 'two seconds and three quarters a word: '..a.life..' '..b.life)
+        __WBSay('Heimskr','Talos! Mightiest Nord of all time! He who was born in Atmora as Hjalti Early-Beard, rose to unite us all!',23,12)
+        local long=__WBChatBubbleFrame(23)
+        assert(math.abs(long.text:GetWidth()-0.2*diag)<.01 and long.text:GetHeight()>2*size, 'wraps at 0.2 DDC')
+        __WBSay('Lydia','Hm.',21,8)
+        assert(math.abs(__WBChatBubbleFrame(21):GetWidth()-32-0.02*diag)<.01, 'at least 32 wide')
+        __WBSay('Lydia','I am sworn to carry your burdens.',21,8)
+        __WBSay('Belethor','|cff1eff00|Hitem:2589:0:0:0|h[Linen Cloth]|h|r for sale.',26,4)
+        assert(__WBChatBubbleFrame(26).text:GetText()=='Linen Cloth for sale.', 'a link as its name')
+        SetCVar('ChatBubbles','0')
+        __WBSay('Gerdur','Nobody sees this.',24,3)
+        assert(not __WBChatBubbleFrame(24) and string.find(ChatFrame1:GetMessageInfo(ChatFrame1:GetNumMessages()),'Nobody sees this.',1,true))
+        SetCVar('ChatBubbles','1')
+    )");
+    at(0);   // a frame made since the last layout runs its OnUpdate from the next
+    at(0.1);
+    run(R"(
+        local a,b=__WBChatBubbleFrame(20),__WBChatBubbleFrame(21)
+        assert(math.abs(a:GetAlpha()-0.4)<.01, 'fading in over a quarter second: '..a:GetAlpha())
+        local w,h=__WBViewportSize()
+        local x=a.text:GetLeft()+a.text:GetWidth()/2
+        assert(math.abs(x-0.4*w)<.5 and math.abs(a.text:GetBottom()-0.7*h)<.5, 'text on its point: '..x..','..a.text:GetBottom())
+        assert(math.abs(a.tail:GetRight()-x)<.5 and math.abs(a.tail:GetTop()-a:GetBottom()-4)<.5 and a.tail:GetWidth()==16)
+        assert(a:GetFrameLevel()>b:GetFrameLevel() and b:GetFrameLevel()>__WBChatBubbleFrame(23):GetFrameLevel(), 'nearer over farther')
+        bubbleRows[1].bx=0.5 bubbleRows[1].by=0.25
+        table.remove(bubbleRows,2) -- Lydia out of sight
+        __WBApplyLive({nameplates={epoch=3,units=bubbleRows}})
+    )");
+    at(0.2);
+    at(0.5);
+    run(R"(
+        local a,b=__WBChatBubbleFrame(20),__WBChatBubbleFrame(21)
+        local w,h=__WBViewportSize()
+        assert(math.abs(a.text:GetLeft()+a.text:GetWidth()/2-0.5*w)<.5 and math.abs(a.text:GetBottom()-0.75*h)<.5, 'follows its person')
+        assert(a:IsShown() and a:GetAlpha()==1)
+        assert(b and not b:IsShown(), 'out of sight: faded out, kept')
+        tinsert(bubbleRows,{guid=21,name='Lydia',level=20,health=100,healthMax=100,reaction=5,attackable=false,
+          classification='normal',distance=8,x=0.7,y=0.4,bx=0.7,by=0.35})
+        __WBApplyLive({nameplates={epoch=3,units=bubbleRows}})
+    )");
+    at(0.6);
+    at(0.7);
+    run("local b=__WBChatBubbleFrame(21) assert(b:IsShown() and math.abs(b:GetAlpha()-0.4)<.01, 'back in sight: fades in')");
+    at(5.2);
+    run("assert(__WBChatBubbleFrame(20):GetAlpha()==1)");
+    at(5.3);
+    at(5.4);
+    run("local a=__WBChatBubbleFrame(20) assert(math.abs(a:GetAlpha()-0.6)<.01, 'fading out from its time and a quarter') saved=a");
+    at(5.6);
+    run(R"(
+        assert(not __WBChatBubbleFrame(20) and not saved:IsShown(), 'gone')
+        __WBSay('Hulda','Welcome to the Bannered Mare.',20,5)
+        assert(__WBChatBubbleFrame(20):IsShown() and WBChatBubble4 and not WBChatBubble5, 'a freed frame is reused')
+        __WB.playerHead={x=0.5,y=0.4}
+        __WBFire('CHAT_MSG_SAY','Well met.',UnitName('player'),GetDefaultLanguage('player'))
+        assert(__WBChatBubbleFrame('player')==WBChatBubble and WBChatBubble.life==2, 'theirs: a second and half a second a word')
+    )");
+}
+
+TEST_CASE("Typed emote slash commands reach the host as DoEmote does", "[client][api][chat][emote]") {
+    const char* env = std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data = env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data / "interface.MPQ")) SKIP("WoW 1.12 client data not present");
+    auto mpq = std::make_shared<wowcore::Mpq>(data);
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq, db, textures, 1280, 720);
+    std::string err;
+    REQUIRE(ui.start(&err));
+    auto* L = ui.lua();
+    auto run = [&](const char* script) {
+        const int result = luaL_dostring(L, script);
+        INFO((result ? lua_tostring(L, -1) : ""));
+        REQUIRE(result == 0);
+    };
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&err));
+    run(R"(
+        __WBLogin() __WBSkyrimMenus()
+        local sent={}
+        local real=__WBHost
+        __WBHost=function(cmd,a,b,c,d) if cmd=='emote' or cmd=='chat' then tinsert(sent,cmd..':'..tostring(a)) end
+          if real then return real(cmd,a,b,c,d) end end
+        local box=DEFAULT_CHAT_FRAME.editBox or ChatFrameEditBox
+        assert(box, 'edit box '..tostring(ChatFrameEditBox)..' '..tostring(DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME:GetName()))
+        for _,line in ipairs({'/dance','/s Well met.','/wave'}) do
+          box:Show() box:SetText(line) ChatEdit_SendText(box) box:Hide()
+        end
+        __WBHost=real
+        assert(sent[1]=='emote:DANCE', tostring(sent[1]))
+        assert(sent[2]=='chat:Well met.', tostring(sent[2]))
+        assert(sent[3]=='emote:WAVE', tostring(sent[3]))
+    )");
 }

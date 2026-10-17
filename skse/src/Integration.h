@@ -1,8 +1,14 @@
 #pragma once
 #include "IntegrationState.h"
 
+namespace SKSE { class SerializationInterface; }
+
 namespace Integration
 {
+    constexpr bool CanChooseClass(Mode mode, bool offered) { return mode != Mode::WoW || offered; }
+    constexpr bool ClassBack(Mode mode, bool creator) { return creator && mode != Mode::WoW; }
+    bool CanChooseClass(); // synchronized decision for render/input threads
+    void UpdateClassChoice(); // main thread: publish after mode or customization-offer changes
     void Init();
     void Tick();
     bool Active(); // render/input threads: no engine or Lua access

@@ -11,6 +11,7 @@ extern "C" {
 }
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include "pipeline/blp_loader.hpp"
@@ -245,7 +246,7 @@ TEST_CASE("Skyrim bags use client frames, APIs, controls, tooltips and host comm
         if r==0 and g==1 and b==0 and string.sub(text,1,1)~='<' then effect=true end
         if text=='<Right Click to Equip>' or text=='<Right Click to Unequip>' then hint=true end
       end
-      assert(effect and hint)   -- its enchantment in green, then what she can do with it
+      assert(effect and hint)   -- its enchantment in green, then what the player can do with it
       assert(getglobal('GameTooltipTextLeft'..GameTooltip:NumLines()):GetText()=='<Tab, then Items: Sell>')
       local link=GetContainerItemLink(0,3) assert(string.find(link,'|cff1eff00|Hskyrim:',1,true)==1)
       assert(GameTooltip:SetHyperlink(link)==1)
@@ -265,7 +266,7 @@ TEST_CASE("Skyrim bags use client frames, APIs, controls, tooltips and host comm
       assert(not __WB.bagCursor and not __WB.cursorTexture())
       __WBBagPage(1) ClearCursor()
       assert(not CursorHasItem() and not __WB.bagCursor)
-      __WBBagPage(4) assert(__WB.bagPage==3)   -- no page past her last
+      __WBBagPage(4) assert(__WB.bagPage==3)   -- no page past their last
       __WBBagPage(1) PickupContainerItem(0,1) PickupContainerItem(3,16)   -- into the hole
       assert(__WB.bagItems[64].key=='staff' and __WB.bagPages==3)
       assert(select('#',GetContainerItemInfo(0,1))==0)
@@ -286,7 +287,8 @@ TEST_CASE("Skyrim bags use client frames, APIs, controls, tooltips and host comm
       assert(GetContainerItemInfo(0,1)==__WBItemIcon(20298))
       GameTooltip:SetBagItem(0,1) assert(GameTooltipTextLeft2:GetText()=='Two-Hand')
       assert(GameTooltipTextLeft5:GetText()=='+20 Intellect')
-      -- Live armour changes the character pane as well as bags, using WoW cloth/armour/stats and set bonuses.
+      -- Live armour changes the character pane as well as bags, using WoW cloth/stats and set bonuses with Skyrim's
+      -- own armour for the copy (its live rating, not WoW's 176).
       local set={id=205,name='Cenarion Raiment',items={{entry=16833,name='Cenarion Vestments'},
         {entry=16834,name='Cenarion Helm'}, {entry=16835,name='Cenarion Leggings'}},bonuses={{spell=23557,threshold=3}}}
       local chest={key='cenarion',form=0xfe810,name='Cenarion Vestments',pos=1,count=1,entry=16833,display=31797,
@@ -301,7 +303,8 @@ TEST_CASE("Skyrim bags use client frames, APIs, controls, tooltips and host comm
       local armor,classes,bonus
       for n=1,GameTooltip:NumLines() do
         local text=getglobal('GameTooltipTextLeft'..n):GetText()
-        if text=='176 Armor' then armor=true end
+        if text=='20 Armor' then armor=true end
+        assert(text~='176 Armor',text)
         if text=='Classes: Druid' then classes=true end
         if string.find(text,'(3) Set:',1,true)==1 then
           local r,g,b=getglobal('GameTooltipTextLeft'..n):GetTextColor() bonus=(r==0 and g==1 and b==0)
@@ -317,18 +320,19 @@ TEST_CASE("Skyrim bags use client frames, APIs, controls, tooltips and host comm
         local r,g,b=getglobal('GameTooltipTextLeft'..n):GetTextColor() inactive=(r==0.5 and g==0.5 and b==0.5)
       end end
       assert(inactive)
-      -- Thunderfury's nature damage and chance-on-hit text are WoW data, rather than converted Skyrim damage.
+      -- Thunderfury's chance-on-hit text is WoW data; its damage is Skyrim's 20, spread over WoW's two ranges.
       __WBInventory({{key='thunderfury',form=0xfe813,name='Thunderfury',pos=1,count=1,entry=19019,display=30606,quality=5,
         kind='Weapon',worn=true,inventorySlots={16},damage=20,
         wow={class=2,subclass=7,InventoryType=13,dmg_min1=44,dmg_max1=115,dmg_min2=16,dmg_max2=30,dmg_type2=3,
           delay=1900,spellid_1=21992,spelltrigger_1=2}}},1)
       GameTooltip:SetInventoryItem('player',16)
-      local damage,proc
+      local damage,nature,proc
       for n=1,GameTooltip:NumLines() do local text=getglobal('GameTooltipTextLeft'..n):GetText()
-        if text=='16 - 30 Nature Damage' then damage=true end
+        if text=='9 - 22 Damage' then damage=getglobal('GameTooltipTextRight'..n):GetText()=='Speed 1.90' end
+        if text=='3 - 6 Nature Damage' then nature=true end
         if string.find(text,'Chance on hit:',1,true)==1 then proc=true end
       end
-      assert(damage and proc)
+      assert(damage and nature and proc)
       -- Crafted instances keep client stat text, add Skyrim quality/effects, and
       -- resolve distinct links even when their base WoW entry is identical.
       local crafted={key='crafted',form=0xfe814,entry=16833,instance=42,name='Renamed Vestments',
@@ -346,7 +350,7 @@ TEST_CASE("Skyrim bags use client frames, APIs, controls, tooltips and host comm
           if text=='Increases your health by 50 points.' then
             local r,g,b=f:GetTextColor() effect=r==0 and g==1 and b==0
           end
-          if text=='Skyrim Armor: 48' then armor=true end
+          if text=='48 Armor' then armor=true end
         end
         assert(quality and effect and armor)
       end
@@ -771,7 +775,7 @@ TEST_CASE("all 95 imported gear tooltips resolve client tokens and display icons
       UseContainerItem(0,1)
       assert(strfind(__WB.log[table.getn(__WB.log)],'bagUseEffect 18608',1,true))
       IsAltKeyDown=oldAlt
-      __WBCooldown(23041,1800)
+      __WBCooldown(1073741824+1031,1800)   -- the staves' shared category
       local start,duration,enable=GetContainerItemCooldown(0,1)
       assert(duration==1800 and enable==1)
       local list={}
@@ -799,4 +803,385 @@ TEST_CASE("all 95 imported gear tooltips resolve client tokens and display icons
     auto* draw=ui.frame(.1f); textures.sync(draw);
     wowcore::Image rendered(2560,1440); wowcore::rasterize(draw,textures,rendered);
     REQUIRE(wowcore::writePng(std::string(WOWBRIDGE_ROOT)+"/build/gear-feedback.png",rendered));
+}
+
+TEST_CASE("imported gear tooltips give the converted Skyrim armour and damage in the client's lines", "[client][equipment][tooltip]") {
+    const char* env=std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data=env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data/"interface.MPQ")) SKIP("WoW 1.12 client data not present");
+    auto mpq=std::make_shared<wowcore::Mpq>(data);
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq,db,textures,2560,1440);
+    std::string err;
+    REQUIRE(ui.start(&err));
+    auto* L=ui.lua();
+    auto run=[&](const char* script) {
+        const int result=luaL_dostring(L,script);
+        INFO((result ? lua_tostring(L,-1) : ""));
+        REQUIRE(result==0);
+    };
+    REQUIRE(luaL_dofile(L,(std::string(WOWBRIDGE_ROOT)+"/wowcore/tests/fixtures/elunara.lua").c_str())==0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&err));
+    run("__WBLogin()");
+    std::ifstream input(std::string(WOWBRIDGE_ROOT)+"/build/gear.json");   // data/build_esp.py's export
+    REQUIRE(input.good());
+    const auto gear=nlohmann::json::parse(input).at("items");
+    // As Bags.cpp describes them, before Skyrim has said anything of a copy: the export's own conversion.
+    std::string items="__gear={";
+    for (const char* entry : {"16897","873","17182","19019"}) {
+        const auto& item=gear.at(entry);
+        items+=std::format("['{}']={{entry={},form={},name={},display={},quality={},kind='{}',pos=1,count=1,key='{}',"
+            "skyrim={{armor={},damage={}}},wow={{class={},subclass={},InventoryType={},armor={},delay={},"
+            "dmg_min1={},dmg_max1={},dmg_min2={},dmg_max2={},dmg_type2={}}}}},",entry,entry,item.at("form").get<int>(),
+            nlohmann::json(item.at("name").get<std::string>()).dump(),item.at("displayid").get<int>(),item.at("quality").get<int>(),
+            item.at("kind")=="WEAP" ? "Weapon" : "Armor",entry,item["skyrim"].value("armor",0),item["skyrim"].value("damage",0),
+            item.at("class").get<int>(),item.at("subclass").get<int>(),item.at("InventoryType").get<int>(),
+            item["wow"].value("armor",0),item["wow"].value("delay",0),item["wow"].value("dmg_min1",0),item["wow"].value("dmg_max1",0),
+            item["wow"].value("dmg_min2",0),item["wow"].value("dmg_max2",0),item["wow"].value("dmg_type2",0));
+    }
+    run((items+"}").c_str());
+    CHECK(gear.at("16897").at("skyrim").at("armor")==45);   // a Dragonscale Cuirass at level 48, epic
+    CHECK(gear.at("873").at("skyrim").at("damage")==22);     // an Elven Warhammer at level 21, swung at 3.7 s
+    run(R"(
+      local function lines(item)
+        __WBInventory({item},1)
+        GameTooltip:SetOwner(UIParent,'ANCHOR_NONE') GameTooltip:SetBagItem(0,1)
+        local out={}
+        for n=1,GameTooltip:NumLines() do
+          local right=getglobal('GameTooltipTextRight'..n)
+          right=right:IsShown() and right:GetText() or ''
+          tinsert(out,getglobal('GameTooltipTextLeft'..n):GetText()..(right~='' and '|'..right or ''))
+        end
+        return '\n'..table.concat(out,'\n')..'\n'
+      end
+      local function has(text,line) assert(strfind(text,'\n'..line..'\n',1,true),line..' in'..text) end
+      local chest=lines(__gear['16897'])
+      has(chest,'45 Armor') assert(not strfind(chest,'225 Armor',1,true))
+      -- Staff of Jordan: 22 over WoW's 119 - 180; Sulfuras 26 over 223 - 372; Thunderfury 11 over both its ranges.
+      local staff=lines(__gear['873'])
+      has(staff,'18 - 26 Damage|Speed 3.70') has(staff,'(5.9 damage per second)')
+      local sulfuras=lines(__gear['17182'])
+      has(sulfuras,'19 - 33 Damage|Speed 3.70') has(sulfuras,'(7.0 damage per second)')
+      local thunderfury=lines(__gear['19019'])
+      has(thunderfury,'5 - 12 Damage|Speed 1.90') has(thunderfury,'2 - 3 Nature Damage') has(thunderfury,'(5.8 damage per second)')
+      -- Their swing as the service rolls it (skill, gear, perks: service/melee.py weapon_tooltip), this copy's tempering
+      -- on top; damage per second is that swing's, the second school scaled alongside.
+      __WB.skyrimWeapons={[873]={min=24.6,max=30.4},[19019]={min=14,max=20}}
+      local wielded=__gear['873'] wielded.damage=33 wielded.plainDamage=22
+      local text=lines(wielded) has(text,'37 - 46 Damage|Speed 3.70') has(text,'(11.1 damage per second)')
+      wielded.damage=nil wielded.plainDamage=nil
+      text=lines(__gear['19019']) has(text,'14 - 20 Damage|Speed 1.90') has(text,'3 - 6 Nature Damage') has(text,'(8.9 damage per second)')
+      __WB.skyrimWeapons=nil
+      -- Skyrim's own word on a copy wins: a tempered chest, their skill and perks.
+      local tempered=__gear['16897'] tempered.armor=52.6 tempered.temper='Fine'
+      local text=lines(tempered) has(text,'53 Armor') has(text,'Improved: Fine')
+      assert(not strfind(text,'Skyrim Armor',1,true) and not strfind(text,'45 Armor',1,true))
+      local swung=__gear['873'] swung.damage=33
+      has(lines(swung),'26 - 40 Damage|Speed 3.70')
+      -- An export older than the conversion still reads as WoW's item.
+      local old=__gear['16897'] old.skyrim=nil old.armor=nil old.temper=nil
+      has(lines(old),'225 Armor')
+    )");
+}
+
+TEST_CASE("Armory items read as their 1.12 items from armory.json's compact rows", "[client][equipment][tooltip][armory]") {
+    const char* env=std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data=env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data/"interface.MPQ")) SKIP("WoW 1.12 client data not present");
+    std::ifstream input(std::string(WOWBRIDGE_ROOT)+"/build/armory.json");   // data/build_armory.py's export
+    if (!input.good()) SKIP("build/armory.json not built");
+    const auto armory=nlohmann::json::parse(input);
+    auto mpq=std::make_shared<wowcore::Mpq>(data);
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq,db,textures,2560,1440);
+    std::string err;
+    REQUIRE(ui.start(&err));
+    auto* L=ui.lua();
+    auto run=[&](const char* script) {
+        const int result=luaL_dostring(L,script);
+        INFO((result ? lua_tostring(L,-1) : ""));
+        REQUIRE(result==0);
+    };
+    REQUIRE(luaL_dofile(L,(std::string(WOWBRIDGE_ROOT)+"/wowcore/tests/fixtures/elunara.lua").c_str())==0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&err));
+    run("__WBLogin()");
+    // As skse/src/Armory.cpp's Row and Bags describe them: the row without its columns' defaults, its Skyrim stats,
+    // quality and display, and its set with every member's name.
+    auto items=nlohmann::json::object();
+    for (const char* entry : {"12640","10623","16921","20130","23558","18820"}) {
+        const auto& row=armory.at("items").at(entry);
+        auto item=nlohmann::json{{"entry",std::stoi(entry)},{"key",entry},{"form",0x02000800+row.at("form").get<int>()},{"pos",1},{"count",1},
+            {"name",row.at("wow").at("name")},{"display",row.at("wow").at("displayid")},{"quality",row.at("wow").at("Quality")},
+            {"wow",row.at("wow")},{"skyrim",row.at("skyrim")},{"kind",row.at("kind")=="WEAP" ? "Weapon" : "Armor"}};
+        if (row.contains("set")) item["set"]=armory.at("sets").at(std::to_string(row.at("set").get<int>()));
+        items[entry]=item;
+    }
+    const auto push=[&](auto&& self,const nlohmann::json& value)->void {
+        if (value.is_object() || value.is_array()) {
+            lua_newtable(L);
+            for (const auto& [key,v]:value.items()) {
+                if (value.is_array()) lua_pushinteger(L,std::stoi(key)+1);
+                else lua_pushstring(L,key.c_str());
+                self(self,v); lua_settable(L,-3);
+            }
+        } else if (value.is_string()) lua_pushstring(L,value.get<std::string>().c_str());
+        else if (value.is_number()) lua_pushnumber(L,value.get<double>());
+        else if (value.is_boolean()) lua_pushboolean(L,value.get<bool>());
+        else lua_pushnil(L);
+    };
+    push(push,items); lua_setglobal(L,"__armory");
+    CHECK(armory.at("items").at("12640").at("skyrim").at("armor")==23);   // an Ebony Helmet's 21 at level 37, epic
+    CHECK_FALSE(armory.at("items").at("12640").at("wow").contains("RequiredLevel"));   // Skyrim gear has no level gate
+    run(R"(
+      local function lines(item)
+        __WBInventory({item},1)
+        GameTooltip:SetOwner(UIParent,'ANCHOR_NONE') GameTooltip:SetBagItem(0,1)
+        local out={}
+        for n=1,GameTooltip:NumLines() do
+          local right=getglobal('GameTooltipTextRight'..n)
+          right=right:IsShown() and right:GetText() or ''
+          tinsert(out,getglobal('GameTooltipTextLeft'..n):GetText()..(right~='' and '|'..right or ''))
+        end
+        return '\n'..table.concat(out,'\n')..'\n'
+      end
+      local function has(text,line) assert(strfind(text,'\n'..line..'\n',1,true),line..' in'..text) end
+      local helm=lines(__armory['12640'])
+      has(helm,'Lionheart Helm') has(helm,'Binds when equipped') has(helm,'Head|Plate') has(helm,'23 Armor')
+      has(helm,'+18 Strength') has(helm,'Durability 100 / 100')
+      assert(strfind(helm,'\nEquip: ',1,true) and not strfind(helm,'565 Armor',1,true) and not strfind(helm,'Requires Level',1,true))
+      assert(GetContainerItemInfo(0,1)==__WBItemIcon(22920))
+      -- Winter's Bite: an axe (subclass 0, kept), Skyrim's 9 spread over WoW's 47 - 88 at its 2.1 s swing.
+      local axe=lines(__armory['10623'])
+      has(axe,"Winter's Bite") has(axe,'Main Hand|Axe') has(axe,'6 - 12 Damage|Speed 2.10') has(axe,'(4.3 damage per second)')
+      assert(strfind(axe,'\nChance on hit: ',1,true))
+      local _,_,quality,level,_,kind,sub=GetItemInfo(10623)
+      assert(quality==3 and level==48 and kind=='Weapon' and sub=='One-Handed Axes')
+      -- Halo of Transcendence: its set as WoW lists it, nothing worn yet.
+      local halo=lines(__armory['16921'])
+      has(halo,'Vestments of Transcendence (0/8)') has(halo,'  Belt of Transcendence')
+      assert(strfind(halo,'\n(3) Set: ',1,true) and strfind(halo,'\n(8) Set: ',1,true))
+      -- Old compact Armory exports have no `use` metadata. Derive it from item_template;
+      -- two worn trinkets still leave the spare flask in a bag.
+      local flask,shell,power=__armory['20130'],__armory['23558'],__armory['18820']
+      flask.count=2 flask.pos=1 flask.worn=true flask.inventorySlots={13}
+      shell.pos=2 shell.worn=true shell.inventorySlots={13}
+      power.pos=3
+      __WBInventory({flask,shell,power},1)
+      __WBInstallCharacter()
+      assert(__WB.equipment[13].entry==20130 and __WB.equipment[14].entry==23558)
+      assert(flask.use.spell==24427 and flask.use.category==1141 and flask.use.cooldown_ms==360000)
+      assert(flask.use.category_cooldown_ms==60000 and shell.use.spell==29506)
+      assert(flask.use.ready_category==1141 and shell.use.ready_category==0)
+      UseInventoryItem(13)
+      assert(strfind(__WB.log[table.getn(__WB.log)],'bagUseEffect 20130',1,true),tostring(__WB.log[table.getn(__WB.log)]))
+      UseInventoryItem(14)
+      assert(strfind(__WB.log[table.getn(__WB.log)],'bagUseEffect 23558',1,true))
+      UseContainerItem(0,1)
+      assert(strfind(__WB.log[table.getn(__WB.log)],'bagUseEffect 20130',1,true))
+      local oldAlt=IsAltKeyDown IsAltKeyDown=function() return true end
+      UseContainerItem(0,3)
+      assert(strfind(__WB.log[table.getn(__WB.log)],'bagUseEffect 18820',1,true))
+      IsAltKeyDown=oldAlt
+      __WBRefreshCooldowns()
+      -- Item timers are kept under the item (536870912 + entry); a bare spell timer does not show on the item.
+      __WBCooldown(24427,500)
+      assert(select(2,GetInventoryItemCooldown('player',13))==0)
+      __WBCooldown(536870912+20130,360) __WBCooldown(1073741824+1141,60)
+      local start,duration,enable=GetInventoryItemCooldown('player',13)
+      assert(duration==360 and enable==1)
+      assert(select(2,GetContainerItemCooldown(0,1))==360)
+      assert(select(2,GetContainerItemCooldown(0,3))==60)
+      assert(select(2,GetInventoryItemCooldown('player',14))==0)
+      __WBCooldown(536870912+18820,90)
+      assert(select(2,GetContainerItemCooldown(0,3))==90)
+      -- The shell's category 0 checks no category, even one its spell would start.
+      __WBCooldown(1073741824+0,600)
+      assert(select(2,GetInventoryItemCooldown('player',14))==0)
+      -- A timer held until an aura fades is enable 0: no sweep, a grey icon.
+      __WBCooldown(536870912+23558,120,1)
+      local _,held,on=GetInventoryItemCooldown('player',14)
+      assert(held==120 and on==0)
+      __WBCooldown(536870912+23558,120)
+      assert(select(3,GetInventoryItemCooldown('player',14))==1)
+      -- The GCD of a use spell sweeps bag and character slots, so it also fires BAG_UPDATE_COOLDOWN.
+      local heard=CreateFrame('Frame') local bagEvents=0
+      heard:RegisterEvent('BAG_UPDATE_COOLDOWN') heard:SetScript('OnEvent',function() bagEvents=bagEvents+1 end)
+      __WBRefreshCooldowns() bagEvents=0
+      __WBGcd(1.5)
+      assert(bagEvents==1 and select(2,GetContainerItemCooldown(0,1))==1.5)
+      assert(select(2,GetInventoryItemCooldown('player',14))==0)   -- the shell's use spell has no GCD
+      heard:UnregisterEvent('BAG_UPDATE_COOLDOWN')
+      __WBRefreshCooldowns() __WBCooldown(536870912+20130,360)
+      -- Both bag and character drags can bind item actions without moving the equipment.
+      PickupContainerItem(0,1) PlaceAction(10)
+      assert(GetActionInfo(10)=='item' and select(2,GetActionInfo(10))==20130)
+      assert(GetActionTexture(10)==flask.texture and IsEquippedAction(10)==1)
+      assert(select(2,GetActionCooldown(10))==360)
+      UseAction(10)
+      assert(strfind(__WB.log[table.getn(__WB.log)],'bagUseEffect 20130',1,true))
+      PickupInventoryItem(14) PlaceAction(11)
+      assert(select(2,GetActionInfo(11))==23558)
+      -- An equippable item that is not worn is equipped from the action bar, as the 1.12 client does.
+      PickupContainerItem(0,3) PlaceAction(13)
+      assert(select(2,GetActionInfo(13))==18820 and IsEquippedAction(13)==nil)
+      UseAction(13)
+      assert(strfind(__WB.log[table.getn(__WB.log)],'bagUse 18820',1,true),tostring(__WB.log[table.getn(__WB.log)]))
+      PickupAction(13) ClearCursor()
+      PickupAction(10) PlaceAction(12)
+      assert(not HasAction(10) and select(2,GetActionInfo(12))==20130)
+      assert(strfind(WBItemActionSlots,'12:20130',1,true))
+      __WBClassSpells({lines={},spells={},unlearned_spells={},known_spells={},highest_ranks={}})
+      assert(HasAction(11) and HasAction(12))
+      local p=__WB.resolve('player') p.skyrim={Alteration=50,Restoration=50,Destruction=50}
+      __WBSpellTooltips({[24427]={item_use=true,effects={{75,75},{9,9},{0,0}},duration_ms=60000,
+        native_lines={'Skyrim: 75 carry weight','Skyrim: 37.5 One-Handed damage %'}},
+        [29506]={item_use=true,effects={{900,900},{0,0},{0,0}},duration_ms=20000}})
+      GameTooltip:SetAction(12)
+      local text=''
+      for n=1,GameTooltip:NumLines() do text=text..'\n'..getglobal('GameTooltipTextLeft'..n):GetText() end
+      assert(strfind(text,'75 carry weight',1,true) and strfind(text,'37.5 One-Handed',1,true))
+      GameTooltip:SetInventoryItem('player',14)
+      text=''
+      for n=1,GameTooltip:NumLines() do text=text..'\n'..getglobal('GameTooltipTextLeft'..n):GetText() end
+      assert(strfind(text,'225',1,true) and not strfind(text,'900',1,true))
+      __WBRefreshCooldowns()
+      assert(select(2,GetActionCooldown(12))==0 and select(2,GetContainerItemCooldown(0,3))==0)
+    )");
+}
+
+TEST_CASE("spell books and mount items read as their 1.12 items and teach when used", "[client][bags][tooltip][learning]") {
+    const char* env=std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data=env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data/"interface.MPQ")) SKIP("WoW 1.12 client data not present");
+    auto mpq=std::make_shared<wowcore::Mpq>(data);
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq,db,textures,2560,1440);
+    std::string err;
+    REQUIRE(ui.start(&err));
+    auto* L=ui.lua();
+    auto run=[&](const char* script) {
+        const int result=luaL_dostring(L,script);
+        INFO((result ? lua_tostring(L,-1) : ""));
+        REQUIRE(result==0);
+    };
+    REQUIRE(luaL_dofile(L,(std::string(WOWBRIDGE_ROOT)+"/wowcore/tests/fixtures/elunara.lua").c_str())==0);
+    run("__WBFixture('idle')");
+    REQUIRE(ui.loadInterface(&err));
+    run("__WBLogin()");
+    std::ifstream input(std::string(WOWBRIDGE_ROOT)+"/build/gear.json");
+    REQUIRE(input.good());
+    const auto gear=nlohmann::json::parse(input);
+    REQUIRE(gear.at("books").size()==179+142);   // the Druid's books and the Paladin's librams
+    REQUIRE(gear.at("mounts").size()==23);
+    const auto push=[&](auto&& self,const nlohmann::json& value)->void {
+        if (value.is_object() || value.is_array()) {
+            lua_newtable(L);
+            for (const auto& [key,v]:value.items()) {
+                if (value.is_array()) lua_pushinteger(L,std::stoi(key)+1);
+                else lua_pushstring(L,key.c_str());
+                self(self,v); lua_settable(L,-3);
+            }
+        } else if (value.is_string()) lua_pushstring(L,value.get<std::string>().c_str());
+        else if (value.is_number()) lua_pushnumber(L,value.get<double>());
+        else if (value.is_boolean()) lua_pushboolean(L,value.get<bool>());
+        else lua_pushnil(L);
+    };
+    push(push,gear.at("books")); lua_setglobal(L,"__books");
+    push(push,gear.at("mounts")); lua_setglobal(L,"__mountItems");
+    for (const auto* section : {"books","mounts"}) for (const auto& [key,item]:gear.at(section).items()) {
+        INFO(item.at("name").get<std::string>());
+        if (item.at("displayid")!=0) CHECK_FALSE(db.itemIcon(item.at("displayid")).empty());
+    }
+    run(R"(
+      -- What Bags.cpp publishes of one (its gear.json row: the client's item row and what it teaches).
+      local function stack(row,key,pos)
+        local item={key=key,pos=pos,form=4096+pos,count=1,kind='Book',name=row.name,entry=row.entry,display=row.displayid,
+          quality=row.quality,wow=row.wow,teaches=row.teaches,texture=row.icon}
+        return item
+      end
+      local function lines(bag,slot)
+        GameTooltip:SetOwner(UIParent,'ANCHOR_NONE') GameTooltip:SetBagItem(bag,slot)
+        local t={}
+        for n=1,GameTooltip:NumLines() do
+          local fs=getglobal('GameTooltipTextLeft'..n) local r,g,b=fs:GetTextColor()
+          t[n]={text=fs:GetText(),r=r,g=g,b=b}
+        end
+        return t
+      end
+      local function find(t,text) for _,l in ipairs(t) do if l.text==text then return l end end end
+      local function red(l) return l and l.r==1 and math.abs(l.g-32/255)<0.000001 and l.b==l.g end
+      local function white(l) return l and l.r==1 and l.g==1 and l.b==1 end
+      local function green(l) return l and l.r==0 and l.g==1 and l.b==0 end
+      local function quality(l,n) local c=ITEM_QUALITY_COLORS[n]
+        return math.abs(l.r-c.r)<0.00001 and math.abs(l.g-c.g)<0.00001 and math.abs(l.b-c.b)<0.00001 end
+      local saber={key='swift_frostsaber',spell=23221,name='Swift Frostsaber',display=14331,speed_percent=100,cast_ms=3000,
+        icon='Interface\\Icons\\Ability_Mount_WhiteTiger',learned=false}
+      local rider={key='swift_green_wind_rider',spell=32295,name='Swift Green Wind Rider',display=11011,speed_percent=100,
+        cast_ms=3000,icon='Interface\\Icons\\Ability_Hunter_Pet_Bat',flying=true,flight_speed_percent=280,learned=false,
+        description='Summons and dismisses a rideable Wind Rider.  This is a very fast mount that can fly outdoors.'}
+      __WBMountCatalog({saber,rider})
+      __WB.classReply={known_spells={5185}}   -- their class book's answer, as __WBClassSpells keeps it
+      __WBPlayerLevel(20)
+      __WBInventory({stack(__books['21294'],'touch',1),stack(__books['900768'],'cat',2),stack(__mountItems['18766'],'reins',3),
+        stack(__mountItems['25531'],'rider',4)},1)
+      -- A book-only rank's 1.12 book: rare blue, the druids' class line, Skyrim's level and the rank before it in red
+      -- while unmet, then the client's learning wording in green.
+      local t=lines(0,1)
+      assert(t[1].text=='Book of Healing Touch XI')
+      assert(quality(t[1],3))
+      assert(white(find(t,'Classes: Druid')))
+      assert(red(find(t,'Requires Level 36')))
+      assert(red(find(t,'Requires Healing Touch (Rank 10)')))
+      assert(not find(t,'Already known'))
+      assert(green(find(t,'Use: Teaches Healing Touch (Rank 11).')))
+      assert(find(t,'<Right Click to Use>') and find(t,'<Tab, then Items: Read>'))
+      local function at(text) for n,l in ipairs(t) do if l.text==text then return n end end end
+      assert(at('Classes: Druid')<at('Requires Level 36') and at('Requires Level 36')<at('Requires Healing Touch (Rank 10)') and
+        at('Requires Healing Touch (Rank 10)')<at('Use: Teaches Healing Touch (Rank 11).'))
+      __WBPlayerLevel(40)
+      __WB.classReply={known_spells={5185,9889,25297}}
+      t=lines(0,1)
+      assert(white(find(t,'Requires Level 36')) and white(find(t,'Requires Healing Touch (Rank 10)')) and red(find(t,'Already known')))
+      -- A made-up book in the same style: common white, the druid books' icon, no rank numeral for an unranked spell.
+      t=lines(0,2)
+      assert(t[1].text=='Book of Cat Form' and quality(t[1],1) and green(find(t,'Use: Teaches Cat Form.')))
+      assert(not find(t,'Requires Level 0') and white(find(t,'Requires Level 8')))
+      local texture=GetContainerItemInfo(0,2) assert(texture==__WBItemIcon(1317) and texture=='Interface\\Icons\\INV_Misc_Book_11')
+      -- 1.12's reins: epic purple, soulbound, Skyrim's level 30, the mount spell's own Use: line.
+      t=lines(0,3)
+      assert(t[1].text=='Reins of the Swift Frostsaber' and quality(t[1],4))
+      assert(t[2].text==ITEM_SOULBOUND and white(find(t,'Requires Level 30')))
+      assert(green(find(t,'Use: Summons and dismisses a rideable Swift Frostsaber.  This is a very fast mount.')))
+      assert(not find(t,'Already known') and not find(t,'Requires Riding (150)'))
+      -- A TBC flyer's item: the icon its mount has (no 1.12 item display shows it) and its spell's description.
+      t=lines(0,4)
+      assert(t[1].text=='Swift Green Wind Rider' and red(find(t,'Requires Level 46')))   -- the player is 40
+      assert(green(find(t,'Use: '..rider.description)))
+      assert(GetContainerItemInfo(0,4)=='Interface\\Icons\\Ability_Hunter_Pet_Bat')
+      -- Right-click asks the host to use it (Bags.cpp: learn and use up, or the client's refusal).
+      UseContainerItem(0,3) assert(strfind(__WB.log[table.getn(__WB.log)],'bagUse reins',1,true))
+      UseContainerItem(0,1) assert(strfind(__WB.log[table.getn(__WB.log)],'bagUse touch',1,true))
+      local errors={} local f=CreateFrame('Frame') f:RegisterEvent('UI_ERROR_MESSAGE') f:SetScript('OnEvent',function() tinsert(errors,arg1) end)
+      __WBItemError('ERR_CANT_EQUIP_LEVEL_I',36) __WBItemError('ERR_PROFICIENCY_NEEDED') __WBItemError('SPELL_FAILED_SPELL_LEARNED')
+      __WBItemError('ERR_CANT_EQUIP_EVER')
+      assert(errors[1]=='You must reach level 36 to use that item.' and errors[2]=='You do not have the required proficiency for that item.')
+      assert(errors[3]=='You have already learned the spell' and errors[4]=='You can never use that item.')
+      -- Their General tab lists the mounts the player has learned, and no other; a learned mount's reins are "Already known".
+      local function listed(spell) for _,id in ipairs(__WB.spellbook) do if id==spell then return true end end end
+      assert(not listed(23221) and not listed(32295) and __WB.spellInfo(32295))
+      saber.learned=true __WBMountCatalog({saber,rider})
+      assert(listed(23221) and not listed(32295))
+      assert(red(find(lines(0,3),'Already known')))
+      __WBLearnedSpell(23221)
+      rider.learned=true __WBMountCatalog({saber,rider}) assert(listed(23221) and listed(32295))
+      saber.learned=false rider.learned=false __WBMountCatalog({saber,rider})
+      assert(not listed(23221) and not listed(32295))
+      __WBPlayerLevel(60)
+    )");
+    CHECK(ui.engine().lastError().empty());
 }

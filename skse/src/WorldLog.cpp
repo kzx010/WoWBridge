@@ -25,7 +25,7 @@ namespace WorldLog
 			return a_actor && a_actor->GetPosition().GetDistance(Player()->GetPosition()) / kUnitsPerYard <= kRadius;
 		}
 
-		// The client's unit kinds, as she sees them now (docs/combat-world.md).
+		// The client's unit kinds, as the player sees them now (docs/combat-world.md).
 		std::string Unit(RE::Actor* a_actor)
 		{
 			const char* category = a_actor == Player()          ? "self" :
@@ -115,7 +115,7 @@ namespace WorldLog
 	void Struck(RE::Actor* a_victim, RE::Actor* a_attacker, RE::FormID a_source, bool a_blocked)
 	{
 		if (!a_victim || !a_attacker || a_attacker == Player() || (!Near(a_victim) && !Near(a_attacker))) {
-			return;   // hers are logged where she deals them
+			return;   // theirs are logged where the player deals them
 		}
 		const auto it = g_health.find(a_victim->GetFormID());
 		const float before = it == g_health.end() ? -1.0f : std::max({ it->second.samples[0], it->second.samples[1], it->second.samples[2] });
@@ -125,7 +125,7 @@ namespace WorldLog
 		std::string named = spell && spell->GetFullName() && *spell->GetFullName() ?
 		                        std::format("kind = \"damage\", spell = {}, school = {}, ", LuaQuote(spell->GetFullName()), School(spell)) :
 		                        std::string("kind = \"swing\", ");
-		// What it took, a moment after (Skyrim's health, as her frames show it).
+		// What it took, a moment after (Skyrim's health, as their frames show it).
 		Frame::After(0.1, [victim, before, head = std::move(head), named = std::move(named), a_blocked] {
 			auto v = victim.get();
 			if (!v || before < 0.0f) {
@@ -138,5 +138,20 @@ namespace WorldLog
 				Report(named + head + ", outcome = \"block\"");
 			}
 		});
+	}
+
+	void Defense(RE::Actor* a_attacker, const nlohmann::json& a_defense, float a_applied)
+	{
+		const float damage = a_defense.value("damage", 0.f);
+		const float absorbed = std::max(0.f, damage - a_applied);
+		auto outcome = a_defense.value("outcome", std::string("hit"));
+		// Partial blocks are landed hits with a trailer; full blocks and full absorbs use the client's miss strings.
+		if (outcome == "block" && a_applied > 0) outcome = "hit";
+		if (outcome == "crush") outcome = "hit"; // the world path accepts a normal hit with its actual crushing damage
+		if (damage > 0 && a_applied <= 0) outcome = "absorb";
+		const auto source = a_attacker ? Unit(a_attacker) : std::string("{ name = \"Unknown\", category = \"hostileCreature\" }");
+		Report(std::format("kind = \"swing\", source = {}, target = {}, outcome = {}, school = {}, amount = {}, blocked = {}, absorbed = {}",
+			source, Unit(Player()), LuaQuote(outcome), a_defense.value("school", 0), std::lround(a_applied),
+			std::lround(a_defense.value("blocked", 0.f)), std::lround(absorbed)));
 	}
 }

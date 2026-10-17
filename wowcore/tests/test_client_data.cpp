@@ -473,7 +473,7 @@ TEST_CASE("M2: the night elf female loads from the client (vanilla v256, embedde
     CHECK(m.version == 256);
     CHECK_FALSE(m.vertices.empty());
     CHECK_FALSE(m.batches.empty());
-    // Her staff's swing (Attack2HL, its first variation): the whoosh at 667 ms, the blow landing at 734 of 1500.
+    // Their staff's swing (Attack2HL, its first variation): the whoosh at 667 ms, the blow landing at 734 of 1500.
     const int swing = wowcore::findSequence(m, 19);
     REQUIRE(swing >= 0);
     CHECK(m.sequences[swing].duration == 1500);
@@ -493,7 +493,7 @@ TEST_CASE("Character: Elunara dressed as the client dresses her", "[client][m2]"
         { {0, 33655}, {2, 30546}, {4, 30536}, {5, 30541}, {6, 30540}, {7, 30542}, {8, 30548}, {9, 34016}, {15, 20298, 2},
           {17, 34954} });
     CHECK(look.body == "Character\\NightElf\\Female\\NightElfFemale.m2");
-    // The hood hides her hair (HelmetGeosetVisData 305); gloves 402, boots 502, the legguards' kilt 1302, no cape.
+    // The hood hides their hair (HelmetGeosetVisData 305); gloves 402, boots 502, the legguards' kilt 1302, no cape.
     CHECK(look.geosets == std::set<uint16_t>{ 0, 402, 502, 702, 801, 901, 1001, 1302, 1501 });
     CHECK((look.skin.w == 256 && look.skin.h == 256));
     REQUIRE(look.attached.size() == 4);
@@ -825,6 +825,32 @@ TEST_CASE("Text: widths as the 1.12 client measures them (evidence/fontref)", "[
             }
         }
     }
+}
+
+TEST_CASE("ClientDb: text emotes give her chat line, animation and night elf voice", "[client][dbc][emote]") {
+    const auto mpq = client();
+    if (!mpq) SKIP("WoW 1.12 client data not present");
+    const wowcore::ClientDb db(*mpq);
+    const auto dance = db.emote("dance", 4, 1);
+    REQUIRE(dance);
+    CHECK(dance->alone == "You burst into dance.");
+    CHECK(dance->atTarget == "You dance with %s.");
+    CHECK((dance->anim == 69 && dance->specProc == 2));   // EmoteDance, until the player moves
+    const auto spit = db.emote("SPIT", 4, 1);
+    REQUIRE(spit);
+    CHECK(spit->alone == "You spit on the ground.");
+    CHECK(spit->anim == 0);   // words only
+    const auto wave = db.emote("WAVE", 4, 1);
+    REQUIRE(wave);
+    CHECK((wave->anim == 67 && wave->specProc == 0));
+    const auto sit = db.emote("SIT", 4, 1);
+    REQUIRE(sit);
+    CHECK((sit->specProc == 1 && sit->standState == 1));
+    const auto cheer = db.emote("CHEER", 4, 1), male = db.emote("CHEER", 4, 0);
+    REQUIRE((cheer && male));
+    CHECK((cheer->sound > 0 && cheer->sound != male->sound));   // their own voice
+    CHECK(db.sound(cheer->sound));
+    CHECK_FALSE(db.emote("NOSUCHEMOTE", 4, 1));
 }
 
 TEST_CASE("ClientDb: the character level-up celebration resolves its archive model and sound", "[client][dbc][level-up]") {
@@ -1235,7 +1261,8 @@ TEST_CASE("Text: native outline and shadow padding and absolute money digit widt
         if (f[0]=="ARIALN.ttf" && !f[3].empty() && f[3].find_first_not_of("0123456789")==std::string::npos)
             CHECK(std::abs(actual-native)<0.05f);
     }
-    for (const auto& [key,expected]:load("client_style_widths.json").items()) {
+    const auto styles=load("client_style_widths.json");
+    for (const auto& [key,expected]:styles.items()) {
         const auto f=fields(key,4); if (f.empty()) continue;
         const int height=std::stoi(f[1]); const float shadowX=std::stof(f[3]);
         const float actual=measure(f[0],height,f[2],f[4],shadowX)-measure(f[0],height,"",f[4]);

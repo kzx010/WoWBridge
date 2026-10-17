@@ -31,7 +31,7 @@ namespace Melee
 			return !body ? 0u : body->IsHeavyArmor() ? 2u : body->IsLightArmor() ? 1u : 0u;
 		}
 
-		// What she strikes with, as the client sounds it (docs/combat-world.md): her form's creature, her weapon (its
+		// What the player strikes with, as the client sounds it (docs/combat-world.md): their form's creature, their weapon (its
 		// subclass, wood or metal), else bare hands - taken as the swing starts, so a shift meanwhile does not change it.
 		struct Striker
 		{
@@ -41,7 +41,7 @@ namespace Melee
 		Striker StrikingWith()
 		{
 			const auto& form = Forms::Current();
-			if (form != "none") {   // her forms' creatures (Forms::kDisplays)
+			if (form != "none") {   // their forms' creatures (Forms::kDisplays)
 				return { WowUi::Striker::Creature, form == "cat" ? 892u : form == "travel" ? 632u : form == "aquatic" ? 2428u : 2281u };
 			}
 			if (const auto hand = Character::InSlot(15); hand && hand->itemClass == 2) {
@@ -70,6 +70,8 @@ namespace Melee
 
 		RE::ActorHandle  g_target;
 		bool             g_attacking = false;
+		int              g_extra = 0;
+		bool             g_pendingExtra = false;
 		bool             g_pending = false;      // a swing's roll in flight
 		double           g_readyAt = 0;          // the weapon's timer
 		std::string      g_lastError;            // shown once until it changes (Player::LastSwingErrorMsg)
@@ -112,7 +114,13 @@ namespace Melee
 			}
 		}
 
-		void Swing(RE::PlayerCharacter* a_player, RE::Actor* a_target)
+		struct SwingPosition
+		{
+			float distance, reach;
+			bool facing, inFront;
+		};
+
+		SwingPosition Position(RE::Actor* a_player, RE::Actor* a_target)
 		{
 			// Unit::UpdateMeleeAttackingState: in reach (both combat reaches and 1.33, at least 5 yards; 3D from a
 			// player), in the front 120 degrees, alive.
@@ -125,89 +133,144 @@ namespace Melee
 			// The target in front of it (from its own heading): it can parry and block.
 			const float th = a_target->GetHeading(false);
 			const bool  inFront = std::sin(th) * -to.x + std::cos(th) * -to.y >= 0.0f;
+			return {distance, reach, facing, inFront};
+		}
+
+		void CompleteSwing(RE::ActorHandle handle, std::uint32_t epoch, const json& r)
+		{
+			if (epoch != g_epoch) {
+				return;
+			}
+			g_pending = false;
+			if (!r.value("ok", false)) {
+				const auto err = r.value("error", "");
+				if (err == "ERR_BADATTACKPOS" || err == "ERR_BADATTACKFACING") {
+					g_readyAt = Frame::Now() + 0.1;   // try again in a tenth of a second
+					Error(err);
+				} else {
+					Error(err == "SERVICE_OFFLINE" ? "" : err);
+					Stop();
+				}
+				return;
+			}
+			// A successful roll describes the request-time snapshot. Validate the live
+			// participants before spending rage, consuming Maul or applying any effects.
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			auto target = handle.get();
+			if (!player || player->IsDead() || !target || target->IsDead() ||
+				target->IsDisabled() || target->IsDeleted() || !target->Is3DLoaded() || !Bridge::Attackable(target.get())) {
+				Error("ERR_INVALID_ATTACK_TARGET");
+				Stop();
+				return;
+			}
+			const auto position = Position(player, target.get());
+			const auto retry = [&](const char* error) { g_readyAt = Frame::Now() + 0.1; Error(error); };
+			if (position.distance >= std::max(5.f, 1.5f + position.reach + 1.33f)) {
+				retry("ERR_BADATTACKPOS");
+				return;
+			}
+			if (!position.facing) {
+				retry("ERR_BADATTACKFACING");
+				return;
+			}
+			if (Character::Get().classId == 2 && Cast::Pacified()) { Stop(); return; }
+			if (!Forms::CanPay(r)) {
+				// Re-request with current power; the service can fall back from Maul to a normal swing.
+				retry(r.value("power", "") == "rage" ? "ERR_OUT_OF_RAGE" : "ERR_OUT_OF_ENERGY");
+				return;
+			}
+			Error("");
+			Forms::OnMelee(r);   // rage gained, Maul paid
+			Cast::MeleeEffects(r, target.get());
+			if (g_pendingExtra) { g_extra = std::max(0, g_extra - 1); g_pendingExtra = false; }
+			else g_readyAt = Frame::Now() + r.value("delay_ms", 2000) / 1000.0;
+			// A service reply can arrive after a cast/channel took animation ownership.
+			if (!Cast::Casting()) Avatar::Act(static_cast<std::int32_t>(Character::Melee().attack), false, true);
+			const auto outcome = r.value("outcome", "");
+			if (Forms::Current() != "cat" && Forms::Current() != "bear" && Forms::Current() != "dire_bear" &&
+				(outcome == "hit" || outcome == "crit" || outcome == "glance" || (outcome == "block" && r.value("damage", 0) > 0))) {
+				Gear::EnchantHit(target.get());
+			}
+			if (const int damage = r.value("damage", 0); damage > 0) {   // in Skyrim's health (service/skyrim.py)
+				Carriers::Damage(target.get(), static_cast<float>(damage));
+				Cast::Damaged(target.get(), damage);
+				Forms::AttackThreat(r, target.get());
+				Character::Train(r.value("skill", ""), static_cast<float>(damage));   // a hit trains their weapon's skill
+			}
+			Log(r, target->GetDisplayFullName());
+			// The server deals the blow as it rolls it (above); the client sounds it as their swing animation marks
+			// it: the whoosh at its $CSS, the impact at its $HIT (a creature's combat hit, $CAH, in a form), a
+			// creature's critical growl as it strikes.
+			const auto swing = Character::Melee().attack;
+			const auto with = StrikingWith();
+			const bool crit = outcome == "crit";
+			const auto sounds = WowUi::Melee(with.by, with.id, with.parryType, 0, crit);
+			if (with.by == WowUi::Striker::Creature && crit) {
+				WowUi::PlaySound(sounds.exertion);
+			}
+			const auto whoosh = with.by == WowUi::Striker::Creature ? sounds.swing : WowUi::SwingSound(Character::Melee().swingType, crit);
+			Frame::After(Avatar::EventAt(swing, "$CSS").value_or(0.0), [whoosh] { WowUi::PlaySound(whoosh); });
+			const char* hit = with.by == WowUi::Striker::Creature ? "$CAH" : "$HIT";
+			Frame::After(Avatar::EventAt(swing, hit).value_or(0.0), [handle, outcome, with] {
+				if (auto victim = handle.get()) {
+					Impact(with, outcome, victim.get());
+				}
+			});
+		}
+
+		std::function<void(const json&)> Completion(RE::Actor* a_target)
+		{
+			const auto handle = a_target ? a_target->CreateRefHandle() : RE::ActorHandle{};
+			return [handle, epoch = g_epoch](const json& r) { CompleteSwing(handle, epoch, r); };
+		}
+
+		void Swing(RE::PlayerCharacter* a_player, RE::Actor* a_target)
+		{
+			const auto [distance, reach, facing, inFront] = Position(a_player, a_target);
 			json  target = { { "level", a_target->GetLevel() }, { "distance_yd", distance }, { "facing", facing }, { "in_front", inFront },
 				 { "alive", !a_target->IsDead() }, { "reaction", Bridge::ReactionName(a_target) }, { "attackable", Bridge::Attackable(a_target) }, { "combat_reach_yd", reach } };
 			Cast::AugmentTarget(target, a_target);
 			g_pending = true;
-			const RE::ActorHandle handle = a_target->CreateRefHandle();
+			g_pendingExtra = Character::Get().classId == 2 && g_extra > 0;
 			auto caster = Character::Caster();
-			Forms::Augment(caster);   // in a form she swings its claws; a queued Maul rides on the swing
+			Forms::Augment(caster);   // in a form the player swings its claws; a queued Maul rides on the swing
 			Service::Request({ { "op", "melee" }, { "caster", caster }, { "target", target }, { "seed", std::uniform_int_distribution<std::uint32_t>()(g_rng) } },
-				[handle, epoch = g_epoch](const json& r) {
-					if (epoch != g_epoch) {
-						return;
-					}
-					g_pending = false;
-					if (!r.value("ok", false)) {
-						const auto err = r.value("error", "");
-						if (err == "ERR_BADATTACKPOS" || err == "ERR_BADATTACKFACING") {
-							g_readyAt = Frame::Now() + 0.1;   // try again in a tenth of a second
-							Error(err);
-						} else {
-							Error(err == "SERVICE_OFFLINE" ? "" : err);
-							Stop();
-						}
-						return;
-					}
-					Error("");
-					Forms::OnMelee(r);   // rage gained, Maul paid
-					Cast::TalentEffects(r, handle.get().get());
-					g_readyAt = Frame::Now() + r.value("delay_ms", 2000) / 1000.0;
-					// A service reply can arrive after a cast/channel took animation ownership.
-					if (!Cast::Casting()) Avatar::Act(static_cast<std::int32_t>(Character::Melee().attack), false, true);
-					auto target = handle.get();
-					if (!target) {
-						return;
-					}
-					const auto outcome = r.value("outcome", "");
-					if (Forms::Current() != "cat" && Forms::Current() != "bear" && Forms::Current() != "dire_bear" &&
-						(outcome == "hit" || outcome == "crit" || outcome == "glance" || (outcome == "block" && r.value("damage", 0) > 0))) {
-						Gear::EnchantHit(target.get());
-					}
-					if (const int damage = r.value("damage", 0); damage > 0) {   // in Skyrim's health (service/skyrim.py)
-						Carriers::Damage(target.get(), static_cast<float>(damage));
-						Cast::Damaged(target.get(), damage);
-						Forms::AttackThreat(r, target.get());
-						Character::Train(r.value("skill", ""), static_cast<float>(damage));   // a hit trains her weapon's skill
-					}
-					Log(r, target->GetDisplayFullName());
-					// The server deals the blow as it rolls it (above); the client sounds it as her swing animation marks
-					// it: the whoosh at its $CSS, the impact at its $HIT (a creature's combat hit, $CAH, in a form), a
-					// creature's critical growl as it strikes.
-					const auto swing = Character::Melee().attack;
-					const auto with = StrikingWith();
-					const bool crit = outcome == "crit";
-					const auto sounds = WowUi::Melee(with.by, with.id, with.parryType, 0, crit);
-					if (with.by == WowUi::Striker::Creature && crit) {
-						WowUi::PlaySound(sounds.exertion);
-					}
-					const auto whoosh = with.by == WowUi::Striker::Creature ? sounds.swing : WowUi::SwingSound(Character::Melee().swingType, crit);
-					Frame::After(Avatar::EventAt(swing, "$CSS").value_or(0.0), [whoosh] { WowUi::PlaySound(whoosh); });
-					const char* hit = with.by == WowUi::Striker::Creature ? "$CAH" : "$HIT";
-					Frame::After(Avatar::EventAt(swing, hit).value_or(0.0), [handle, outcome, with] {
-						if (auto victim = handle.get()) {
-							Impact(with, outcome, victim.get());
-						}
-					});
-				});
+				Completion(a_target));
 		}
 	}
+
+	std::function<void(const nlohmann::json&)> CompletionForTesting(RE::Actor* a_target)
+	{
+		return Completion(a_target);
+	}
+
+	void QueueExtra(int count)
+	{
+		if (Character::Get().classId == 2) g_extra = std::clamp(g_extra + count, 0, 5);
+	}
+	int ExtraAttacks() { return g_extra; }
 
 	bool Attacking() { return g_attacking; }
 
 	void Start(RE::Actor* a_target)
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (Character::Get().classId == 2 && Cast::Pacified()) { Lua("__WBUiError('ERR_ATTACK_PACIFIED')"); return; }
 		if (!a_target || a_target == player || a_target->IsDead()) {
 			Lua("__WBUiError('ERR_INVALID_ATTACK_TARGET')");
 			return;
 		}
 		Mounts::Dismount();
 		const bool was = g_attacking;
-		g_target = a_target->CreateRefHandle();
+		const RE::ActorHandle next = a_target->CreateRefHandle();
+		if (was && g_target != next) {
+			++g_epoch;   // a reply for the previous target must not hit it or stop this attack
+			g_pending = false;
+		}
+		g_target = next;
 		g_attacking = true;
 		g_lastError.clear();
-		Avatar::SetWeaponsDrawn(true);   // the client draws her weapon as the attack starts
+		Avatar::SetWeaponsDrawn(true);   // the client draws their weapon as the attack starts
 		if (!was) {
 			Lua("__WBAttacking(1)");   // PLAYER_ENTER_COMBAT: the Attack action lights
 		}
@@ -244,8 +307,9 @@ namespace Melee
 			Stop();
 			return;
 		}
+		if (Character::Get().classId == 2 && Cast::Pacified()) { Stop(); return; }
 		// No swing while a spell is cast (IsNonMeleeSpellCasted); the timer waits ready.
-		if (g_pending || Cast::Casting() || Frame::Now() < g_readyAt) {
+		if (g_pending || Cast::Casting() || (Frame::Now() < g_readyAt && g_extra == 0)) {
 			return;
 		}
 		Swing(player, target.get());
@@ -256,6 +320,8 @@ namespace Melee
 		++g_epoch;
 		g_pending = false;
 		g_readyAt = 0;
+		g_extra = 0;
+		g_pendingExtra = false;
 		g_attacking = false;
 		g_target = {};
 	}

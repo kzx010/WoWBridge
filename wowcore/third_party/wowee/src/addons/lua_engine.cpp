@@ -736,14 +736,14 @@ int lua_Region_SetHeight(lua_State* L) {
 /// the alternative was answering nil, and MoneyFrame does
 /// SetWidth(GetTextWidth() + iconWidth) - arithmetic that loses the file.
 float measureTextWidth(const std::string& text, const std::string& fontFace,
-                       float fontHeight) {
+                       float fontHeight, float advancePx = 0.0f) {
     // Through the same function the renderer draws with, so a widget sized to
     // its own text gets the width its own text will occupy. Measuring in this
     // client's face at a flat twelve while drawing in the interface's at its
     // real height made every self-sized label narrower than what went in it -
     // MoneyFrame sizes all three coin buttons that way, and the gold, silver
     // and copper ran into one another.
-    return wowee::ui::interfaceTextWidth(text, fontFace, fontHeight);
+    return wowee::ui::interfaceTextWidth(text, fontFace, fontHeight, advancePx);
 }
 
 /// The font string a widget measures: itself if it is one, and otherwise the
@@ -762,8 +762,8 @@ const wowee::ui::Widget* textWidgetOf(lua_State* L, int index) {
 
 int lua_Region_GetTextWidth(lua_State* L) {
     const auto* w = textWidgetOf(L, 1);
-    lua_pushnumber(L, w ? wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight),
-        w->fontOutline, w->hasShadow, w->shadowX) : 0.0);
+    lua_pushnumber(L, w ? wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight,
+        wowee::ui::interfaceFontStyleAdvance(w->fontOutline)), w->fontOutline, w->hasShadow, w->shadowX) : 0.0);
     return 1;
 }
 
@@ -893,8 +893,8 @@ int lua_Region_GetWidth(lua_State* L) {
         // _G[name.."Text"]:GetWidth(), so answering zero made every tab on the
         // character sheet collapse to the width of its two end textures, with
         // the label clipped out of sight inside it.
-        lua_pushnumber(L, wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight),
-            w->fontOutline, w->hasShadow, w->shadowX));
+        lua_pushnumber(L, wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight,
+            wowee::ui::interfaceFontStyleAdvance(w->fontOutline)), w->fontOutline, w->hasShadow, w->shadowX));
         return 1;
     }
     lua_pushnumber(L, w ? (w->rectW > 0.0f ? w->rectW / es : w->width) : 0.0);
@@ -6917,12 +6917,12 @@ void LuaEngine::registerCoreAPI() {
         "function mt:SetText(text, r, g, b)\n"
         // OnTextSet belongs to the box, not to the typing: it fires when the
         // text is *set* rather than entered, which is how the chat box learns
-        // that something put a channel prefix in it. Declared on the chat edit
-        // box and dispatched by nothing until now.
+        // that something put a channel prefix in it. lua_EditBox_SetText fires
+        // it, publishing `this` as the 1.12 handlers read it (WoWBridge: this
+        // also called it a second time, bare, and ChatEdit_ParseText(this) then
+        // failed on a nil box - every SetText on the chat box from code).
         "    if self.__isEditBox then\n"
         "        __WoweeEditSetText(self, text)\n"
-        "        local h = self.__scripts and self.__scripts.OnTextSet\n"
-        "        if h then h(self) end\n"
         "        return\n"
         "    end\n"
         // A tooltip's SetText is its first line, not a font string's text.

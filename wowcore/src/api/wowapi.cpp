@@ -103,6 +103,9 @@ int lua_SpellInfo(lua_State* L) {
     field(L, "costPct", s->manaCostPct);
     field(L, "procCharges", s->procCharges);
     field(L, "procChance", s->procChance);
+    field(L, "stackAmount", s->stackAmount);
+    field(L, "maxTargetLevel", s->maxTargetLevel);
+    field(L, "maxTargets", s->maxTargets);
     field(L, "rangeIndex", s->rangeIndex);
     field(L, "stances", s->shapeshiftMask);   // the forms it is used in (bit form-1: 1 cat, 16 bear, 128 dire bear)
     field(L, "stancesNot", s->shapeshiftExclude);
@@ -121,6 +124,8 @@ int lua_SpellInfo(lua_State* L) {
         field(L, "chain", f.chainTargets);
         field(L, "amplitude", f.chainAmplitude);
         field(L, "misc", f.misc);
+        field(L, "multiple", f.multiple);
+        field(L, "comboPoints", f.comboPoints);
         lua_rawseti(L, -2, e + 1);
     }
     lua_setfield(L, -2, "effects");

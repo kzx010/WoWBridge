@@ -145,7 +145,7 @@ function __WBInstallWorldMap()
   WorldMapFrameAreaLabel:SetFontObject("GameFontNormalLarge")
   WorldMapFrameAreaDescription:SetFontObject("GameFontHighlightSmall")
   -- The client puts a POI's name/description above the map. Also use its map
-  -- tooltip so the fast-travel key is visible where she is pointing.
+  -- tooltip so the fast-travel key is visible where the player is pointing.
   local enter,leave=WorldMapPOI_OnEnter,WorldMapPOI_OnLeave
   WorldMapPOI_OnEnter=function()
     enter() poiTooltip(this)

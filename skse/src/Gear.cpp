@@ -1,6 +1,7 @@
 #include "Gear.h"
 #include "Integration.h"
 
+#include "Armory.h"
 #include "Avatar.h"
 #include "Cast.h"
 #include "Character.h"
@@ -10,6 +11,8 @@
 #include "ui/WowUi.h"
 
 #include <fstream>
+
+namespace Cast { void UseItem(std::uint32_t entry); }
 
 namespace Gear
 {
@@ -31,6 +34,8 @@ namespace Gear
 		};
 		std::map<RE::TESBoundObject*, SkyrimLook> g_skyrimLooks;
 		std::map<std::uint32_t, RE::TESBoundObject*> g_reagents;   // by WoW item entry
+		std::map<RE::SpellItem*, std::pair<std::int32_t, std::size_t>> g_armoryCopies;   // the Armory's abilities: (bonus, copy)
+		std::map<std::uint32_t, RE::SpellItem*> g_armorySets;   // its set bonuses by local ID
 		std::map<std::uint32_t, int> g_shownCounts;                // what the interface was last told
 		constexpr int              kReagentStack = 20;
 		bool                       g_given = false;
@@ -39,12 +44,14 @@ namespace Gear
 		bool                       g_known = false;   // g_worn has been read since the game loaded
 		double                     g_nextRead = 0;
 		// No load notice yet: a game entered from the main menu by `coc` sends neither kNewGame nor kPostLoadGame, so the
-		// first frame she is in the world counts as one. A save being loaded clears it (kPreLoadGame) and sends its own.
+		// first frame the player is in the world counts as one. A save being loaded clears it (kPreLoadGame) and sends its own.
 		bool                       g_unannounced = true;
 
-		// One piece to a body slot, as Skyrim keeps it: her WoW items have no armour addons (her Skyrim body is not seen), and
-		// Skyrim finds two pieces at odds by their addons - so a Skyrim helmet and her WoW helm were both worn. Whatever she
+		// One piece to a body slot, as Skyrim keeps it: their WoW items have no armour addons (their Skyrim body is not seen), and
+		// Skyrim finds two pieces at odds by their addons - so a Skyrim helmet and their WoW helm were both worn. Whatever the player
 		// puts on takes off the worn armour that shares a body slot with it.
+		const Item* Find(const RE::TESBoundObject* a_form);
+
 		void OnePerSlot(RE::FormID a_equipped)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -52,10 +59,31 @@ namespace Gear
 			if (!player || !put) {
 				return;
 			}
-			const auto slots = put->GetSlotMask().underlying();
+			// A WoW head item takes the head, the hair and the circlet: one head piece, whichever look it is worn in.
+			constexpr std::uint32_t kHeadPieces = (1u << 0) | (1u << 1) | (1u << 12);   // biped slots 30, 31, 42
+			const auto claims = [&](const RE::TESObjectARMO* a_armo, std::uint32_t a_type) {
+				return a_armo->GetSlotMask().underlying() | (a_type == 1 ? kHeadPieces : 0u);
+			};
+			// WoW's inventory type of a WoW piece (0: Skyrim's own). Two fingers and two trinkets each keep one other;
+			// a shirt and a tabard share Skyrim's body slot 56 but are two WoW slots (INVTYPE_BODY, INVTYPE_TABARD).
+			const auto wowType = [](const RE::TESObjectARMO* a_armo) -> std::uint32_t {
+				if (const auto* armory = Armory::Find(a_armo)) return armory->look.inventoryType;
+				if (const auto* own = Find(a_armo)) return Character::Gear().at(own->entry).inventoryType;
+				return 0;
+			};
+			const auto type = wowType(put);
+			const auto slots = claims(put, type);
+			const bool dual = type == 11 || type == 12;
+			bool kept = false;
 			for (const auto& [form, data] : player->GetInventory([](RE::TESBoundObject& a_object) { return a_object.IsArmor(); })) {
 				const auto* other = form->As<RE::TESObjectARMO>();
-				if (other && other != put && data.second && data.second->IsWorn() && (other->GetSlotMask().underlying() & slots)) {
+				if (other && other != put && data.second && data.second->IsWorn() && (claims(other, wowType(other)) & slots)) {
+					const auto otherType = wowType(other);
+					if ((type == 4 && otherType == 19) || (type == 19 && otherType == 4)) continue;
+					if (dual && otherType == type && !kept) {
+						kept = true;
+						continue;
+					}
 					RE::ActorEquipManager::GetSingleton()->UnequipObject(player, form, nullptr, 1, nullptr, false, false, false);
 				}
 			}
@@ -133,7 +161,7 @@ namespace Gear
 			std::vector<Character::Item> primary, additional;
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			for (const auto& [form, data] : player->GetInventory([](RE::TESBoundObject& o) {
-				return Find(&o) != nullptr || g_skyrimLooks.contains(&o);
+				return Find(&o) != nullptr || Armory::Find(&o) != nullptr || g_skyrimLooks.contains(&o);
 			})) {
 				if (data.first <= 0 || !data.second || !data.second->IsWorn()) {
 					continue;
@@ -141,6 +169,9 @@ namespace Gear
 				Character::Item item;
 				if (const auto* own = Find(form)) {
 					item = Character::Gear().at(own->entry);
+					item.form = form->GetFormID();
+				} else if (const auto* armory = Armory::Find(form)) {
+					item = armory->look;
 					item.form = form->GetFormID();
 				} else {
 					const auto& look = g_skyrimLooks.at(form);
@@ -164,7 +195,7 @@ namespace Gear
 				}
 				primary.push_back(item);
 			}
-			// Her WoW items keep their slots; a Skyrim item's look fills a slot no WoW item of hers takes.
+			// Their WoW items keep their slots; a Skyrim item's look fills a slot no WoW item of theirs takes.
 			auto order = [](const auto& a, const auto& b) {
 				if (static_cast<bool>(a.entry) != static_cast<bool>(b.entry)) { return a.entry != 0; }
 				return a.form < b.form;
@@ -172,7 +203,10 @@ namespace Gear
 			std::ranges::sort(primary, order);
 			std::ranges::sort(additional, order);
 			std::map<std::uint32_t, Character::Item> slots;
-			for (const auto& i : primary) { slots.try_emplace(i.slot, i); }
+			for (auto i : primary) {
+				if (i.inventoryType == 12 && slots.contains(12)) i.slot = 13;
+				slots.try_emplace(i.slot, i);
+			}
 			for (const auto& i : additional) {
 				slots.try_emplace(i.slot, i);
 			}
@@ -181,7 +215,7 @@ namespace Gear
 			return out;
 		}
 
-		// Her kit, the realm's equipment, into her inventory and on her.
+		// Their kit, the realm's equipment, into their inventory and on the player.
 		void Give()
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -193,10 +227,10 @@ namespace Gear
 				player->AddObjectToContainer(it->form, nullptr, 1, nullptr);
 				RE::ActorEquipManager::GetSingleton()->EquipObject(player, it->form, nullptr, 1, nullptr, false, false, false);
 			}
-			for (const auto& [entry, form] : g_reagents) {   // her bags: a stack of each reagent her spells use
+			for (const auto& [entry, form] : g_reagents) {   // their bags: a stack of each reagent their spells use
 				player->AddObjectToContainer(form, nullptr, kReagentStack, nullptr);
 			}
-			logger::info("gear: her kit given ({} items, {} reagents)", Character::Get().equipment.size(), g_reagents.size());
+			logger::info("gear: their kit given ({} items, {} reagents)", Character::Get().equipment.size(), g_reagents.size());
 		}
 	}
 
@@ -204,6 +238,19 @@ namespace Gear
 	{
 		auto* data = RE::TESDataHandler::GetSingleton();
 		LoadSkyrimLooks(data);
+		Armory::Init();
+		for (std::size_t i = 0; i < Armory::Abilities().size(); ++i) {
+			for (std::size_t copy = 0; copy < Armory::Abilities()[i].size(); ++copy) {
+				g_armoryCopies[Armory::Abilities()[i][copy]] = { static_cast<std::int32_t>(i), copy };
+			}
+		}
+		for (const auto& [id, set] : Armory::Sets()) {
+			for (const auto& bonus : set.bonuses) {
+				if (auto* ability = bonus.ability ? data->LookupForm<RE::SpellItem>(bonus.ability, Armory::kPlugin) : nullptr) {
+					g_armorySets[bonus.ability] = ability;
+				}
+			}
+		}
 		for (const auto& [entry, item] : Character::Gear()) {
 			// Untyped, then cast: LookupForm<T> wants T's exact form type, and a bound object has none of its own.
 			auto* found = data->LookupForm(item.form, kPlugin);
@@ -219,20 +266,45 @@ namespace Gear
 			}
 		}
 		if (!Ready()) {
-			logger::warn("gear: {} not loaded; she wears the realm's equipment", kPlugin);
+			logger::warn("gear: {} not loaded; the player wears the realm's equipment", kPlugin);
 			return;
 		}
 		RE::ScriptEventSourceHolder::GetSingleton()->AddEventSink<RE::TESEquipEvent>(&g_sink);
-		logger::info("gear: {} WoW items are Skyrim items", g_items.size());
+		logger::info("gear: {} WoW items are Skyrim items, {} more in {}", g_items.size(), Armory::Items().size(), Armory::kPlugin);
 	}
 
-	bool Ready() { return !g_items.empty() || !g_skyrimLooks.empty(); }
+	bool Ready() { return !g_items.empty() || !g_skyrimLooks.empty() || Armory::Ready(); }
+	bool Given() { return g_given; }
+
+	nlohmann::json WeaponDamages()
+	{
+		auto out = nlohmann::json::object();
+		for (const auto& item : g_items) {
+			if (const auto* weapon = item.form->As<RE::TESObjectWEAP>()) out[std::to_string(item.entry)] = weapon->attackDamage;
+		}
+		// The Armory's weapons the player carries (its other 1,700 are no tooltip of theirs; the service takes 256 at most).
+		if (auto* player = RE::PlayerCharacter::GetSingleton(); player && Armory::Ready()) {
+			for (const auto& [form, data] : player->GetInventory([](RE::TESBoundObject& o) { return o.IsWeapon() && Armory::Find(&o); })) {
+				if (out.size() >= 200) break;
+				if (data.first > 0) out[std::to_string(Armory::Find(form)->entry)] = form->As<RE::TESObjectWEAP>()->attackDamage;
+			}
+		}
+		return out;
+	}
 	std::uint32_t EntryOf(const RE::TESBoundObject* a_form)
 	{
 		const auto* item = Find(a_form);
 		if (item) return item->entry;
+		if (const auto* armory = Armory::Find(a_form)) return armory->entry;
 		for (const auto& [entry, form] : g_reagents) if (form == a_form) return entry;
 		return 0;
+	}
+
+	RE::TESBoundObject* FormOf(std::uint32_t a_entry)
+	{
+		if (const auto it = std::ranges::find(g_items, a_entry, &Item::entry); it != g_items.end()) return it->form;
+		const auto* armory = Armory::Find(a_entry);
+		return armory ? armory->form : nullptr;
 	}
 
 	// Read instances for every request: crafting changes extra lists without changing
@@ -243,6 +315,14 @@ namespace Gear
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) return out;
 		out["enchantments"] = nlohmann::json::array();
+		if (!player->GetEquippedObject(false) || !player->GetEquippedObject(false)->IsWeapon()) {
+			// Bare hands: their race's unarmed damage (the UnarmedDamage actor value; Skyrim has no unarmed skill, so the
+			// One-handed multiplier stands in, as the engine's H2H uses no skill at all), never the WoW 1-2 fist scaled.
+			out["weapon_entry"] = 0;
+			out["weapon_skill"] = "OneHanded";
+			out["weapon_damage"] = std::max(0.f, player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kUnarmedDamage));
+			out["weapon_unarmed"] = true;
+		}
 		for (const auto& [form, data] : player->GetInventory()) {
 			if (data.first <= 0 || !data.second || !data.second->IsWorn()) continue;
 			auto visit = [&](RE::ExtraDataList* extra) {
@@ -256,6 +336,10 @@ namespace Gear
 					const auto type = static_cast<int>(form->As<RE::TESObjectWEAP>()->GetWeaponType());
 					out["weapon_skill"] = type == 7 || type == 9 ? "Marksman" : type == 5 || type == 6 ? "TwoHanded" : "OneHanded";
 					out["temper_multiplier"] = base > 0 ? player->GetDamage(&entry) / base : 1.f;
+					// Their swing deals the weapon's Skyrim damage at their skill (service/melee.py native_factor): a WoW
+					// weapon's or a vanilla one's alike. Without it the service fell back to scaling the whole WoW roll,
+					// attack power included, so a Daedric warhammer swung as WoW's 1-2 fist (balance review, October 16).
+					out["weapon_damage"] = form->As<RE::TESObjectWEAP>()->attackDamage;
 				}
 				// Armour enchantments are applied by Skyrim on equip. Mirror their
 				// relevant AVs to the service; intrinsic WoW abilities are excluded.
@@ -271,6 +355,14 @@ namespace Gear
 				if (extra && (extra->HasType<RE::ExtraWorn>() || extra->HasType<RE::ExtraWornLeft>())) { visit(extra); visited = true; }
 			}
 			if (!visited) visit(nullptr);
+		}
+		// Their fortified skills as Skyrim has them now, from anything (enchantments, potions, blessings, shrines): the
+		// service prefers these to the worn enchantments' sum for the same values.
+		auto& live = out["live"] = nlohmann::json::object();
+		for (const auto value : { RE::ActorValue::kOneHandedModifier, RE::ActorValue::kTwoHandedModifier, RE::ActorValue::kMarksmanModifier,
+				 RE::ActorValue::kAlterationModifier, RE::ActorValue::kConjurationModifier, RE::ActorValue::kDestructionModifier,
+				 RE::ActorValue::kIllusionModifier, RE::ActorValue::kRestorationModifier }) {
+			live[std::to_string(static_cast<int>(value))] = player->AsActorValueOwner()->GetActorValue(value);
 		}
 		return out;
 	}
@@ -313,10 +405,16 @@ namespace Gear
 	{
 		const auto entry = EntryOf(form);
 		const auto it = Character::Gear().find(entry);
-		if (it == Character::Gear().end() || !it->second.useEntry) return false;
+		if (it == Character::Gear().end() || !it->second.useEntry) {
+			if (!entry) return false;
+			Cast::UseItem(entry);
+			return true;
+		}
 		const auto& item = it->second;
 		auto error = [](const char* text) { WowUi::Run(std::format("__WBFire('UI_ERROR_MESSAGE', {})", LuaQuote(text))); };
-		if (!Cast::ItemReady(item.useSpell)) { error("Item is not ready yet."); return true; }
+		if (!Cast::ItemReady(Cast::kItemTimer | entry) || (item.useReadyCategory && !Cast::ItemReady(Cast::kItemCategory | item.useReadyCategory))) {
+			WowUi::Run("__WBFire('UI_ERROR_MESSAGE', ERR_ITEM_COOLDOWN)"); return true;   // the client's own refusal
+		}
 		// Do not discard a player's crafted instance while changing its base item.
 		if (extra && (extra->HasType<RE::ExtraEnchantment>() || extra->HasType<RE::ExtraHealth>() || extra->HasType<RE::ExtraTextDisplayData>())) {
 			error("This modified item cannot be transformed."); return true;
@@ -330,10 +428,9 @@ namespace Gear
 		player->RemoveItem(form, 1, RE::ITEM_REMOVE_REASON::kRemove, extra, nullptr);
 		player->AddObjectToContainer(other->form, nullptr, 1, nullptr);
 		if (worn) equip->EquipObject(player, other->form, nullptr, 1, nullptr, false, true, false, true);
-		Cast::ItemCooldown(item.useSpell, item.useCooldown);
-		// The two staff spells share item category 1031's thirty-minute cooldown.
-		if (const auto dest = Character::Gear().find(item.useEntry); dest != Character::Gear().end() && dest->second.useSpell)
-			Cast::ItemCooldown(dest->second.useSpell, item.useCooldown);
+		// The two staves share item category 1031's thirty-minute cooldown; their own spell timers are zero.
+		Cast::ItemCooldown(Cast::kItemTimer | entry, item.useItemCooldown);
+		if (item.useCategory) Cast::ItemCooldown(Cast::kItemCategory | item.useCategory, item.useCategoryCooldown);
 		g_dirty = true;
 		return true;
 	}
@@ -351,7 +448,7 @@ namespace Gear
 		if (!Ready()) {
 			return;
 		}
-		if (!g_given && !g_items.empty()) {
+		if (!g_given && !g_items.empty() && Character::Get().classId == 11) {   // WoWBridge.esp's kit is a Druid's
 			Give();
 			g_given = true;
 		}
@@ -383,7 +480,7 @@ namespace Gear
 
 	void Tick()
 	{
-		// The interface's item counts (a spell's "Reagents:" line, red when she has none), as they change.
+		// The interface's item counts (a spell's "Reagents:" line, red when the player has none), as they change.
 		if (static double next = 0; !g_reagents.empty() && Frame::Now() >= next) {
 			next = Frame::Now() + 0.5;
 			if (auto counts = ReagentCounts(); counts != g_shownCounts) {
@@ -399,7 +496,7 @@ namespace Gear
 			OnGameLoaded();
 		}
 		// An equip event may precede the inventory/hand update. Reconcile periodically as well, so an
-		// unchanged read at the event cannot leave her in that outfit until another item is equipped.
+		// unchanged read at the event cannot leave the player in that outfit until another item is equipped.
 		const auto* readyPlayer = RE::PlayerCharacter::GetSingleton();
 		if (!Ready() || !readyPlayer || !readyPlayer->Is3DLoaded()) {
 			return;
@@ -425,10 +522,11 @@ namespace Gear
 				player->RemoveSpell(item.ability);
 			}
 		}
+		const auto wearing = [](std::uint32_t a_entry) {
+			return std::ranges::any_of(g_worn, [a_entry](const auto& item) { return item.entry == a_entry; });
+		};
 		for (const auto& [key, set] : Character::Sets()) {
-			const auto count = std::ranges::count_if(set.entries, [](auto entry) {
-				return std::ranges::any_of(g_worn, [entry](const auto& item) { return item.entry == entry; });
-			});
+			const auto count = std::ranges::count_if(set.entries, wearing);
 			for (const auto& bonus : set.bonuses) {
 				auto* ability = bonus.ability ? RE::TESDataHandler::GetSingleton()->LookupForm<RE::SpellItem>(bonus.ability, kPlugin) : nullptr;
 				if (!ability) continue;
@@ -436,11 +534,33 @@ namespace Gear
 				else if (count < bonus.threshold && player->HasSpell(ability)) player->RemoveSpell(ability);
 			}
 		}
+		// The Armory's bonuses: each worn item takes the next copy of its ability, so equal bonuses add up. Each set
+		// bonus has its own ability even if another set uses the same spell. Unearned copies (including saved ones) go.
+		std::map<std::int32_t, std::size_t> copies;
+		for (const auto& i : g_worn) {
+			if (const auto* armory = i.entry ? Armory::Find(i.entry) : nullptr; armory && armory->ability >= 0) ++copies[armory->ability];
+		}
+		const auto& added = player->GetActorRuntimeData().addedSpells;
+		const std::set<RE::SpellItem*> held(added.begin(), added.end());
+		const auto grant = [player, &held](RE::SpellItem* a_spell, bool a_wanted) {
+			if (a_wanted && !held.contains(a_spell)) player->AddSpell(a_spell);
+			else if (!a_wanted && held.contains(a_spell)) player->RemoveSpell(a_spell);
+		};
+		for (const auto& [spell, copy] : g_armoryCopies) {
+			const auto it = copies.find(copy.first);
+			grant(spell, it != copies.end() && copy.second < it->second);
+		}
+		for (const auto& [id, set] : Armory::Sets()) {
+			const auto count = static_cast<std::uint32_t>(std::ranges::count_if(set.entries, wearing));
+			for (const auto& bonus : set.bonuses) {
+				if (const auto it = g_armorySets.find(bonus.ability); it != g_armorySets.end()) grant(it->second, count >= bonus.threshold);
+			}
+		}
 		std::string list;
 		for (const auto& i : g_worn) {
 			list += std::format(" {}:{}{}", i.slot, i.displayId, i.entry ? "" : std::format("(form {:08X})", i.form));
 		}
-		logger::info("gear: she wears {} WoW slots:{}", g_worn.size(), list);
+		logger::info("gear: the player wears {} WoW slots:{}", g_worn.size(), list);
 	}
 
 	void Save(SKSE::SerializationInterface* a_intfc)

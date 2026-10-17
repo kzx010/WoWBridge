@@ -21,7 +21,7 @@ namespace SkyrimSpells
 		struct Pending
 		{
 			RE::SpellItem*  spell = nullptr;
-			RE::ActorHandle target;    // empty: herself for Self delivery, otherwise native aim
+			RE::ActorHandle target;    // empty: the player for Self delivery, otherwise native aim
 			double          end = 0;   // the cast's end, or the channel's
 			double          nextTick = 0;   // a channel: its next second
 			bool            channel = false;
@@ -106,7 +106,7 @@ namespace SkyrimSpells
 				a_spell->GetSpellType() == RE::MagicSystem::SpellType::kLesserPower);
 		}
 
-		// Her learned spells, base spells and racial spells; hand spells and powers have separate book lists.
+		// Their learned spells, base spells and racial spells; hand spells and powers have separate book lists.
 		std::vector<RE::SpellItem*> Known(bool a_powers = false)
 		{
 			std::vector<RE::SpellItem*> out;
@@ -134,8 +134,8 @@ namespace SkyrimSpells
 			return out;
 		}
 
-		// Her WoW body casts it as she casts her own: Wrath's precast and release, a channel's stance (Hurricane's at a
-		// foe, Tranquility's otherwise). Skyrim's own casting animations are her hidden body's.
+		// The player's WoW body casts it as the player casts their own: Wrath's precast and release, a channel's stance (Hurricane's at a
+		// foe, Tranquility's otherwise). Skyrim's own casting animations are their hidden body's.
 		WowUi::SpellSounds Kit(bool a_hostile, bool a_channel) { return WowUi::Sounds(a_channel ? (a_hostile ? 17402 : 9863) : 9912); }
 
 		std::string Entry(RE::SpellItem* a_spell)
@@ -221,7 +221,7 @@ namespace SkyrimSpells
 			}
 		}
 
-		// Her bar uses Skyrim's voice handler, just as the native shout control does: charge, then release. Skyrim
+		// Their bar uses Skyrim's voice handler, just as the native shout control does: charge, then release. Skyrim
 		// chooses the variation and casts it; its fire event, not the button press, starts the interface's recovery.
 		bool VoiceButton(float a_value, float a_held)
 		{
@@ -316,7 +316,7 @@ namespace SkyrimSpells
 			}
 			if (!v.released && held >= 0.1f) {
 				if (auto* shout = v.form->As<RE::TESShout>(); shout && Word(shout) != v.word) {
-					FinishVoice(true);   // what she knows changed while charging; resolve it on the next use
+					FinishVoice(true);   // what the player knows changed while charging; resolve it on the next use
 					return;
 				}
 				VoiceButton(1.0f, held);

@@ -123,6 +123,8 @@ class Skyrim(unittest.TestCase):
             for a, b in zip(wow['results'], scaled['results']):
                 self.assert_health(a, b, 240 / 1340)
                 kinds.add(a['type'])
+                if a['type'] == 'damage':   # its storm slows each unit it strikes by 25%
+                    self.assertEqual((a['attack_slow_percent'], b['attack_slow_percent']), (25, 25))
         self.assertEqual(kinds, {'damage', 'miss'})
 
     def test_melee_staff_bare_hands_and_one_hand(self):

@@ -31,13 +31,17 @@ def target_armor(cat, target):
     reduction = number(target.get('armor_reduction', 0), 'target.armor_reduction')
     if reduction < 0:
         raise ValueError('target.armor_reduction must be nonnegative')
-    return max(0, cat.creature_armor(int(target['level'])) - reduction)
+    armor = cat.creature_armor(int(target['level']))
+    if 'actor_values' in target:
+        from service import native_values
+        armor += native_values.external(native_values.snapshot(target['actor_values']), 39) * 8
+    return max(0, armor - reduction)
 
 
 def chances(ch: Character, target: dict) -> dict:
     """Each side of the attack table for this attacker and target (percent)."""
     level = int(target['level'])
-    skill = ch.level * 5                     # weapon skill at its maximum for the level
+    skill = ch.weapon_skill_value()          # the main hand's skill at its maximum, plus +skill racials
     cap = ch.level * 5                       # GetSkillMaxForLevel
     defense = level * 5                      # a creature's GetDefenseSkillValue
     front = bool(target.get('in_front', True))   # the attacker in front of the target: it can parry and block
@@ -62,7 +66,8 @@ def chances(ch: Character, target: dict) -> dict:
     # not among the wand users with the caster penalty.
     out['glance'] = (10.0 + (defense - min(skill, cap)) * 2) if level > 10 and not target.get('is_player') else 0.0
     # Crit: agility and gear; against NPCs 0.2 a point of skill over their defense (crit suppression below).
-    out['crit'] = ch.melee_crit() + (skill - defense) * 0.2
+    # CalculateEffectiveCritChance: weapon skill counts against NPCs only, a player's maximum against players.
+    out['crit'] = ch.melee_crit() + ((cap if target.get('is_player') else skill) - defense) * 0.2
     return {k: max(0.0, min(v, 100.0)) for k, v in out.items()}
 
 
@@ -83,9 +88,13 @@ def swing(cat, ch: Character, req: dict) -> dict:
     if next_swing is not None:
         if next_swing not in cat.spells or feral.ability(cat, next_swing) != 9881:
             raise ValueError('caster.next_swing must be a Maul rank')
+        # Melee's in_front describes the defender's arc. Spell validation uses
+        # in_front for the caster's arc, and behind for the defender's defenses.
+        spell_target = {**t, 'kind': 'unit', 'distance_yd': t.get('distance_yd', 0),
+                        'in_front': t.get('facing', True),
+                        'behind': t.get('behind', not t.get('in_front', True))}
         try:
-            ability = feral.resolve(cat, ch, {**req, 'spell': next_swing,
-                                              'target': {**t, 'kind': 'unit', 'distance_yd': t.get('distance_yd', 0)}},
+            ability = feral.resolve(cat, ch, {**req, 'spell': next_swing, 'target': spell_target},
                                     executing_swing=True)
         except spells.CastError as e:
             # Unit.cpp:AttackerStateUpdate falls back to an ordinary swing when
@@ -106,31 +115,33 @@ def swing(cat, ch: Character, req: dict) -> dict:
     w = ch.melee_weapon()
     rng = random.Random(req.get('seed', 0))
     from service.perks import WHITE
+    low, high, multiplier = roll_range(ch, w)
+    factor = native_factor(ch, low, high, multiplier)
     table = chances(ch, t)
     table['crit'] = F.apply_spell_mod(WHITE, F.SPELLMOD_CRITICAL_CHANCE, table['crit'], ch.mods)
     side = _die(rng, list(table.items()))
-    out = {'outcome': side, 'delay_ms': w['delay'], 'damage': 0, 'blocked': 0}
+    out = {'outcome': side, 'delay_ms': attack_time(ch, w), 'damage': 0, 'blocked': 0}
+    if factor:
+        out['weapon_factor'] = factor   # skyrim.convert's, in place of the generic unit conversion
     if caster.get('prowling', False):
         out['breaks_prowl'] = True
     if ch.form in ('bear', 'dire_bear'):
         out['rage_gained'] = 0
     if side in ('miss', 'dodge', 'parry'):
         return out
-    # Player::CalculateMinMaxDamage: weapon damage plus attack power / 14 a second of the weapon's speed.
-    bonus = ch.attack_power() / 14.0 * (w['delay'] / 1000.0)
-    if ch.form != 'none':
-        bonus += ch.total(13, 1)  # StatSystem.cpp:CalculateMinMaxDamage, Tiger's Fury.
-    multiplier = ch.multiplier(79, 1) * (ch.weapon_multiplier if ch.form not in ('cat', 'bear', 'dire_bear') else 1)
-    damage = rng.randint(int((w['min'] + bonus) * multiplier), int((w['max'] + bonus) * multiplier))      # Unit::CalculateDamage
+    damage = rng.randint(int(low), int(high))      # Unit::CalculateDamage
+    roll = damage
     damage = int(F.apply_spell_mod(WHITE, F.SPELLMOD_DAMAGE, damage, ch.mods))
+    damage += ch.feral_weapon_floor(roll, low, high)
     armor = target_armor(cat, t)
     damage = F.armor_reduced(damage, armor, ch.level)                       # CalcArmorReducedDamage
     damage = int(damage)
     if side == 'crit':
         damage = int(damage * (1 + F.apply_spell_mod(WHITE, F.SPELLMOD_CRIT_DAMAGE_BONUS, 1, ch.mods)))
     elif side == 'glance':
-        # CalculateGlanceAmount: a multiplier between low and high ends set by the defense difference.
-        diff = int(t['level']) * 5 - ch.level * 5
+        # CalculateGlanceAmount: a multiplier between low and high ends set by the defense difference (pre-2.0.1:
+        # the uncapped weapon skill).
+        diff = int(t['level']) * 5 - ch.weapon_skill_value()
         if diff >= 0:                       # our skill beating their defense: no reduction
             high = min(max(1.2 - 0.03 * diff, 0.2), 0.99)
             low = min(max(1.3 - 0.05 * diff, 0.01), min(0.91, high))
@@ -146,14 +157,65 @@ def swing(cat, ch: Character, req: dict) -> dict:
     return out
 
 
+def attack_time(ch: Character, w: dict) -> int:
+    """Unit::ApplyAttackTimePercentMod (Unit.cpp:10474): SPELL_AURA_MOD_ATTACKSPEED (Seal of the Crusader's +40%)
+    divides the main hand's swing time by 1 + x/100 and a slow multiplies it by 1 + |x|/100; GetAttackTime, which
+    attack power (GetAPMultiplier) and proc-per-minute chances use, keeps the weapon's own."""
+    delay = float(w['delay'])
+    for a in ch.auras:
+        if a['aura'] == 9 and a['amount']:
+            delay *= 100.0 / (100.0 + a['amount']) if a['amount'] > 0 else (100.0 - a['amount']) / 100.0
+    return w['delay'] if delay == w['delay'] else int(delay)
+
+
+def roll_range(ch: Character, w: dict) -> tuple[float, float, float]:
+    """Player::CalculateMinMaxDamage: weapon damage plus attack power / 14 a second of the weapon's speed, times the
+    damage-done auras and native weapon fortification (that multiplier too). Seal of the Crusader scales the weapon's
+    base damage (m_modAttackBaseDPSPct) and the main hand's TOTAL_PCT (paladin.crusader_pcts); a native weapon's
+    damage takes both, as the weapon's base damage does (the third value, native_factor's multiplier)."""
+    bonus = ch.attack_power() / 14.0 * (w['delay'] / 1000.0)
+    if ch.form != 'none':
+        bonus += ch.total(13, 1)  # StatSystem.cpp:CalculateMinMaxDamage, Tiger's Fury.
+    multiplier = ch.multiplier(79, 1) * (ch.weapon_multiplier if ch.form not in ('cat', 'bear', 'dire_bear') else 1)
+    from service.paladin import crusader_pcts
+    base, total = crusader_pcts(ch)
+    if (base, total) != (1.0, 1.0):
+        multiplier *= total
+        return (w['min'] * base + bonus) * multiplier, (w['max'] * base + bonus) * multiplier, multiplier * base
+    return (w['min'] + bonus) * multiplier, (w['max'] + bonus) * multiplier, multiplier
+
+
+def native_factor(ch: Character, low: float, high: float, multiplier: float) -> float | None:
+    """WoW health to Skyrim's for a weapon with a native damage: WoW's roll keeps its spread, table, crits, armor
+    and procs, scaled so a plain hit averages the weapon's Skyrim damage at her skill (Character.native_weapon_average)
+    times the same multiplier. Attack power then widens nothing but the spread; it reaches damage natively (Fortify)."""
+    native = ch.native_weapon_average()
+    return native * multiplier / ((low + high) / 2) if native and high > 0 else None
+
+
+def weapon_tooltip(ch: Character) -> dict | None:
+    """Her plain hit as the swing deals it, in Skyrim's health: the client's 'X - Y Damage' and damage per second."""
+    from service.perks import WHITE
+    w = ch.melee_weapon()
+    low, high, multiplier = roll_range(ch, w)
+    factor = native_factor(ch, low, high, multiplier)
+    if not factor:
+        return None
+    low, high = (F.apply_spell_mod(WHITE, F.SPELLMOD_DAMAGE, v, ch.mods) * factor for v in (low, high))
+    return {'min': low, 'max': high, 'dps': (low + high) / 2 / (w['delay'] / 1000), 'delay_ms': w['delay']}
+
+
 def ability_outcome(ch, s, target, rng):
     """Unit.cpp:MeleeSpellHitResult: yellow attacks cannot glance or crit on
     the hit die. Crit and partial block roll separately for damaging spells.
     Pounce/Ravage have NO_ACTIVE_DEFENSE; Rake has COMPLETELY_BLOCKED.
     """
     table = chances(ch, target)
+    # chances() already takes SPELL_AURA_MOD_HIT_CHANCE off in talent mode; CMaNGOS takes it once (Unit::Calculate
+    # EffectiveMissChance), for the Druid too (her gear's +hit counted twice on abilities before).
+    hit = 0 if ch.talent_mode else ch.total(54)
     table['miss'] = max(0, F.apply_spell_mod(s, F.SPELLMOD_RESIST_MISS_CHANCE,
-                                           table['miss'] - ch.total(54), ch.mods))
+                                           table['miss'] - hit, ch.mods))
     sides = [('miss', table['miss'])]
     if not s['Attributes'] & 0x200000:
         sides += [('dodge', 0 if target.get('is_player') and not target.get('in_front', True) else table['dodge']),

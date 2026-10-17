@@ -1,4 +1,4 @@
-#include "wowcore/character.hpp"
+#include "wowcore/character.h"
 #include "wowcore/item_preview.hpp"
 
 #include "pipeline/blp_loader.hpp"
@@ -13,6 +13,36 @@
 #include <optional>
 
 namespace wowcore {
+bool eligibleCharacter(uint32_t classId, uint32_t race) {
+    // CharBaseInfo.dbc, build 5875: the implemented classes' four pairs.
+    return (classId == 11 && (race == 4 || race == 6)) || (classId == 2 && (race == 1 || race == 3));
+}
+
+std::vector<CharacterClass> characterClasses(const Mpq& mpq) {
+    const auto classes = Dbc::load(mpq, "DBFilesClient\\ChrClasses.dbc");
+    const auto races = Dbc::load(mpq, "DBFilesClient\\ChrRaces.dbc");
+    const auto base = mpq.read("DBFilesClient\\CharBaseInfo.dbc");
+    // CharBaseInfo has two byte fields; Dbc's word-column reader cannot read it.
+    if (!classes || !races || !base || base->size() < 20 ||
+        std::string(base->begin(), base->begin()+4) != "WDBC") return {};
+    const auto word = [&](size_t at) {
+        return uint32_t((*base)[at]) | uint32_t((*base)[at+1]) << 8 |
+            uint32_t((*base)[at+2]) << 16 | uint32_t((*base)[at+3]) << 24;
+    };
+    const auto count = word(4);
+    if (word(8) != 2 || word(12) != 2 || count > (base->size()-20)/2) return {};
+    std::vector<CharacterClass> out;
+    for (const auto id : {11u,2u}) if (const auto row = classes->rowOf(id)) {
+        CharacterClass c{id,classes->str(*row,5),classes->str(*row,14),{}};
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t race = (*base)[20+i*2];
+            if ((*base)[21+i*2] == id && races->rowOf(race) && eligibleCharacter(id,race)) c.races.push_back(race);
+        }
+        if (!c.races.empty()) out.push_back(std::move(c));
+    }
+    return out;
+}
+
 namespace {
 // Race folder names and the suffix helms carry for each race (1.12: eight races).
 struct Race { const char* folder; const char* helm; };
@@ -439,6 +469,42 @@ std::optional<Look> dressCreature(const Mpq& mpq, uint32_t displayId) {
     return look;
 }
 
+Customization customization(const Mpq& mpq, uint32_t race, uint32_t sex) {
+    Customization out;
+    const auto load = [&](const char* name) { return Dbc::load(mpq, std::string("DBFilesClient\\") + name); };
+    const auto sections = load("CharSections.dbc");
+    const auto facial = load("CharacterFacialHairStyles.dbc");
+    const auto races = load("ChrRaces.dbc");
+    if (!sections) return out;
+    std::set<std::array<uint32_t, 3>> textures;   // base section, variation, colour
+    for (uint32_t r = 0; r < sections->rows(); ++r)
+        if (sections->u32(r, 1) == race && sections->u32(r, 2) == sex)
+            textures.insert({ sections->u32(r, 3), sections->u32(r, 4), sections->u32(r, 5) });
+    const auto has = [&](uint32_t base, uint32_t variation, uint32_t color) {
+        return textures.contains(std::array<uint32_t, 3>{ base, variation, color });
+    };
+    const auto count = [](auto exists) { uint32_t n = 0; while (n < 256 && exists(n)) ++n; return n; };   // 0, 1, ... unbroken
+    out.skins = count([&](uint32_t c) { return has(0, 0, c); });
+    for (uint32_t skin = 0; skin < out.skins; ++skin) out.faces.push_back(count([&](uint32_t v) { return has(1, v, skin); }));
+    out.hairStyles = count([&](uint32_t v) { return has(3, v, 0); });
+    for (uint32_t style = 0; style < out.hairStyles; ++style)
+        out.hairColors.push_back(count([&](uint32_t c) { return has(3, style, c); }));
+    // CharacterFacialHairStyles: RaceID, SexID, VariationID, Geoset[6].
+    if (facial) out.facialHairs = count([&](uint32_t v) { return rowWhere(*facial, { {0, race}, {1, sex}, {2, v} }).has_value(); });
+    // ChrRaces (1.12): ... Name_lang (17-25), FacialHairCustomization[2] (male, female), HairCustomization.
+    if (const auto r = races ? races->rowOf(race) : std::nullopt) {
+        out.facialHair = races->str(*r, sex == 1 ? 27 : 26);
+        out.hair = races->str(*r, 28);
+    }
+    return out;
+}
+
+bool Customization::allows(const Appearance& who) const {
+    return who.skin < skins && who.skin < faces.size() && who.face < faces[who.skin] && who.hairStyle < hairStyles &&
+           who.hairStyle < hairColors.size() && who.hairColor < hairColors[who.hairStyle] &&
+           who.facialHair < std::max(facialHairs, 1u);
+}
+
 Look dressCharacter(const Mpq& mpq, const Appearance& who, const std::vector<Worn>& worn) {
     Look look;
     const Race race = raceOf(who.race);
@@ -472,6 +538,7 @@ Look dressCharacter(const Mpq& mpq, const Appearance& who, const std::vector<Wor
     // The body texture: skin, face, markings, scalp, underwear, then the items' components in the client's order.
     const auto skin = section(*sections, who, 0, 0, who.skin);
     look.skin = loadImage(mpq, skin[0]);
+    if (!skin[1].empty()) look.replaceableTextures[8] = skin[1];   // Tauren fur/mane (M2 skin-extra texture)
     if (look.skin.rgba.empty()) {
         look.skin.w = look.skin.h = 256;
         look.skin.rgba.assign(256 * 256 * 4, 255);
@@ -492,8 +559,9 @@ Look dressCharacter(const Mpq& mpq, const Appearance& who, const std::vector<Wor
     // Shirt, head, neck, shoulders, legs, feet, chest, tabard, waist, wrists, hands, back: what lies over what. A robe or
     // a kilt (geoset 1302 and up) hangs over the boots, so the boots go under the legs and chest instead.
     const bool robe = std::max(group(4, 2), group(6, 2)) > 0;
-    const auto order = robe ? std::initializer_list<uint32_t>{ 3u, 0u, 1u, 2u, 7u, 6u, 4u, 18u, 5u, 8u, 9u, 14u }
-                            : std::initializer_list<uint32_t>{ 3u, 0u, 1u, 2u, 6u, 7u, 4u, 18u, 5u, 8u, 9u, 14u };
+    // Own the slot values: a conditional initializer_list leaves its backing array dangling before the loop.
+    const auto order = robe ? std::array<uint32_t, 12>{ 3u, 0u, 1u, 2u, 7u, 6u, 4u, 18u, 5u, 8u, 9u, 14u }
+                            : std::array<uint32_t, 12>{ 3u, 0u, 1u, 2u, 6u, 7u, 4u, 18u, 5u, 8u, 9u, 14u };
     for (const uint32_t slot : order) {
         const Item* item = bySlot(slot);
         if (!item) continue;
@@ -526,6 +594,11 @@ Look dressCharacter(const Mpq& mpq, const Appearance& who, const std::vector<Wor
             for (int i = 0; i < 3; ++i) {
                 const uint32_t v = facial->u32(*r, 3 + i);
                 if (v > 0 && v < 100 && showFacial[show[i]]) look.geosets.insert(static_cast<uint16_t>(groups[i] + v));
+            }
+            // Tauren females use the sixth DBC geoset for their 2xx hair. The first three contain client sentinels.
+            if (who.race == 6 && female && showFacial[1]) {
+                const auto v = facial->u32(*r, 8);
+                if (v > 0 && v < 100) look.geosets.insert(static_cast<uint16_t>(200 + v));
             }
         }
     if (showEars) look.geosets.insert(702);

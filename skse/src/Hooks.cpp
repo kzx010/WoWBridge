@@ -3,6 +3,7 @@
 
 #include "Frame.h"
 #include "Input.h"
+#include "SelfTest.h"
 
 namespace Hooks
 {
@@ -45,8 +46,21 @@ namespace Hooks
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
+		struct TestFrontView
+		{
+			// CommonLib ThirdPersonState.h: primary vtable 0xD, void(bool weaponSheathed).
+			// TDM's hook confirms that bypassing this call preserves free rotation when drawn.
+			static void thunk(RE::ThirdPersonState* a_this, bool a_weaponSheathed)
+			{
+				if (!SelfTest::WantFrontView()) { func(a_this, a_weaponSheathed); return; }
+				a_this->freeRotationEnabled = true;
+				a_this->freeRotation = { RE::NI_PI, 0.f };
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
 		// Skyrim's camera shake (Game.ShakeCamera and its own callers: hits, stomps, explosions). WoW's camera never
-		// shakes for any of them (the user: the shaking screen when she is hit is disorienting), so it is replaced
+		// shakes for any of them (the user: the shaking screen when the player is hit is disorienting), so it is replaced
 		// outright; calls are only counted.
 		std::atomic<std::uint32_t> g_shakes = 0;
 		using ShakeFunction = void (*)(float, const RE::NiPoint3&, float);
@@ -67,6 +81,13 @@ namespace Hooks
 		REL::Relocation<std::uintptr_t> playerVtbl{ RE::VTABLE_PlayerCharacter[0] };
 		PlayerUpdate::func = playerVtbl.write_vfunc(0xAD, PlayerUpdate::thunk);
 		logger::info("hook PlayerCharacter::Update installed");
+		static bool frontViewInstalled = false;
+		if (!frontViewInstalled) {
+			REL::Relocation<std::uintptr_t> thirdVtbl{ RE::VTABLE_ThirdPersonState[0] };
+			TestFrontView::func = thirdVtbl.write_vfunc(0xD, TestFrontView::thunk);
+			frontViewInstalled = true;
+			logger::info("hook ThirdPersonState::SetFreeRotationMode installed (self-test only)");
+		}
 
 		const auto inputSite = REL::Relocation<std::uintptr_t>{ RELOCATION_ID(67315, 68617) }.address() + 0x7B;
 		if (!VerifyCall(inputSite, REL::Relocation<std::uintptr_t>{ REL::ID(68655) }.address(), "input dispatch")) {

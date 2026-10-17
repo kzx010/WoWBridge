@@ -20,6 +20,7 @@ class ClientDb;
 class Mpq;
 class MinimapAtlas;
 struct MapPoint;
+struct MinimapFloorTriangle;
 struct Look;
 
 class UiSession {
@@ -42,6 +43,9 @@ public:
     // Render/Lua thread only. The atlas outlives the session; nullptr/unknown
     // worldspace clears terrain and map coordinates (interior/unsupported area).
     void setMinimap(const MinimapAtlas* atlas, const std::string& worldspace, MapPoint player, double heading);
+    // Render/Lua thread only. The interior floor plan to draw while the pose has no terrain; empty clears it.
+    // __WB.minimap.z (yards) selects the storey the player is on.
+    void setMinimapFloor(std::vector<MinimapFloorTriangle> floor);
     // Copy __WB.minimap pose, parent layers, tracking blips and compass POIs from live Lua data.
     void applyLiveMinimap(const MinimapAtlas* atlas);
     // Full map has a separate exterior pose, including while in an interior.

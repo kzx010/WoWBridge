@@ -12,7 +12,8 @@ import zipfile
 
 REPO = Path(__file__).resolve().parents[1]
 OUT = REPO / 'dist/WoWBridge-Tester'
-DATA = ('progression.json', 'talents.json', 'perks.json', 'talent_catalog.json', 'perk_catalog.json')
+DATA = ('progression.json', 'talents.json', 'perks.json', 'talent_catalog.json', 'perk_catalog.json', 'racial_data.json',
+        'paladin_manifest.json')   # service/paladin.py loads it for every Paladin spell
 SCREENSHOTS = tuple('docs/screenshots/' + name for name in (
     'wowbridge_toggle.png', 'wowbridge_appearance.png', 'wowbridge_name.png', 'wowbridge_configured.png'))
 
@@ -38,8 +39,8 @@ def build():
     stage = REPO / 'build/tester-stage'
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
-    required = ('WoWBridge.esp', 'SKSE/Plugins/WoWBridge.dll', 'SKSE/Plugins/WoWBridge.ini',
-                'SKSE/Plugins/WoWBridge/character.json', 'SKSE/Plugins/WoWBridge/gear.json')
+    required = ('WoWBridge.esp', 'WoWBridgeArmory.esp', 'SKSE/Plugins/WoWBridge.dll', 'SKSE/Plugins/WoWBridge.ini',
+                'SKSE/Plugins/WoWBridge/character.json', 'SKSE/Plugins/WoWBridge/gear.json', 'SKSE/Plugins/WoWBridge/armory.json')
     mod = REPO / 'dist/WoWBridge'
     for name in required:
         if not (mod / name).is_file():
@@ -54,6 +55,7 @@ def build():
     for name in DATA:
         copy(REPO / 'data' / name, stage / 'runtime/data' / name)
     copy(REPO / 'build/catalog.json', stage / 'runtime/build/catalog.json')
+    copy(REPO / 'build/armory_catalog.json', stage / 'runtime/build/armory_catalog.json')   # data/build_armory.py
     # Preserve upstream notices already present in the local build dependencies.
     license_sources = {
         'WoWee.txt': REPO / 'wowcore/third_party/wowee/LICENSE',
@@ -61,9 +63,14 @@ def build():
         'StormLib.txt': REPO.parent / 'reference/StormLib/LICENSE',
         'CommonLibSSE-NG.txt': REPO.parent / 'reference/CommonLibSSE-NG/licenses/LICENSE-MIT.txt',
         'hde64.txt': REPO.parent / 'reference/CommonLibSSE-NG/licenses/LICENSE-hde64.txt',
+        'SkyCraft.txt': REPO.parent / 'reference/SkyCraft/LICENSE',   # ported world-pass technique (docs/credits-and-resources.md)
     }
     for path in (REPO / 'build/skse/vcpkg_installed').glob('*/share/*/copyright'):
         license_sources['vcpkg-' + path.parent.name + '.txt'] = path
+    # Ports some vcpkg installs ship without a copyright file (SimpleIni and StormLib on the Windows build, October 17):
+    # their notices, as preview 3 published them, stay in the repo so no release silently drops one.
+    for path in (REPO / 'tools/notices').glob('vcpkg-*.txt'):
+        license_sources.setdefault(path.name, path)
     for name, path in license_sources.items():
         copy(path, stage / 'licenses' / name)
     # Lua's full permission notice is in lua.h, rather than its README.
@@ -96,10 +103,12 @@ def source_snapshot():
     result = subprocess.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
                             cwd=REPO, capture_output=True, check=True)
     excluded = {'STATUS.md', 'docs/privacy.md', 'docs/next-playtest.md',
-                'tools/native/mpqcat', 'tools/native/mpqpack', 'tools/native/mpqverify'}
+                'tools/native/mpqcat', 'tools/native/mpqpack', 'tools/native/mpqverify',
+                'tools/transfer.py', 'tools/tests/test_transfer.py'}   # the developer's own machine-to-machine transfer
     roots = {'data', 'service', 'skse', 'tools', 'wowcore', 'docs', 'licenses'}
     public_docs = {'docs/console-commands.md': '## Shell helpers',
-                   'docs/perks.md': '## Rebuilding and checks'}
+                   'docs/perks.md': '## Rebuilding and checks',
+                   'docs/credits-and-resources.md': '## Keeping it current'}   # the README's Credits link (maintenance notes stay local)
     top = {'README.md', 'LICENSE', 'setup.py', 'Setup.cmd', 'Start Service.cmd', 'Uninstall.cmd', 'start-service.sh', '.gitignore'}
     selected = []
     for name in sorted(set(result.stdout.decode().strip('\0').split('\0'))):

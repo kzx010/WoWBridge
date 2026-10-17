@@ -13,6 +13,7 @@ namespace Input
 		std::uint64_t movesPassed = 0;
 		std::uint64_t keysSwallowed = 0;
 		std::uint64_t buttonsSwallowed = 0;
+		std::uint64_t buttonsReconciled = 0;   // button-ups the OS knew about and the game never delivered
 	};
 
 	void Filter(RE::InputEvent** a_head);
@@ -25,7 +26,7 @@ namespace Input
 	bool RightDragged();    // the right button moved the mouse since it went down (steering, not a click)
 	bool LeftDragged();     // the same for the left button (a camera turn, not a click)
 	void SetLeftLook(bool a_on);   // the left button is down on the world (the interface says): its drags turn the camera
-	void UpdateRunByButtons();     // every frame: both buttons held on the world run her forward, as in WoW
+	void UpdateRunByButtons();     // every frame: both buttons held on the world run the player forward, as in WoW
 	std::pair<float, float> Cursor();  // screen pixels, origin top-left
 	void SetCursor(float a_x, float a_y);
 	bool SteeringHeld();

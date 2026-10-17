@@ -14,9 +14,15 @@ PY="${WOWBRIDGE_PYTHON:-$PROJECT/toolchain/venv/bin/python}"
 GAME_DIR="$PROJECT/steamapps/common/Skyrim Special Edition"
 SKSE_LOGS="$PROJECT/steamapps/compatdata/489830/pfx/drive_c/users/steamuser/Documents/My Games/Skyrim Special Edition/SKSE"
 cd "$ROOT" || exit 1
+WSL=$(grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null && echo 1 || true)   # native Windows Skyrim driven from WSL (tools/winhost.py), else Proton on Linux
+winhost() { "$PY" -c "import sys; sys.path.insert(0, 'tools'); import winhost; from pathlib import Path; $1"; }
+[ -n "$WSL" ] && SKSE_LOGS="$(winhost "print(winhost.docs_dir() / 'SKSE')")"
 
 service_up() { (exec 3<>/dev/tcp/127.0.0.1/7878) 2>/dev/null; }
-game_up() { pgrep -f '^S:.*SkyrimSE\.exe' > /dev/null; }
+game_up() {
+    if [ -n "$WSL" ]; then tasklist.exe /FI "IMAGENAME eq SkyrimSE.exe" /NH 2>/dev/null | grep -qi SkyrimSE; return; fi
+    pgrep -f '^S:.*SkyrimSE\.exe' > /dev/null
+}
 
 start_service() {
     if service_up; then echo "service: already running on 127.0.0.1:7878"; return; fi
@@ -27,6 +33,7 @@ start_service() {
 
 # The reference WoW client full screen keeps the focus from Skyrim, which then stops at its first frame.
 minimize_wow() {
+    [ -n "$WSL" ] && { winhost "winhost.minimize('World of Warcraft')" > /dev/null 2>&1; return 0; }
     "$PY" -c "import sys; sys.path.insert(0, 'tools'); from inputdev import kwin
 kwin('for (const w of workspace.windowList()) if (w.caption === \"World of Warcraft\") w.minimized = true; print(\"TAG|\");')" > /dev/null 2>&1 || true
 }
@@ -37,7 +44,9 @@ play)
     sed -i 's/^autorun=1/autorun=0/' "$GAME_DIR/Data/SKSE/Plugins/WoWBridge.ini"   # play, not the test suite
     start_service
     minimize_wow
-    steam -applaunch 489830 > /dev/null 2>&1 &
+    if [ -n "$WSL" ]; then winhost "winhost.launch(Path('$GAME_DIR') / 'skse64_loader.exe')" > /dev/null
+    else steam -applaunch 489830 > /dev/null 2>&1 &
+    fi
     cat <<'EOF'
 Skyrim is launching through Steam (SKSE). For a new game, play the opening normally and choose Play WoWBridge
 at character creation. Pick a night elf druid preset and enter a name. Dragonborn is the default.
@@ -61,7 +70,11 @@ test)
     game_up && { echo "Close Skyrim first (tools/play.sh stop)."; exit 1; }
     echo "Running the in-game suite (about 20 minutes; don't use the mouse or keyboard meanwhile)..."
     RUN_STATUS=0
-    timeout 2500 "$PY" tools/run_skyrim.py --autorun --timeout 2400 "${@:2}" > build/skyrim_run.log 2>&1 || RUN_STATUS=$?
+    # The outer limit follows the runner's own (the last --timeout given wins), so its SIGTERM - which the runner
+    # turns into its normal cleanup - only ever stops a hung runner.
+    INNER=2400; ARGS=("${@:2}")
+    for ((i = 0; i < ${#ARGS[@]}; i++)); do [ "${ARGS[i]}" = --timeout ] && INNER=${ARGS[i+1]%.*}; done
+    timeout --kill-after=60 $((INNER + 100)) "$PY" tools/run_skyrim.py --autorun --timeout 2400 "${@:2}" > build/skyrim_run.log 2>&1 || RUN_STATUS=$?
     head -1 build/skyrim_run.log
     "$PY" - "$RUN_STATUS" <<'EOF'
 import json, re, sys

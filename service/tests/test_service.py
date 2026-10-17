@@ -91,6 +91,9 @@ class Spells(Fixture):
         self.assertEqual((root['type'], root['duration_ms']), ('root', 27000))
         self.assertEqual(root['heartbeat']['interval_ms'], 13500)
         self.assertEqual(len(dot['ticks']), 9)
+        # SpellMgr::IsSingleTargetSpell: a player's root (family flags 0x200) holds one unit; its damage aura is not one.
+        self.assertEqual(root['single_target'], {'chain': 339, 'family': 7, 'flags': 0x200})
+        self.assertNotIn('single_target', dot)
         with self.assertRaisesRegex(spells.CastError, 'ONLY_OUTDOORS'):
             self.cast(self.full, 'entangling_roots', ctx={'indoors': True})
 

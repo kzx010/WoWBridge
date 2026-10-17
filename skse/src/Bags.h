@@ -7,6 +7,10 @@ namespace Bags
 	constexpr std::uint32_t kRecord = 'BAGS', kRecordVersion = 2;
 	// Shared description for bags, merchant and loot; extra lists are borrowed only for this call. Main thread.
 	nlohmann::json DescribeItem(RE::TESBoundObject* a_form, RE::ExtraDataList* a_extra, int a_count);
+	// What Skyrim's own menus list: playable and named (its own or a custom name). Nameless records (draugr hair,
+	// dragon skins and blood, clutter tokens) stay hidden there; GetDisplayName() calls them "<Missing Name>".
+	bool Named(RE::TESBoundObject* a_form, RE::ExtraDataList* a_extra);
+	bool Listed(RE::TESBoundObject* a_form, RE::ExtraDataList* a_extra);
 	std::string ItemLua(const nlohmann::json& a_items);
 	// Selected-pile accounting for native transfers. Main thread.
 	nlohmann::json Sale(const std::string& a_key);

@@ -1,5 +1,9 @@
 #pragma once
 
+#include <glm/mat4x4.hpp>
+
+namespace Avatar { struct Loaded; }
+
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Buffer;
@@ -24,9 +28,25 @@ namespace WowModels
 		float                    viewProj[16]{};    // the frame's, row-major (camera-relative Skyrim units -> clip)
 	};
 	void Draw(const Frame& a_frame);
+	// Last body actually drawn, after blending, upper-body animation and the mount's saddle.
+	// Absolute Skyrim world matrices (not the pass's camera-relative matrices). Copied across threads.
+	struct AttachmentPose
+	{
+		const Avatar::Loaded* body = nullptr;
+		bool drawn = false;
+		std::uint64_t frame = 0;
+		std::chrono::steady_clock::time_point at;
+		std::array<std::optional<glm::mat4>, 34> points;
+		// The same points in their own frame (saddle, size and the attachment; no placement): a consumer places them
+		// with this frame's position and facing, so a turn between the draw and its Tick cannot mirror or lag them.
+		std::array<std::optional<glm::mat4>, 34> local;
+	};
+	AttachmentPose LastAttachments();
+	// Their placement in absolute Skyrim world (the pass's Placement without the camera re-basing).
+	glm::mat4 PlacementAbsolute(const RE::NiPoint3& a_position, float a_facing);
 	bool GroundReady(const std::shared_ptr<const wowcore::ItemPreview>& a_item);  // main thread: uploaded and recent world draw
 
-	// Her face for the interface's portraits (PlayerPortrait): drawn once her model is up, through the model's own
+	// Their face for the interface's portraits (PlayerPortrait): drawn once their model is up, through the model's own
 	// portrait camera (M2 camera 0). nullptr until then.
 	ID3D11ShaderResourceView* Portrait();
 	// The target's face (a Skyrim actor's head, Portrait::Current) for TargetPortrait. nullptr: none drawn for it.
@@ -43,7 +63,7 @@ namespace WowModels
 	};
 	Stats GetStats();
 
-	// Independent menu resources; never evicts her body/portraits. Caller saves/restores D3D bindings.
+	// Independent menu resources; never evicts the player's body/portraits. Caller saves/restores D3D bindings.
 	struct ItemFrame
 	{
 		ID3D11Device* device = nullptr;

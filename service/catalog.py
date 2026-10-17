@@ -6,7 +6,7 @@ DEFAULT = Path(__file__).resolve().parent.parent / 'build/catalog.json'
 
 
 class Catalog:
-    def __init__(self, path: Path = DEFAULT, *, raw: dict | None = None):
+    def __init__(self, path: Path = DEFAULT, *, raw: dict | None = None, armory: Path | bool = True):
         self.raw = json.loads(json.dumps(raw)) if raw is not None else json.loads(Path(path).read_text())
         self.poison_payloads = set(self.raw.get('poison_payloads', ()))
         # The pinned build catalog can predate talent code links. A deterministic
@@ -25,12 +25,31 @@ class Catalog:
                 for key, row in extra[section].items():
                     self.raw[section].setdefault(key, row)
             self.poison_payloads = set(extra['poison_payloads'])
+        if armory is True and raw is None:   # beside the catalog it supplements
+            armory = Path(path).resolve().parent / 'armory_catalog.json'
+        # WoWBridgeArmory.esp's items (data/build_armory.py): their item_template rows (each without what its columns
+        # default to), their sets and every spell they use, beside WoWBridge.esp's, which win.
+        self.armory = set()   # the entries it adds
+        if not isinstance(armory, bool) and Path(armory).exists():
+            extra = json.loads(Path(armory).read_text())
+            for section in ('spells', 'cast_times', 'durations', 'ranges', 'radii', 'icons', 'item_sets'):
+                for key, row in extra[section].items():
+                    self.raw.setdefault(section, {}).setdefault(key, row)
+            for section in ('spell_affect', 'spell_proc_event', 'spell_facing'):
+                known = {json.dumps(row, sort_keys=True) for row in self.raw.setdefault(section, [])}
+                self.raw[section] += [row for row in extra[section] if json.dumps(row, sort_keys=True) not in known]
+            for key, row in extra['items'].items():
+                if key not in self.raw['items']:
+                    self.raw['items'][key] = {**extra['item_defaults'], **row}
+                    self.armory.add(int(key))
         self.spells = {int(k): v for k, v in self.raw['spells'].items()}
         # Imported equipment follows Skyrim requirements even with a stale catalog.
         # Progression's spell/item-book rank requirements are a separate data source.
         for item in self.raw['items'].values():
             item['RequiredLevel'] = 0
         self.items = {int(k): v for k, v in self.raw['items'].items()}
+        self.item_use_spells = {item[f'spellid_{n}'] for item in self.items.values() for n in range(1, 6)
+                               if item.get(f'spellid_{n}') and item.get(f'spelltrigger_{n}') == 0}
         self.slice = self.raw['slice']
         self.ranks = {int(k): v for k, v in self.raw.get('ranks', {}).items()}
         self.class_spells = sorted(set(self.ranks) | set(self.slice.values()))

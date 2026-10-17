@@ -599,8 +599,8 @@ TEST_CASE("all Feral talents enter the book and live energy rage damage duration
             CastSpell(slots[id],'spell')
           end
         end
-        assert(GameTooltip:SetAction(2) and strfind(text(),'138',1,true) and strfind(text(),'40 Energy',1,true))
-        assert(GameTooltip:SetSpell(slots[9850],'spell') and strfind(text(),'138',1,true) and strfind(text(),'40 Energy',1,true))
+        assert(GameTooltip:SetAction(2) and strfind(text(),'10 additional damage',1,true) and strfind(text(),'40 Energy',1,true))
+        assert(GameTooltip:SetSpell(slots[9850],'spell') and strfind(text(),'10 additional damage',1,true) and strfind(text(),'40 Energy',1,true))
         assert(GameTooltip:SetAction(4) and strfind(text(),'48 Energy',1,true))
         assert(GameTooltip:SetAction(3) and strfind(text(),'5 sec',1,true))
         assert(__WB.manaCost(__WB.resolve('player'),150,1,9881)==10)
@@ -1888,6 +1888,8 @@ TEST_CASE("Skyrim spell tooltips convert health amounts and preserve the client 
     REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/elunara.lua").c_str()) == 0);
     run("__WBFixture('idle')");
     REQUIRE(wowcore::loadFrameXml(engine, mpq).failures.empty());
+    REQUIRE(luaL_dofile(L, (std::string(WOWBRIDGE_ROOT) + "/wowcore/tests/fixtures/skyrim_health_tooltips.lua").c_str()) == 0);
+    lua_setglobal(L, "__nativeHealthCases");
     run(R"(
         __WBLogin()
         function testDescription(slot, book)
@@ -1971,7 +1973,48 @@ TEST_CASE("Skyrim spell tooltips convert health amounts and preserve the client 
         assert(__WB.spellText(moonfire,'$s2 / $o1',fixed)=='23 to 26 / 44')
         p.skyrim=nil
         assert(__WB.spellText(moonfire,'$s2 / $o1')=='198 to 230 / 396')
+        -- Rip and Ferocious Bite list their per-point damage as prose: converted as their tokens are.
+        local rip, bite = __WB.spellInfo(9896), __WB.spellInfo(31018)
+        __WBSpellTooltips({[9896]={effects={{0,0},{0,0},{0,0}},health_factor=0.1,minimum_health=false},
+                           [31018]={effects={{0,0},{0,0},{0,0}},health_factor=0.1,minimum_health=false}})
+        p.skyrim={OneHanded=50}
+        local ripText, biteText = __WB.spellText(rip), __WB.spellText(bite)
+        assert(string.find(ripText, '1 point  : 27 damage', 1, true) and string.find(ripText, '5 points: 94 damage', 1, true), ripText)
+        assert(string.find(biteText, '1 point  : 20-26 damage', 1, true) and string.find(biteText, '5 points: 79-85 damage', 1, true), biteText)
+        p.skyrim=nil
+        assert(string.find(__WB.spellText(rip), '5 points: 942 damage', 1, true))
+        -- Their Skyrim skill for the spell: one grey line before its description, in Skyrim only.
+        __WBSpellTooltips({[__WB.actions[1].spell]={effects={{0,0},{0,0},{0,0}},skill='Destruction'}})
+        p.skyrim={Destruction=30}
+        GameTooltip:SetOwner(UIParent,'ANCHOR_NONE') GameTooltip:SetAction(1)
+        local found
+        for i=1,GameTooltip:NumLines() do if getglobal('GameTooltipTextLeft'..i):GetText()=='Destruction' then found=i end end
+        assert(found and found==GameTooltip:NumLines()-1, 'skill line '..tostring(found))
+        p.skyrim=nil
+        GameTooltip:SetAction(1)
+        for i=1,GameTooltip:NumLines() do assert(getglobal('GameTooltipTextLeft'..i):GetText()~='Destruction') end
         __WB.spellTooltips=savedProfiles
+        -- The service suite regenerates these profiles and expected amounts
+        -- from real resolve replies, including the converted aura/queue fields.
+        p.skyrim={}
+        for _, case in ipairs(__nativeHealthCases) do
+            __WBSpellTooltips({[case.spell]=case.profile})
+            local info=__WB.spellInfo(case.spell)
+            local actual=__WB.spellText(info,case.text)
+            assert(actual==case.actual, info.name..': '..actual..' ~= '..case.actual)
+            assert(__WB.spellText(info,case.text,case.profile)==case.actual)
+        end
+        __WBSpellTooltips({[9830]={health_factor=7/96.5},[9867]={health_factor=7/96.5},
+                           [9850]={health_factor=7/96.5},[31018]={health_factor=7/96.5}})
+        assert(__WB.spellText(__WB.spellInfo(9830),'$s1 / $s2 / $s3')=='6 / 225 / 1')
+        assert(__WB.spellText(__WB.spellInfo(9867),'$s1 / $s2 / $s3')=='7 / 350 / 1')
+        assert(__WB.spellText(__WB.spellInfo(9850),'$s1 / $s2')=='8 / 1')
+        assert(__WB.spellText(__WB.spellInfo(31018),'$f1')=='0.2')
+        assert(__WB.spellText(__WB.spellInfo(9846),'$d')=='6 sec')
+        assert(__WB.spellText(__WB.spellInfo(5229),'$/10;s1')=='2') -- rage
+        assert(__WB.spellText(__WB.spellInfo(29166),'$s2% / $s1%')=='400% / 100%') -- mana regen
+        __WB.spellTooltips=savedProfiles
+        p.skyrim=nil
         -- Regrowth's catalog uses the same heal/range/period tokens as the other
         -- spells. Preserve its spelling in both modes, through action and book APIs.
         for _, id in ipairs({8936,8938,8939,8940,8941,9750,9856,9857,9858}) do
@@ -2373,7 +2416,7 @@ TEST_CASE("SoundEntries: the interface's named sounds resolve to the client's fi
     REQUIRE(kits.impact.size() == 1);
     CHECK(kits.impact[0].slot == 1);
     CHECK_FALSE(db.sound(wrath.impact)->loop);
-    const auto rejuv = db.spellVisualKits(25299);               // Rejuvenation: her swirl at her feet as it lands
+    const auto rejuv = db.spellVisualKits(25299);               // Rejuvenation: their swirl at the player's feet as it lands
     REQUIRE(rejuv.impact.size() == 1);
     const auto swirl = wowcore::loadModel(mpq, rejuv.impact[0].model);   // all particles and ribbons, no geometry
     REQUIRE(swirl);

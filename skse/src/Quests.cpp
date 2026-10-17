@@ -139,8 +139,8 @@ namespace Quests
 				if (usable(link.ref)) return link.ref->GetPosition();
 			}
 		}
-		// An objective in her own interior has no exterior leg in its current
-		// tracking path. Its entrance is represented by her cached exterior pose.
+		// An objective in their own interior has no exterior leg in its current
+		// tracking path. Its entrance is represented by their cached exterior pose.
 		if (a_exteriorMap && here && cell && cell->IsInteriorCell() && a_ref &&
 			!a_ref->IsDeleted() && !a_ref->IsDisabled() && a_ref->GetParentCell() == cell)
 			return a_player->GetPlayerRuntimeData().exteriorPosition;

@@ -111,6 +111,30 @@ class ProgressionTests(unittest.TestCase):
         self.assertEqual(acquired['highest_ranks']['5487'], 9634)
         self.assertEqual(acquired['highest_ranks']['5185'], 25297)
 
+    def test_a_book_teaches_its_rank_early_and_nothing_after_it(self):
+        # Skyrim/Learning.cpp sends a read book's rank with what she knows; the book is optional, her skill still teaches.
+        skills = {'destruction': 20}   # WoW level 4: Moonfire (Rank 1) and Wrath (Rank 2) at 6 not yet
+        before = self.ask(skills)
+        self.assertNotIn(5177, before['known_spells'])
+        since = before['known_spells']
+        early = self.ask(skills, acquired_spells=since + [5177], since=since)
+        self.assertIn(5177, early['known_spells'])
+        self.assertEqual(early['newly_learned'], [5177])   # announced as learned (Progression.cpp asks with since)
+        self.assertEqual(early['highest_ranks']['5176'], 5177)
+        self.assertEqual(early['replacements'], [{'chain': 5176, 'old_spell': 5176, 'new_spell': 5177}])
+        # The next rank still waits for its skill (Wrath III at 14 asks Destruction 34), or for its own book.
+        self.assertNotIn(5178, early['known_spells'])
+        self.assertEqual(skill_value(14, self.progression.curve), 34)
+        self.assertNotIn(5178, self.ask({'destruction': 33}, acquired_spells=[5177])['known_spells'])
+        self.assertIn(5178, self.ask({'destruction': 34}, acquired_spells=[5177])['known_spells'])
+        self.assertIn(5178, self.ask(skills, acquired_spells=[5177, 5178])['known_spells'])
+        # A book-only rank (Healing Touch XI) is never taught by skill, only by its book, after rank X.
+        self.assertNotIn(25297, self.ask(MAX_SKILLS)['known_spells'])
+        self.assertIn(25297, self.ask(MAX_SKILLS, acquired_spells=[25297])['known_spells'])
+        # Skill-learned ranks stay with an early book's: skill 100 gives every trainer rank above it.
+        full = self.ask(MAX_SKILLS, acquired_spells=[5177])
+        self.assertEqual(full['highest_ranks']['5176'], 9912)
+
     def test_levels_curve_clamp_and_exact_unlock(self):
         curve = self.progression.curve
         self.assertEqual([wow_level(s, curve) for s in (-1, 15, 25, 50, 75, 100, 150)], [1, 1, 7, 25, 42, 60, 60])

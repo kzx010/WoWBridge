@@ -67,8 +67,31 @@ inline bool Outcome(const json& v,bool tracking=false) {
     }
     return !v.contains("form_tracking") || (!tracking && Outcome(v["form_tracking"],true));
 }
+inline bool FormResources(const json& v) {
+    if (!v.is_object() || !Fields(v,{"form"},String) ||
+        !Fields(v,{"rage","energy"},[](const json& x) { return Number(x,0,100); }) ||
+        !Fields(v,{"energy_in","decay_in","no_decay_in"},[](const json& x) { return Number(x); })) return false;
+    if (v.contains("rage_auras")) {
+        if (!v["rage_auras"].is_array() || v["rage_auras"].size()>64) return false;
+        for (const auto& a : v["rage_auras"]) {
+            for (const auto* key : {"spell","next","end","every","per_tick","max_per_tick","health_per_rage","crits","tick","crit_multiplier","respite"})
+                if (!a.is_object() || !a.contains(key)) return false;
+            if (!UInt(a["spell"]) || !UInt(a["tick"]) || !Bool(a["respite"]) ||
+                !Number(a["next"]) || !Number(a["end"]) || !Number(a["every"],.1,1e6) ||
+                !Fields(a,{"per_tick","max_per_tick","health_per_rage","crit_multiplier"},[](const json& x) { return Number(x,0,1e8); }) ||
+                !a["crits"].is_array() || a["crits"].size()>100000) return false;
+            for (const auto& crit : a["crits"]) if (!Bool(crit)) return false;
+        }
+    }
+    return true;
+}
+inline bool PeriodicDispel(const json& v) {
+    return v.is_object() && Fields(v,{"type"},String) && Fields(v,{"count"},[](const json& x) { return UInt(x) && Number(x,0,100000); }) &&
+        Fields(v,{"every"},[](const json& x) { return Number(x,0,1e6) && (x==0 || x.get<double>()>=.1); }) &&
+        Fields(v,{"next"},[](const json& x) { return Number(x); });
+}
 inline bool Valid(const json& v) {
-    if (!v.is_object() || !Fields(v,{"saved_at","mana"},[](const json& x) { return Number(x); })) return false;
+    if (!v.is_object() || !Fields(v,{"form_resources"},FormResources) || !Fields(v,{"saved_at","mana"},[](const json& x) { return Number(x); })) return false;
     if (v.contains("cooldowns")) {
         if (!v["cooldowns"].is_object()) return false;
         for (const auto& [key,left] : v["cooldowns"].items()) {
@@ -83,7 +106,7 @@ inline bool Valid(const json& v) {
                 !Fields(a,{"tracking_aura","tracking_mask"},UInt) || !Fields(a,{"school","shield"},Int) ||
                 !Fields(a,{"name"},String) || !Fields(a,{"harmful","ends_with_form","respite","steady"},Bool) ||
                 !Fields(a,{"remaining","wow_per_tick","threat_multiplier"},[](const json& x) { return Number(x); }) ||
-                !Fields(a,{"tooltip"},Tooltip)) return false;
+                !Fields(a,{"tooltip"},Tooltip) || !Fields(a,{"periodic_dispel"},PeriodicDispel)) return false;
             if (a.contains("form_outcome") && !a["form_outcome"].is_null() && !Outcome(a["form_outcome"])) return false;
             if (a.contains("ticks")) {
                 if (!a["ticks"].is_array()) return false;

@@ -18,7 +18,20 @@ class Mpq;
 struct Appearance {
     uint32_t race = 4, sex = 1;    // ChrRaces id; 0 male, 1 female
     uint32_t skin = 0, face = 0, hairStyle = 0, hairColor = 0, facialHair = 0;
+    bool operator==(const Appearance&) const = default;
 };
+
+// What 1.12's character creation lets a race and sex choose, each choice running from 0 to one before its count:
+// skin colours (CharSections 0), the faces each skin colour has (1), hair styles (3) and the colours each style has,
+// facial hair styles (CharacterFacialHairStyles); and what the race calls its hair and facial hair (ChrRaces:
+// "NORMAL", "MARKINGS" ... for GlueStrings' HAIR_<hair>_STYLE/_COLOR and FACIAL_HAIR_<facialHair>; "NONE": none).
+struct Customization {
+    uint32_t skins = 0, hairStyles = 0, facialHairs = 0;
+    std::vector<uint32_t> faces, hairColors;   // by skin colour, by hair style
+    std::string hair, facialHair;
+    bool allows(const Appearance& who) const;   // every choice in range (the race and sex are the caller's)
+};
+Customization customization(const Mpq& mpq, uint32_t race, uint32_t sex);
 
 // A worn item: the equipment slot (0 head, 2 shoulders, 4 chest, 5 waist, 6 legs, 7 feet, 8 wrists, 9 hands,
 // 14 back, 15 main hand, 16 off hand, 18 tabard) and its ItemDisplayInfo id; sheath is item_template.sheath.
@@ -45,7 +58,8 @@ struct Look {
     std::string cape;               // texture type 2
     std::set<uint16_t> geosets;     // shown
     std::vector<Attached> attached;
-    // Creature skins: M2 texture type -> full MPQ path (11-13 from TextureVariation[0-2]).
+    // Additional character skins (8: Tauren fur/mane) and creature skins (11-13: TextureVariation[0-2]):
+    // M2 texture type -> full MPQ path.
     // Character texture types 1/6/2 remain in skin/hair/cape above.
     std::map<uint32_t, std::string> replaceableTextures;
     float scale = 1.0f;             // uniform model scale, applied by the host

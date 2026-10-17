@@ -243,21 +243,39 @@ local function spellSkill(info)
   end
   return heal and "Restoration" or damage and "Destruction" or "Alteration"
 end
-local function healthScale(info, f, op, by, values)
+local function healthScale(info, f, op, by, values, e)
   local p = WB.resolve("player")
   if not (p and p.skyrim and f.effect and f.effect ~= 0) then return nil end
-  if f.effect ~= 2 and f.effect ~= 10 and f.aura ~= 3 and f.aura ~= 8 then return nil end
   values=values or profile(info)
+  if values.item_use and (f.effect==30 or f.aura==24 or f.aura==69) then
+    local factor=f.aura==69 and (0.25 * (0.5 + (p.skyrim[spellSkill(info)] or 50) / 100)) or
+      (f.misc==0 and .2 or f.misc==1 and .1 or 1)
+    return function(amount)
+      if op=="/" then amount=amount/tonumber(by) elseif op=="*" then amount=amount*tonumber(by) end
+      local value=amount*factor local lower=math.floor(value)
+      if value-lower>.5 or value-lower==.5 and math.mod(lower,2)~=0 then lower=lower+1 end
+      return lower
+    end
+  end
+  local rate=values.health_rates and values.health_rates[e]
+  -- Flat weapon bonuses, resurrection health, shields, flat damage buffs and
+  -- linked form health are health amounts too. Weapon percentages (effect 31),
+  -- resources, AP and the other aura magnitudes keep their original units.
+  if not rate and f.effect ~= 2 and f.effect ~= 10 and f.effect ~= 113
+      and f.effect ~= 17 and f.effect ~= 58 and f.effect ~= 121
+      and f.aura ~= 3 and f.aura ~= 8 and f.aura ~= 15 and f.aura ~= 13 and f.aura ~= 34 then return nil end
   local factor=values.health_factor or (0.25 * (0.5 + (p.skyrim[spellSkill(info)] or 50) / 100))
-  return function(amount)
+  return function(amount, coefficient)
     -- Token arithmetic is part of the WoW amount, before conversion.
     if op == "/" then amount = amount / tonumber(by)
     elseif op == "*" then amount = amount * tonumber(by) end
     local value = amount * factor
+    if rate or coefficient then return value end
     local lower = math.floor(value)
     -- Python round: exactly halfway goes to the even integer.
     if value - lower > 0.5 or (value - lower == 0.5 and lower % 2 ~= 0) then lower=lower+1 end
-    if values.minimum_health and factor>0 and amount>0 then lower=math.max(1,lower) end
+    -- A spell's own rule decides its minimum; an item's proc or use (no profile) keeps at least a point, as the service.
+    if (values.minimum_health or not values.health_factor) and factor>0 and amount>0 then lower=math.max(1,lower) end
     return lower
   end
 end
@@ -266,7 +284,7 @@ end
 local function token(info, code, e, op, by, values)
   e = tonumber(e) or 1
   local f = info.effects[e] or {}
-  local scale = healthScale(info, f, op, by, values)
+  local scale = healthScale(info, f, op, by, values, e)
   if code == "s" or code == "m" or code == "M" then
     local lo, hi = effectRange(info, e, values)
     if scale then lo, hi = scale(lo), scale(hi) end
@@ -287,7 +305,9 @@ local function token(info, code, e, op, by, values)
   elseif code == "x" then
     return tostring(f.chain or 0), f.chain or 0
   elseif code == "f" then
-    return num(f.amplitude or 1), f.amplitude or 1
+    local value=f.amplitude or 1
+    if scale then value=scale(value,true) end
+    return num(value), value, scale
   elseif code == "n" then
     return tostring(info.procCharges), info.procCharges
   elseif code == "h" then
@@ -298,6 +318,18 @@ local function token(info, code, e, op, by, values)
   elseif code == "r" then
     local range = (values or profile(info)).range_max or info.rangeMax or 0
     return num(range), range
+  -- The rest of the client's tokens, from Spell.dbc as CMaNGOS reads it: most targets, highest target level, most
+  -- stacks, an effect's multiple (Mana Burn's damage per mana) and its points per combo point.
+  elseif code == "i" then
+    return tostring(info.maxTargets or 0), info.maxTargets or 0
+  elseif code == "v" then
+    return tostring(info.maxTargetLevel or 0), info.maxTargetLevel or 0
+  elseif code == "u" then
+    return tostring(info.stackAmount or 0), info.stackAmount or 0
+  elseif code == "e" then
+    return num(f.multiple or 0), f.multiple or 0
+  elseif code == "b" then
+    return num(f.comboPoints or 0), f.comboPoints or 0
   end
 end
 
@@ -320,13 +352,30 @@ function WB.spellText(info, text, values)
         i = i + 1 + stop
       else
         -- $/1000;s3  $*2;s1  $12345d  $s1
-        local _, stop2, op, by, id, code, e = string.find(rest, "^([/*]?)(%d*);?(%d*)([sSmMoOdtaxfnhqr])(%d?)")
+        local _, stop2, op, by, id, code, e = string.find(rest, "^([/*]?)(%d*);?(%d*)([sSmMoOdDtaxfFnhqrivueb])(%d?)")
+        if not stop2 then
+          -- $25695/5;s1: another spell's, the spell first (Arathi Basin rations).
+          _, stop2, id, op, by, code, e = string.find(rest, "^(%d+)([/*])(%d+);([sSmMoOdDtaxfFnhqrivueb])(%d?)")
+        end
         local value, number, scaled
         if stop2 then
           local target = info
           if op == "" and by ~= "" then id = by end                 -- $12345s1: another spell's
           if id ~= "" then target = WB.spellInfo(tonumber(id)) or info end
-          value, number, scaled = token(target, (code == "O" or code == "S") and string.lower(code) or code, e, op, by, target == info and values or nil)
+          local targetValues=values
+          if target ~= info then
+            -- Linked Pounce bleeds and Bear passives use their parent spell's
+            -- health conversion, with the linked effect's own values/timing.
+            local source=values or profile(info)
+            targetValues={}
+            local linked=source.linked_spells and (source.linked_spells[tostring(target.id)] or source.linked_spells[target.id])
+            for k,v in pairs(linked or profile(target)) do targetValues[k]=v end
+            if source.health_factor then
+              targetValues.health_factor=source.health_factor
+              targetValues.minimum_health=source.minimum_health
+            end
+          end
+          value, number, scaled = token(target, (code == "O" or code == "S" or code == "D" or code == "F") and string.lower(code) or code, e, op, by, targetValues)
           if value and op ~= "" and not scaled then
             number = op == "/" and number / tonumber(by) or number * tonumber(by)
             value = num(number)
@@ -343,7 +392,22 @@ function WB.spellText(info, text, values)
       end
     end
   end
-  return table.concat(out)   -- line breaks stay as Spell.dbc has them (CR LF), as the client keeps them
+  local result = table.concat(out)   -- line breaks stay as Spell.dbc has them (CR LF), as the client keeps them
+  -- A finishing move's combo table is literal prose, not tokens (Rip, Ferocious Bite): its damage in their units too,
+  -- by the same conversion and rounding as the tokens.
+  local v, p = values or profile(info), WB.resolve("player")
+  if v.health_factor and p and p.skyrim and string.find(result, "%d points?%s*:") then
+    local function convert(n)
+      local value = tonumber(n) * v.health_factor
+      local lower = math.floor(value)
+      if value - lower > 0.5 or (value - lower == 0.5 and lower % 2 ~= 0) then lower = lower + 1 end
+      return tostring(v.minimum_health and math.max(1, lower) or lower)
+    end
+    result = string.gsub(result, "(%d+ points?%s*:%s*)(%d+)%-(%d+)( damage)",
+      function(a, low, high, b) return a .. convert(low) .. "-" .. convert(high) .. b end)
+    result = string.gsub(result, "(%d+ points?%s*:%s*)(%d+)( damage)", function(a, x, b) return a .. convert(x) .. b end)
+  end
+  return result
 end
 
 ------------------------------------------------------------------------------------------------------- spell lines
@@ -438,6 +502,11 @@ local function addSpell(t, id, showRank, shapeshift)
     end
     t:AddLine("Reagents: " .. table.concat(names, ", "), 1, 1, 1, 1)
   end
+  -- The Skyrim skill it trains and draws on (the service's rule): one quiet grey line, in Skyrim only.
+  local skill, p = profile(info).skill, WB.resolve("player")
+  if skill and p and p.skyrim then
+    t:AddLine(({ OneHanded = "One-Handed", TwoHanded = "Two-Handed", Marksman = "Archery" })[skill] or skill, GRAY[1], GRAY[2], GRAY[3])
+  end
   local desc = WB.spellText(info)
   if desc ~= "" then t:AddLine(desc, GOLD[1], GOLD[2], GOLD[3], 1) end
   t:Show()
@@ -504,6 +573,13 @@ end
 function MT:SetAction(slot)
   self:ClearLines()
   local a = type(slot) == "number" and WB.actions[slot]
+  if a and a.item and WB.itemAction then
+    local item=WB.itemAction(a.item)
+    if item then self.__itemId=item.entry for _,line in ipairs(WB.itemTooltip(item)) do
+      if line.right then self:AddDoubleLine(line.left,line.right,line.r or 1,line.g or 1,line.b or 1)
+      else self:AddLine(line.left,line.r or 1,line.g or 1,line.b or 1,line.wrap and 1 or nil) end
+    end return filled(self,true) end
+  end
   return filled(self, a and a.spell and addSpell(self, a.spell, true))
 end
 function MT:SetShapeshift(index)
@@ -567,7 +643,8 @@ local function addAura(t, a, playerBuff)
   if not a then return nil end
   local name, description
   if a.mount then
-    name,description=a.name,"Increases ground movement speed by 100%. Right-click to dismount."
+    name,description=a.name,a.flight and ("Increases ground movement speed by 100% and flight speed by "..a.flight..
+      "%. Right-click to dismount.") or "Increases ground movement speed by 100%. Right-click to dismount."
   elseif a.skyrim then   -- Skyrim's own magic: its name and words
     name, description = a.name, a.text
   else

@@ -29,6 +29,8 @@ class CasterBook(unittest.TestCase):
                   else {**HOSTILE, 'friendly': True})
         if name in ('barkskin', 'tranquility'):
             target = {'kind': 'self'}
+        if name in ('remove_curse', 'cure_poison', 'abolish_poison'):
+            target['dispellable'] = ['Curse' if name == 'remove_curse' else 'Poison']
         if name == 'rebirth':
             target['dead'] = True
         return {'op': 'resolve', 'spell': BOOK[name], 'seed': seed, 'target': target,
@@ -137,7 +139,9 @@ class CasterBook(unittest.TestCase):
             req['target']['creature_type'] = creature
             out = self.answer(req)
             aura = out['auras'][0]
-            self.assertEqual((aura['type'], aura['breaks_on_damage'], aura['single_target']), ('stun', True, True))
+            # SpellMgr::IsSingleTargetSpell: sleep with family flags; IsSingleTargetSpells matches any rank (chain 2637).
+            self.assertEqual((aura['type'], aura['breaks_on_damage'], aura['single_target']),
+                             ('stun', True, {'chain': 2637, 'family': 7, 'flags': 0x1000000}))
             self.assertEqual(aura['heartbeat']['chance'], F.spell_miss_chance(60, 60, False, 0))
             self.assertEqual(aura['heartbeat']['interval_ms'], self.cat.duration(self.cat.spell(18658), 60) // 2)
         for name in ('hibernate', 'soothe_animal'):
@@ -153,6 +157,15 @@ class CasterBook(unittest.TestCase):
             pct = F.effective_resist_percent(60, 60, 200, True, True)
             self.assertEqual(out['hit_chance'], 100 - 4 - pct)
             self.assertEqual(out['events'][0]['type'], 'resist')
+
+    def test_soothe_animal_reaches_its_rank_level(self):
+        cap = self.cat.spell(BOOK['soothe_animal'])['MaxTargetLevel']
+        for level, error in ((cap, None), (cap + 1, 'SPELL_FAILED_HIGHLEVEL')):
+            req = self.request('soothe_animal')
+            req['target']['level'] = level
+            self.assertEqual(self.answer(req).get('error'), error)
+        aura = self.answer(self.request('soothe_animal'))['auras'][0]
+        self.assertEqual((aura['type'], aura['amount']), ('detect_range', -10))
 
     def test_dispels_and_rebirth_are_not_healing(self):
         for name, dispel in (('remove_curse', 'Curse'), ('cure_poison', 'Poison'), ('abolish_poison', 'Poison')):
@@ -262,6 +275,8 @@ class CasterBook(unittest.TestCase):
         expected = F.mana_regen_per_second(11, plain.stats['spi']) * 5 + plain.total(character.A_MOD_POWER_REGEN) / 5
         self.assertEqual(inn.regen()['per_sec'], expected)
         self.assertEqual(inn.regen()['per_sec_casting'], expected)
+        # What the plugin adds inside the rule: Innervate's spirit share, not cancelled by an untalented baseline (G5).
+        self.assertAlmostEqual(inn.regen()['per_sec_casting_spirit'], F.mana_regen_per_second(11, plain.stats['spi']) * 5)
         self.assertIs(self.svc.char(caster), plain)
         self.assertIs(self.svc.char({**caster, 'auras': [22812, 22812]}), bark)
 
@@ -312,7 +327,9 @@ class CasterBook(unittest.TestCase):
             self.assertEqual(armor['skyrim'], [{'mgef': ARMOR_BUFF, 'magnitude': 40}])
             self.assertEqual(stats['skyrim'], [
                 {'mgef': 0x493AA, 'magnitude': 20}, {'mgef': 0x49504, 'magnitude': 20},
-                {'mgef': 0x49507, 'magnitude': 20}])
+                {'mgef': 0x49507, 'magnitude': 20}, {'mgef': 0x7A0F4, 'magnitude': 12},   # Strength: carry weight,
+                {'mgef': 0x7A0FD, 'magnitude': 12},                                       # Spirit: magicka rate,
+                {'mgef': 0x7A0FF, 'magnitude': 6}, {'mgef': 0x7A106, 'magnitude': 6}])   # weapon damage
             expected = {}
             for effect in RESISTS.values():
                 expected[effect] = expected.get(effect, 0) + resists['amount'] / 3
@@ -324,7 +341,7 @@ class CasterBook(unittest.TestCase):
         req = self.request('innervate')
         req['caster']['skyrim'] = {}
         regen = self.answer(req)['auras'][1]
-        self.assertEqual(regen['skyrim'], [{'mgef': 0x7A0FD, 'magnitude': 50}])
+        self.assertEqual(regen['skyrim'], [{'mgef': 0x7A0FD, 'magnitude': 200}])
 
 
 if __name__ == '__main__':

@@ -13,3 +13,9 @@ export FXC2=$P/toolchain/fxc2/fxc2.exe
 
 # Directly invoked Python helpers use the project virtual environment.
 export PATH="$P/toolchain/venv/bin:$PATH"
+# WSL: no system LLVM; clang-cl/lld-link/llvm-rc/llvm-lib come from llvm-mingw (toolchain/wsl-bin links), llvm-mt
+# from Ubuntu's llvm-18 package.
+# WSL as tools/winhost.py tells it (the kernel's release), even in an environment without WSL_DISTRO_NAME.
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then   # safe under set -eu (ship.sh)
+    export WB_WSL=1 PATH="$P/toolchain/wsl-bin:$PATH"
+fi

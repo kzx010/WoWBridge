@@ -2,7 +2,7 @@
 
 WoWBridge brings the look and feel of vanilla World of Warcraft into Skyrim Special Edition. It uses the WoW 1.12.1 interface, character models, animations and sounds alongside Skyrim's world, quests and NPCs. Combat runs through a local Python service based on CMaNGOS Classic formulas, with adjustments for Skyrim's skills and equipment.
 
-The current build is for early testing. The default character is a night elf druid. There are working spells, forms, talents, equipment previews, bags, ground mounts and a WoW-style minimap. Skyrim's dialogue and merchant menus handle conversations and trade.
+The current build is for early testing. Choose a druid (night elf or tauren) or a paladin (human or dwarf), each as a male or female WoW model at its 1.12 height. There are working spells, forms, talents, auras and blessings, equipment previews, bags, ground mounts and a WoW-style minimap; NPCs wear their WoW helms, shoulders, weapons and shields as 1.12 models, and WoW models take Skyrim's sun shadows. Skyrim's dialogue and merchant menus handle conversations and trade.
 
 The project has been tested on Linux through Proton and Windows 11.
 
@@ -46,7 +46,7 @@ Run this from the tester folder:
 py -3 setup.py install
 ```
 
-This copies WoWBridge into Skyrim's `Data` folder and adds `*WoWBridge.esp` to the standard `Plugins.txt`. It records the files it adds. If a destination already contains a different, untracked file, installation stops with the filename so you can resolve the conflict.
+This copies WoWBridge into Skyrim's `Data` folder and adds `*WoWBridge.esp` and then `*WoWBridgeArmory.esp` (every other WoW item; it needs WoWBridge.esp before it) to the standard `Plugins.txt`. It records the files it adds. If a destination already contains a different, untracked file, installation stops with the filename so you can resolve the conflict.
 
 For a custom Skyrim profile, specify the plugin list that profile uses:
 
@@ -56,7 +56,7 @@ py -3 setup.py install --plugins-txt "D:\Profiles\Skyrim\Plugins.txt"
 
 ### Mod manager
 
-Add the configured `local/mod/WoWBridge` folder as a mod and enable `WoWBridge.esp`. You can ZIP the contents of that folder if your manager expects an archive. The ESP and `SKSE` directory belong at the archive root.
+Add the configured `local/mod/WoWBridge` folder as a mod and enable `WoWBridge.esp` and `WoWBridgeArmory.esp`, in that order. You can ZIP the contents of that folder if your manager expects an archive. The ESP and `SKSE` directory belong at the archive root.
 
 You can also have setup stage directly into a separate mod-manager folder with `--mod-dir`. Keep this staging folder separate from Skyrim's Data directory. Let the mod manager handle deploying and enabling the mod.
 
@@ -122,6 +122,8 @@ Once you can move, use **W/A/S/D** to explore and hold the right mouse button to
 
 The gameplay service listens on `127.0.0.1:7878`. It needs no internet connection. Close its terminal with Ctrl+C after leaving Skyrim. Setup reports an occupied port instead of starting a second service.
 
+Detailed service logging is optional. For troubleshooting, use `py -3 setup.py service --trace` on Windows or `python3 setup.py service --trace` on Linux. Logs append to `local/service_trace.jsonl`.
+
 Run `py -3 setup.py check` to check the selected local dependencies and gameplay data without launching Skyrim.
 
 ## Controls
@@ -153,7 +155,7 @@ These are the default keyboard and mouse controls during gameplay. Saved key bin
 | Tab | Cycle through nearby attackable targets in view. |
 | Ctrl+Tab / Ctrl+Shift+Tab | Cycle forward / backward through nearby friendly followers in view. |
 | F1 | Target yourself. |
-| F2 through F5 | Target your first through fourth follower, when present. |
+| F2 through F4 | Target your first through third follower, when present. F5 and F9 stay Skyrim's quicksave and quickload. |
 | Right-click an actor or object within reach | Talk, loot, open, harvest or take an item, depending on the target. Right-click a hostile actor to start attacking. |
 | Alt+right-click an attackable actor | Start attacking, including friendly and neutral actors. |
 | Alt+left-click a loose object within reach | Pick it up and hold it in the world. Move the mouse to position it horizontally. |
@@ -180,7 +182,7 @@ The initial action bar includes Attack, Wrath, Moonfire, Rejuvenation, Healing T
 
 | Control | Action |
 | --- | --- |
-| B | Open / close all bags. F12 toggles the backpack; F8 through F11 toggle the other bags. |
+| B | Open / close all bags. F12 toggles the backpack; F8, F10 and F11 toggle the other bags. |
 | Right-click an item in a bag | Equip, unequip or use it, according to its tooltip. With a storage container open, store the stack. |
 | Alt+right-click a bag item with a separate use effect | Activate that effect, as shown in its tooltip. |
 | Shift+left-click a stack with chat closed | Choose how many items to split off. |
@@ -193,19 +195,20 @@ The initial action bar includes Attack, Wrath, Moonfire, Rejuvenation, Healing T
 
 | Control | Action |
 | --- | --- |
-| Shift+Tab | Open Skyrim's menu for Items, Magic, Skills and Map. |
+| Shift+Tab | Open Skyrim's menu for Items, Magic, Skills and Map. On Windows, Steam's in-game overlay takes this key first: turn the overlay off for Skyrim in its Steam properties, or give the overlay another shortcut. |
 | Escape | Close or cancel the active WoW interface panel or cursor action first. With nothing left to close, open Skyrim's pause menu. |
 | C / K | Open the character / skills panel. |
 | P / N | Open the spellbook / talents panel. |
 | L | Open the WoW-style quest log containing your Skyrim quests. |
 | M or Shift+M | Open Skyrim's map. |
-| O | Open WoWBridge's testing panel. |
+| O | Open WoWBridge's testing panel (the Socials micro button). |
+| Main menu micro button | Open WoW's main menu. Skyrim Options and Exit Game open Skyrim's system menu; Interface Options and Key Bindings are WoW's, less the options and commands that do nothing in Skyrim. |
 | V / Shift+V / Ctrl+V | Toggle enemy / friendly / all nameplates. |
 | Alt+Z | Hide / show the WoW interface. |
 | Enter or `/` | Open chat or begin a slash command. |
 | Right-click a supported frame or its header | Choose Unlock Frame, then drag it with the left mouse button. Use the same menu to lock it again. |
 
-Change ordinary bindings through the WoW interface's Key Bindings menu. Shift+Tab, Shift+M, the B all-bags shortcut and the world mouse gestures are handled separately. Skyrim's console remains on its usual key; `wb` opens the testing panel and `wb help` lists the available commands.
+Change ordinary bindings through the WoW interface's Key Bindings menu. Commands with nothing behind them in Skyrim (sitting, chat replies, pets, camera views, raid icons and similar) are not listed, so their keys, such as R and Print Screen, stay Skyrim's. Shift+Tab, Shift+M, the B all-bags shortcut and the world mouse gestures are handled separately. Skyrim's console remains on its usual key; `wb` opens the testing panel and `wb help` lists the available commands.
 
 ## Uninstall
 
@@ -235,4 +238,4 @@ WoWBridge's original code is available under the [MIT License](LICENSE). Third-p
 
 ## Credits
 
-WoWBridge uses work from CMaNGOS Classic, WoWee, CommonLibSSE-NG, SKSE, StormLib, Dear ImGui, Lua and their contributors. Retained third-party license notices are in `licenses` and accompany the tester bundle. World of Warcraft and Skyrim belong to their respective owners.
+WoWBridge uses work from CMaNGOS Classic, WoWee, CommonLibSSE-NG, SKSE, StormLib, Dear ImGui, Lua and their contributors; DBC column layouts from WoWDBDefs (wowdev, CC BY-SA 4.0); the in-frame world renderer and the sun-shadow capture are ported from SkyCraft (chasmlol, MIT), and picking details from SmoothCam (MIT). The full ledger, with what each contributed and its licence, is [docs/credits-and-resources.md](docs/credits-and-resources.md). Retained third-party license notices are in `licenses` and accompany the tester bundle. World of Warcraft and Skyrim belong to their respective owners.

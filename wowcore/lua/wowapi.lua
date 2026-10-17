@@ -199,6 +199,8 @@ end
 ------------------------------------------------------------------------------------------------------------ auras
 -- unit.buffs / unit.debuffs: { {spell, texture, count, dispel, expires, untilCancelled, castable}, ... }
 -- `castable` on UnitBuff keeps buffs the player can cast; on UnitDebuff it keeps debuffs the player can dispel.
+-- FrameXML passes its options' strings (SHOW_CASTABLE_BUFFS, SHOW_DISPELLABLE_DEBUFFS): "0" is unticked, as 0 is.
+local function filtering(castable) return castable and castable ~= 0 and castable ~= "0" end
 -- Names of the spells in the player's book: a buff is "castable" when the player can cast it, any rank.
 local function knownNames()
   if WB.knownNames and not WB.spellbookDirty then return WB.knownNames end
@@ -220,13 +222,14 @@ local function aura(list, index, castable, dispels)
 end
 function UnitBuff(unit, index, castable)
   local u = resolve(unit)
-  local a = u and aura(u.buffs, index, castable)
+  local a = u and aura(u.buffs, index, filtering(castable))
   if a then return a.texture, a.count or 1 end
   return nil
 end
 function UnitDebuff(unit, index, castable)
   local u = resolve(unit)
   local p = player()
+  castable = filtering(castable)
   local a = u and aura(u.debuffs, index, castable, castable and (p and p.dispels or {}))
   if a then return a.texture, a.count or 1, a.dispel end
   return nil
@@ -267,14 +270,16 @@ function GetWeaponEnchantInfo() return nil, nil, nil, nil, nil, nil end
 
 ------------------------------------------------------------------------------------------------------------ spells
 local infoCache = {}
+-- A positive id the client's Spell.dbc lacks may still be a spell of theirs: WB.syntheticSpells[id] answers in the
+-- same shape (the TBC-style flying mounts, wowapi_mounts.lua). The client's own spell always wins.
 local function spellInfo(id)     -- name, rank, icon, passive, castTime, range, cost, ... (wowcore/src/api/wowapi.cpp)
-  if type(id) == "number" and id < 0 then return WB.skyrimSpells and WB.skyrimSpells[id] end   -- a Skyrim spell of hers
+  if type(id) == "number" and id < 0 then return WB.skyrimSpells and WB.skyrimSpells[id] end   -- a Skyrim spell of theirs
   local i = infoCache[id]
   if i == nil then
     i = id and __WBSpellInfo and __WBSpellInfo(id) or false
     infoCache[id] = i
   end
-  return i or nil
+  return i or id and WB.syntheticSpells and WB.syntheticSpells[id] or nil
 end
 WB.spellInfo = spellInfo
 local function hasBit(mask, bit) return math.floor((mask or 0) / bit) % 2 == 1 end
@@ -378,7 +383,7 @@ local function book()
   end
   add(GENERAL or "General", "Interface\\Icons\\Ability_Kick", general)
   for _, name in ipairs(lineNames) do add(name, byLine[name].icon, byLine[name]) end
-  -- The Skyrim spells she has learned (tomes, trainers): a tab of their own after her class's (SkyrimSpells).
+  -- The Skyrim spells the player has learned (tomes, trainers): a tab of their own after their class's (SkyrimSpells).
   if table.getn(skyrim) > 0 then add("Skyrim", "Interface\\Icons\\Spell_Arcane_StarFire", skyrim) end
   WB.book = { tabs = tabs, slots = slots }
   return WB.book
@@ -489,16 +494,24 @@ end
 ------------------------------------------------------------------------------------------------------------ actions
 local function action(slot) return type(slot) == "number" and WB.actions[slot] end
 function HasAction(slot) return flag(action(slot)) end
-function GetActionTexture(slot) local a = action(slot) return a and a.spell and spellIcon(a.spell) end
+function GetActionTexture(slot)
+  local a=action(slot) local item=a and a.item and WB.itemAction and WB.itemAction(a.item)
+  return item and item.texture or a and a.spell and spellIcon(a.spell)
+end
+function GetActionInfo(slot) local a=action(slot) if a then return a.item and "item" or "spell",a.item or a.spell end end
 function GetActionText(slot) local a = action(slot) return a and a.text end
-function GetActionCount(slot) local a = action(slot) return a and a.count or 0 end
+function GetActionCount(slot)
+  local a=action(slot) local item=a and a.item and WB.itemAction and WB.itemAction(a.item)
+  return item and item.count or a and a.count or 0
+end
 function GetActionCooldown(slot)
   local a = action(slot)
   if not a then return 0, 0, 0 end
+  if a.item then return WB.itemCooldown(WB.itemAction(a.item)) end
   local s, d = cooldown(a.spell)
   return s, d, 1
 end
--- In Skyrim her mana is magicka and a spell costs a fifth (service/skyrim.py); the recorded client paid WoW's.
+-- In Skyrim their mana is magicka and a spell costs a fifth (service/skyrim.py); the recorded client paid WoW's.
 -- In Skyrim each spell's magicka is the service's (op skyrim_costs, service/skyrim_balance.py), told by the host.
 function WB.manaCost(p, amount, powerType, spell)
   -- Host costs already use client rage/energy units and include talent masks.
@@ -528,6 +541,7 @@ end
 function IsUsableAction(slot)
   local a = action(slot)
   if not a then return nil, nil end
+  if a.item then return flag(WB.itemAction(a.item)),nil end
   if WB.classRows and WB.classRows[a.spell] and WB.classRows[a.spell].passive then return nil, nil end
   if WB.unlearned and WB.unlearned[a.spell] then return nil, nil end
   local p, info = player(), spellInfo(a.spell)
@@ -566,10 +580,15 @@ end
 function IsAutoRepeatAction() return nil end
 function IsAttackAction(slot) local a = action(slot) return flag(a and a.spell == 6603) end
 function IsConsumableAction() return nil end
-function IsEquippedAction() return nil end
+function IsEquippedAction(slot)
+  local a=action(slot)
+  if a and a.item then local item,equipped=WB.itemAction(a.item) return flag(item and equipped) end
+  return nil
+end
 function UseAction(slot, checkCursor, onSelf)
   if checkCursor == 1 and WB.cursor then PlaceAction(slot) return end
   local a = action(slot)
+  if a and a.item then WB.useItemAction(a.item) return end
   if a and not (WB.classRows and WB.classRows[a.spell] and WB.classRows[a.spell].passive) and
      not (WB.unlearned and WB.unlearned[a.spell]) then host("useAction", slot, a.spell, onSelf) end
 end
@@ -577,16 +596,24 @@ function PickupAction(slot)
   local a = action(slot)
   if not a then return end
   WB.actions[slot] = nil
-  WB.setCursor({ spell = a.spell })
+  local item=a.item and WB.itemAction(a.item)
+  WB.setCursor(a.item and {item=a.item,itemEntry=a.item,texture=item and item.texture} or { spell = a.spell })
+  if WB.saveItemActions then WB.saveItemActions() end
   __WBFire("ACTIONBAR_SLOT_CHANGED", slot)
   host("actionChanged", slot)
 end
 function PlaceAction(slot)
   local c = WB.cursor
-  if not c or not c.spell then return end
+  if not c then return end
+  local held=WB.bagHeld
+  local entry=c.itemEntry or (held and held.use and held.entry)
+  if not c.spell and not entry then return end
   local old = WB.actions[slot]
-  WB.actions[slot] = { spell = c.spell }
-  WB.setCursor(old and { spell = old.spell } or nil)
+  if entry then ClearCursor() end   -- keep the actual equipment in its native place
+  WB.actions[slot] = entry and {item=entry} or { spell = c.spell }
+  local item=old and old.item and WB.itemAction(old.item)
+  WB.setCursor(old and (old.item and {item=old.item,itemEntry=old.item,texture=item and item.texture} or { spell = old.spell }) or nil)
+  if WB.saveItemActions then WB.saveItemActions() end
   __WBFire("ACTIONBAR_SLOT_CHANGED", slot)
   host("actionChanged", slot)
 end
@@ -637,8 +664,11 @@ local function bindingIndex()
   if WB.bindingKeys then return WB.bindingKeys end
   local keys = {}
   for b in allBindings() do
-    if b[2] then keys[b[2]] = b end
-    if b[3] then keys[b[3]] = b end
+    -- Loot All shares its keys with ordinary bindings, active only in the loot window.
+    if b[1] ~= "WBLOOTALL" then
+      if b[2] then keys[b[2]] = b end
+      if b[3] then keys[b[3]] = b end
+    end
   end
   WB.bindingKeys = keys
   return keys
@@ -658,15 +688,28 @@ function GetBindingKey(command)
   end
 end
 function GetBindingAction(key)
+  if WB.lootSession and LootFrame and LootFrame:IsShown() then
+    local first, second = GetBindingKey("WBLOOTALL")
+    if key == first or key == second then return "WBLOOTALL" end
+  end
   local b = bindingIndex()[tostring(key)]
   return b and b[1] or ""
 end
--- SetBinding(key) clears the key; SetBinding(key, command) moves it to command (first free of its two slots).
+-- SetBinding(key) clears the key (a loot override first); assigning Loot All preserves the ordinary binding.
+-- Other commands move the key to command (first free of its two slots).
 function SetBinding(key, command)
   if not key then usage('SetBinding("KEY"[, "COMMAND"])') end
+  local first, second = GetBindingKey("WBLOOTALL")
+  -- The stock panel clears twice when unbinding; keep both clears on its selected row.
+  local clearCommand = not command and KeyBindingFrame and KeyBindingFrame:IsShown() and KeyBindingFrame.selected
+  if not command and not clearCommand and (key == first or key == second) then clearCommand = "WBLOOTALL" end
   for b in allBindings() do
-    if b[3] == key then b[3] = nil end
-    if b[2] == key then b[2], b[3] = b[3], nil end
+    -- Loot All shares its key: binding it takes the key from no other row, and binding another command to that key
+    -- (as the panel does after clearing it) leaves Loot All's key alone.
+    if (not clearCommand or b[1] == clearCommand) and (not command or (b[1] == "WBLOOTALL") == (command == "WBLOOTALL")) then
+      if b[3] == key then b[3] = nil end
+      if b[2] == key then b[2], b[3] = b[3], nil end
+    end
   end
   WB.bindingKeys = nil
   if not command then return 1 end
@@ -681,35 +724,79 @@ end
 -- Saved key bindings as the client keeps them: bindings-cache.wtf, one "bind KEY COMMAND" line per key. SaveBindings
 -- hands the host the text to write for the set (1 the account's, 2 the character's) and the host gives it back at
 -- start (__WBLoadBindings); LoadBindings reverts to what was saved (the panel's Cancel), or to the defaults (0).
+-- WoWBridge's own commands and their default keys. A save records one left unbound as "bind NONE COMMAND", so a
+-- command missing from a save is one added since: it gets its default key, unless another command has that key.
+local BRIDGE_BINDINGS = { { "WBLOOTALL", "R" }, { "WBTOGGLEAUTOLOOT", "Y" } }
+local SHARES_KEY = { WBLOOTALL = true }   -- Loot All's key keeps its other binding outside the loot window
+-- Written at the top of a save since F5 and F9 went back to Skyrim (SKYRIM_KEYS): a save without it still holds the
+-- client's old defaults for them.
+local SAVE_MARK = "# WoWBridge bindings 2"
 local function bindingsText()
-  local out = {}
+  local out = { SAVE_MARK }
   for b in allBindings() do
     if b[2] then table.insert(out, "bind " .. b[2] .. " " .. b[1]) end
     if b[3] then table.insert(out, "bind " .. b[3] .. " " .. b[1]) end
   end
+  for _, d in ipairs(BRIDGE_BINDINGS) do
+    if not GetBindingKey(d[1]) then table.insert(out, "bind NONE " .. d[1]) end
+  end
   return table.concat(out, "\n") .. "\n"
 end
 -- The client's default keys, less WoWBridge's departures (the user's choices): T (ATTACKTARGET) stays Skyrim's -
--- she attacks with the Attack action in slot 1, a right click or Alt+right click; Shift+Tab (TARGETPREVIOUSENEMY)
+-- the player attacks with the Attack action in slot 1, a right click or Alt+right click; Shift+Tab (TARGETPREVIOUSENEMY)
 -- opens Skyrim's Tab menu.
 local UNBOUND_BY_DEFAULT = { ATTACKTARGET = true, TARGETPREVIOUSENEMY = true }
+-- In Skyrim (__WBSkyrimKeys; the reference renders keep the client's list): the rows with nothing behind them here -
+-- sitting, following, pitch, chat replies, auto self cast, a pet, assist, the last hostile, the keyring, the
+-- reputation, honor and pet panes, the Friends/Who/Guild/Raid tabs, battlegrounds, screenshots, camera views and raid
+-- icons - are not listed, so their keys (R, X, G, F, U, H, Print Screen ...) are Skyrim's; a save's lines for them
+-- are ignored. F5 and F9 (the fourth follower, the second bag) are Skyrim's quicksave and quickload.
+local UNLISTED = {}
+for _, c in ipairs({ "SITORSTAND", "FOLLOWTARGET", "PITCHUP", "PITCHDOWN", "REPLY", "REPLY2", "TOGGLEAUTOSELFCAST",
+    "TARGETPET", "TARGETLASTHOSTILE", "ASSISTTARGET", "PETATTACK", "TOGGLEKEYRING", "TOGGLEPETBOOK", "TOGGLECHARACTER2",
+    "TOGGLECHARACTER3", "TOGGLECHARACTER4", "TOGGLEFRIENDSTAB", "TOGGLEWHOTAB", "TOGGLEGUILDTAB", "TOGGLERAIDTAB",
+    "TOGGLEWORLDSTATESCORES", "TOGGLEBATTLEFIELDMINIMAP", "SCREENSHOT", "HEADER_CAMERA", "NEXTVIEW", "PREVVIEW",
+    "CAMERAZOOMIN", "CAMERAZOOMOUT", "FLIPCAMERAYAW", "HEADER_RAID_TARGET", "RAIDTARGETNONE" }) do UNLISTED[c] = true end
+for n = 1, 8 do
+  for _, c in ipairs({ "TARGETPARTYPET", "SETVIEW", "SAVEVIEW", "RESETVIEW", "RAIDTARGET" }) do UNLISTED[c .. n] = true end
+end
+local SKYRIM_KEYS = { F5 = "TARGETPARTYMEMBER4", F9 = "TOGGLEBAG2" }
+local SKYRIM_UNBOUND = { TARGETPARTYMEMBER4 = true, TOGGLEBAG2 = true }
 function __WBDefaultBindings()
   WB.bindings, WB.hiddenBindings = {}, {}
-  for i, b in ipairs(WB.defaultBindings) do
-    if UNBOUND_BY_DEFAULT[b[1]] then WB.bindings[i] = { b[1] } else WB.bindings[i] = { b[1], b[2], b[3] } end
+  for _, b in ipairs(WB.defaultBindings) do
+    if not (WB.skyrimKeys and UNLISTED[b[1]]) then
+      if UNBOUND_BY_DEFAULT[b[1]] or (WB.skyrimKeys and SKYRIM_UNBOUND[b[1]]) then table.insert(WB.bindings, { b[1] })
+      else table.insert(WB.bindings, { b[1], b[2], b[3] }) end
+    end
   end
   for i, b in ipairs(WB.defaultHiddenBindings) do WB.hiddenBindings[i] = { b[1], b[2], b[3] } end
+  -- Keep bridge additions separate from the generated vanilla defaults.
+  table.insert(WB.bindings, { "HEADER_WOWBRIDGE" })
+  for _, d in ipairs(BRIDGE_BINDINGS) do table.insert(WB.bindings, { d[1], d[2] }) end
   WB.bindingKeys = nil
 end
 local defaultBindings = __WBDefaultBindings
 local function applyBindings(text)
   for b in allBindings() do b[2], b[3] = nil, nil end
+  local saved, used = {}, {}
+  local before = WB.skyrimKeys and not string.find(text, SAVE_MARK, 1, true)
   for key, command in string.gmatch(text, "bind (%S+) (%S+)") do
-    for b in allBindings() do
-      if b[1] == command then
-        if not b[2] then b[2] = key elseif not b[3] then b[3] = key end
-        break
+    saved[command] = true
+    -- A command no longer listed binds nothing and keeps no key from Skyrim; nor does F5 or F9 kept at its old default.
+    if key ~= "NONE" and not (before and SKYRIM_KEYS[key] == command) then
+      for b in allBindings() do
+        if b[1] == command then
+          if not b[2] then b[2] = key elseif not b[3] then b[3] = key else break end
+          if not SHARES_KEY[command] then used[key] = true end
+          break
+        end
       end
+    end
+  end
+  for _, d in ipairs(BRIDGE_BINDINGS) do
+    if not saved[d[1]] and (SHARES_KEY[d[1]] or not used[d[2]]) then
+      for b in allBindings() do if b[1] == d[1] then b[2] = d[2] break end end
     end
   end
   WB.bindingKeys = nil
@@ -729,6 +816,13 @@ function LoadBindings(set)
   __WBFire("UPDATE_BINDINGS")
 end
 function GetCurrentBindingSet() return WB.bindingSet or 1 end
+-- In game (__WBSkyrimMenus): the rows Skyrim has no use for go and their keys are Skyrim's, the saved keys kept.
+-- Through LoadBindings, so that the other in-game adjustments to it (the bags') follow.
+function __WBSkyrimKeys()
+  WB.skyrimKeys = true
+  defaultBindings()
+  LoadBindings(WB.savedBindings and GetCurrentBindingSet() or 0)
+end
 -- A bound key pressed or released in play: the command's FrameXML script, as the client runs it - the release only
 -- for the bindings that ask for it (runOnUp: the action buttons cast on release).
 function __WBBinding(command, down)
@@ -804,6 +898,36 @@ function __WBSavedVariablesText()
     local kind = type(v)
     if kind == "string" then table.insert(out, name .. " = " .. string.format("%q", v))
     elseif kind == "number" or kind == "boolean" then table.insert(out, name .. " = " .. tostring(v)) end
+  end
+  return table.concat(out, "\n") .. "\n"
+end
+-- Their character's own (WB.saveForCharacter: their preferred mount, Show Helm, Show Cloak), written under their profile
+-- rather than the account's; one never set is written as nil, so another character's does not carry over.
+local perCharacter = {}
+function WB.saveForCharacter(name) perCharacter[name] = true end
+WB.saveForCharacter("WBItemActionSlots")
+function WB.saveItemActions()
+  local slots={}
+  for slot=1,120 do local a=WB.actions[slot] if a and a.item then table.insert(slots,slot..":"..a.item) end end
+  WBItemActionSlots=table.concat(slots,",")
+end
+local itemActions=CreateFrame("Frame")
+itemActions:RegisterEvent("VARIABLES_LOADED")
+itemActions:SetScript("OnEvent",function()
+  for slot,entry in string.gfind(WBItemActionSlots or "","(%d+):(%d+)") do
+    slot,entry=tonumber(slot),tonumber(entry)
+    if slot>=1 and slot<=120 and entry>0 then WB.actions[slot]={item=entry} end
+  end
+end)
+function __WBCharacterVariablesText()
+  local out, names = {}, {}
+  for name in pairs(perCharacter) do table.insert(names, name) end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local v = getglobal(name)
+    if type(v) == "string" then table.insert(out, name .. " = " .. string.format("%q", v))
+    elseif type(v) == "number" then table.insert(out, name .. " = " .. tostring(v))
+    else table.insert(out, name .. " = nil") end
   end
   return table.concat(out, "\n") .. "\n"
 end

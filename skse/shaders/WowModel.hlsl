@@ -19,7 +19,11 @@ cbuffer Object : register(b1)
 	float4 tint;                   // the batch's colour and transparency (effects; 1 for her)
 	float4 uvRow0;                 // the batch's texture animation: uv' = (dot(row0, (uv, 1)), dot(row1, (uv, 1)))
 	float4 uvRow1;
+	float4 shadowFeet;             // camera-relative feet/centre; w: world receiving enabled
 };
+#define WB_MODEL_SHADOWS
+#include "WowShadow.hlsl"
+
 cbuffer Bones : register(b2)
 {
 	row_major float4x4 bones[256];
@@ -45,6 +49,7 @@ struct VSOut
 	float2 uv : TEXCOORD0;
 	float4 curClip : TEXCOORD1;
 	float4 prevClip : TEXCOORD2;
+	float3 rel : TEXCOORD3;
 };
 
 VSOut VSMain(VSIn v)
@@ -66,7 +71,8 @@ VSOut VSMain(VSIn v)
 	}
 	p = float4(p.xyz, 1.0);
 	VSOut o;
-	o.pos = mul(viewProj, mul(world, p));
+	o.rel = mul(world, p).xyz;
+	o.pos = mul(viewProj, float4(o.rel, 1));
 	o.curClip = o.pos;
 	o.prevClip = mul(prevViewProj, mul(prevWorld, p));
 	o.normal = mul((float3x3)world, n);
@@ -95,7 +101,7 @@ PSOut PSMain(VSOut i, bool front : SV_IsFrontFace)
 	if (material.y < 0.5) {
 		float3 n = normalize(i.normal);
 		n = (front || (flags & 2)) ? n : -n;
-		light = ambientColor.rgb + lightColor.rgb * saturate(dot(n, lightDir.xyz));
+		light = ambientColor.rgb + lightColor.rgb * ModelSun(i.rel, n, shadowFeet) * saturate(dot(n, lightDir.xyz));
 	}
 	PSOut o;
 	o.color = float4(t.rgb * light, ((flags & 4) ? 1.0 : t.a) * (1.0 - material.z));

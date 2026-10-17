@@ -6,7 +6,9 @@
 #include "Config.h"
 #include "Frame.h"
 #include "Surrogate.h"
+#include "Portrait.h"
 #include "render/ItemPreview.h"
+#include "render/PlayerWeapons.h"
 
 #include "wowcore/mpq.hpp"
 
@@ -16,9 +18,10 @@ namespace Avatar
 	{
 		std::atomic<const Loaded*> g_data = nullptr, g_mountData = nullptr;
 		std::atomic<std::uint32_t> g_mountDisplay = 0;
+		std::atomic<bool>          g_mountFlying = false;
 		std::atomic<bool>          g_suspended = false;
-		bool                       g_drawn = false;   // her sheath state (main thread)
-		bool                       g_shownDrawn = false;   // where the weapon is drawn: in her hand or not, so far
+		bool                       g_drawn = false;   // their sheath state (main thread)
+		bool                       g_shownDrawn = false;   // where the weapon is drawn: in their hand or not, so far
 		double                     g_drawSwitchAt = -1;    // a sheath animation's moment the weapon changes place
 
 		struct Action
@@ -27,11 +30,53 @@ namespace Avatar
 			bool         loop = false;
 			double       since = 0;
 			bool         upperBody = false;
+			std::int32_t then = -1;   // looped once this one has played (sitting down, then sitting)
 		};
 		Action g_action;   // main thread
-		std::atomic<std::uint32_t> g_display = 0;   // her form's creature display; 0: herself
+		std::atomic<std::uint32_t> g_display = 0;   // their form's creature display; 0: the player
 		std::mutex                 g_lock;
 		Pose                       g_pose;
+		struct RaceCameraState
+		{
+			std::vector<std::pair<RE::Setting*, float>> settings;
+			RE::ThirdPersonState* third = nullptr;
+			float expected = 0, actual = 0;
+		};
+		std::optional<RaceCameraState> g_raceCamera;
+		float g_mountHeight = 0;
+		// Replace the shoulder Z offset with the distance from the native head to the drawn Head attachment (0).
+		// Feet stay at the actor origin; model scale must not also be multiplied by the surrogate scale.
+		void RaceCamera(std::optional<float> a_offset)
+		{
+			if (!a_offset) {
+				if (!g_raceCamera) return;
+				for (const auto& [setting, value] : g_raceCamera->settings) setting->data.f = value;
+				if (auto* third = g_raceCamera->third) {
+					third->posOffsetExpected.z = g_raceCamera->expected;
+					third->posOffsetActual.z = g_raceCamera->actual;
+				}
+				g_raceCamera.reset();
+				return;
+			}
+			if (!g_raceCamera) {
+				g_raceCamera.emplace();
+				auto* ini = RE::INISettingCollection::GetSingleton();
+				for (const auto name : {"fOverShoulderPosZ:Camera", "fOverShoulderCombatPosZ:Camera"})
+					if (auto* setting = ini ? ini->GetSetting(name) : nullptr) g_raceCamera->settings.emplace_back(setting, setting->data.f);
+			}
+			const float height = *a_offset + g_mountHeight;
+			for (const auto& [setting, value] : g_raceCamera->settings) setting->data.f = height;
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			if (camera && camera->currentState && camera->currentState->id == RE::CameraState::kThirdPerson) {
+				auto* third = static_cast<RE::ThirdPersonState*>(camera->currentState.get());
+				if (!g_raceCamera->third) {
+					g_raceCamera->third = third;
+					g_raceCamera->expected = third->posOffsetExpected.z;
+					g_raceCamera->actual = third->posOffsetActual.z;
+				}
+				third->posOffsetExpected.z = third->posOffsetActual.z = height;
+			}
+		}
         struct MountCameraState {
             std::vector<std::pair<RE::Setting*,float>> settings;
             RE::ThirdPersonState* third=nullptr;
@@ -91,7 +136,7 @@ namespace Avatar
 				path = tex->type == 0 ? tex->filename : tex->type == 6 ? a_data.look.hair :
 				       tex->type == 2 ? (a_part.attached ? a_part.attached->texture : a_data.look.cape) : std::string();
 				if (const auto r = a_data.look.replaceableTextures.find(tex->type); path.empty() && r != a_data.look.replaceableTextures.end()) {
-					path = r->second;   // a creature's skin (her form: types 11-13)
+					path = r->second;   // a creature's skin (their form: types 11-13)
 				}
 				if (path.empty()) {
 					a_part.batchImages.push_back(nullptr);
@@ -105,16 +150,16 @@ namespace Avatar
 			}
 		}
 
-		// Her looks, kept once dressed: herself (0) and each form's creature (its display), so that a shift is at once, as
-		// the client's (dressing one takes a second and more). Filled by the loading thread; never freed but for her own
-		// look when her gear changes, and that one only at the next change (the renderer may be drawing it this frame).
+		// Their looks, kept once dressed: the player (0) and each form's creature (its display), so that a shift is at once, as
+		// the client's (dressing one takes a second and more). Filled by the loading thread; never freed but for their own
+		// look when their gear changes, and that one only at the next change (the renderer may be drawing it this frame).
 		std::mutex                                             g_looksLock;
 		std::map<std::uint32_t, std::unique_ptr<const Loaded>> g_looks;
 		std::set<std::uint32_t>                                g_mountRequests;
 		std::mutex                                             g_loading;   // one dressing at a time
 		std::uint64_t                                          g_outfitRevision = 0;   // protected by g_looksLock
 
-		// She is shown as the look for the display she is in, once it is dressed.
+		// The player is shown as the look for the display the player is in, once it is dressed.
 		void Publish()
 		{
 			std::lock_guard lock(g_looksLock);
@@ -141,12 +186,16 @@ namespace Avatar
 			data->display = display;
 			data->appearance = a_looks;
 			data->items = a_items;
-			// In a form she is its creature (wowcore::dressCreature: its model, skins and scale), else herself in her gear.
+			// In a form the player is its creature (wowcore::dressCreature: its model, skins and scale), else the player in their gear.
 			auto       creature = display ? wowcore::dressCreature(mpq, display) : std::nullopt;
 			if (creature) {
 				data->look = std::move(*creature);
 			} else {
 				data->look = wowcore::dressCharacter(mpq, a_looks, data->items);
+				// Calibrated to Skyrim's average human of their sex (Surrogate::DrawScale), every race in proportion.
+				// Without a size row (a model that failed to load or pose) the player's body still shows at the client's scale.
+				if (const auto scale = Surrogate::DrawScale(a_looks.race, a_looks.sex)) data->look.scale = *scale;
+				else logger::warn("avatar: no size row for race {} sex {}; the client's scale", a_looks.race, a_looks.sex);
 			}
 			auto body = wowcore::loadModel(mpq, data->look.body);
 			if (!body) {
@@ -178,7 +227,7 @@ namespace Avatar
 				// Equipment may have changed while MPQ assets loaded. An obsolete body must never
 				// replace the latest outfit (or publish after a newer request waiting on g_loading).
 				if (!creature && a_revision != g_outfitRevision) { return; }
-				static std::unique_ptr<const Loaded> retired;   // her look before her gear changed: drawn maybe this frame
+				static std::unique_ptr<const Loaded> retired;   // their look before their gear changed: drawn maybe this frame
 				auto& look = g_looks[display];
 				retired = std::move(look);
 				look = std::move(data);
@@ -186,7 +235,7 @@ namespace Avatar
 			Publish();
 		}
 
-		// In the background, one at a time: a look dressed (and shown if she is in it).
+		// In the background, one at a time: a look dressed (and shown if the player is in it).
 		void Dress(std::vector<std::uint32_t> a_displays)
 		{
 			const auto items = Character::Worn();   // the request's outfit, not whatever a queued loader finds later
@@ -220,8 +269,8 @@ namespace Avatar
 			float         speed = 0;   // yards a second over the ground
 		};
 
-		// WoW's chase camera: centred behind her (no shoulder offset), out to 15 yards at most, starting about 5.5 yards
-		// back (the 1.12 client's framing of her: 260 pixels a yard at 1440 lines). Zooming in past the nearest goes to
+		// WoW's chase camera: centred behind the player (no shoulder offset), out to 15 yards at most, starting about 5.5 yards
+		// back (the 1.12 client's framing of the player: 260 pixels a yard at 1440 lines). Zooming in past the nearest goes to
 		// first person, as in WoW.
 		bool g_cameraSettings = false, g_cameraZoomed = false;
 		std::vector<std::pair<RE::Setting*, float>> g_nativeCameraFloats;
@@ -239,7 +288,7 @@ namespace Avatar
 						setting->data.f = value;
 					}
 				}
-				// Nor does WoW's screen pulse and blur as health runs low (the user: the screen shook as she was hit).
+				// Nor does WoW's screen pulse and blur as health runs low (the user: the screen shook as the player was hit).
 				auto* prefs = RE::INIPrefSettingCollection::GetSingleton();
 				for (auto* setting : { ini ? ini->GetSetting("bLowHealthIModEnabled:Display") : nullptr,
 						 prefs ? prefs->GetSetting("bLowHealthIModEnabled:Display") : nullptr }) {
@@ -304,7 +353,7 @@ namespace Avatar
 				if (along < -0.3f) {
 					return { 45, true, heading };   // SwimBackwards
 				}
-				return { 42, true, std::atan2(dx, dy) };   // Swim, towards where she goes
+				return { 42, true, std::atan2(dx, dy) };   // Swim, towards where the player goes
 			}
 			const bool  airborne = a_player->IsInMidair();
 			if (airborne) {
@@ -314,15 +363,15 @@ namespace Avatar
 			}
 			wasAirborne = false;
 			if (speed > 0.5f) {
-				// Moving away from where she faces is backing up (WalkBackwards), her back to the way she goes; otherwise
-				// she turns to the way she goes (sideways when strafing, half-way on a diagonal).
+				// Moving away from where the player faces is backing up (WalkBackwards), their back to the way the player goes; otherwise
+				// the player turns to the way the player goes (sideways when strafing, half-way on a diagonal).
 				const float along = (dx * std::sin(heading) + dy * std::cos(heading)) / std::max(std::hypot(dx, dy), 1e-4f);
 				if (along < -0.3f) {
 					m.animation = 13;
 					m.facing = std::atan2(-dx, -dy);
 				} else {
-					// Run or Walk as her run/walk mode says (WoW's TOGGLERUN, numpad /; Skyrim's own run toggle), never by
-					// how fast she goes: slowed, she runs slower (the animation's rate follows her speed).
+					// Run or Walk as their run/walk mode says (WoW's TOGGLERUN, numpad /; Skyrim's own run toggle), never by
+					// how fast the player goes: slowed, the player runs slower (the animation's rate follows their speed).
 					const auto* controls = RE::PlayerControls::GetSingleton();
 					m.animation = !controls || controls->data.running ? 5u : 4u;
 					m.facing = std::atan2(dx, dy);
@@ -341,7 +390,7 @@ namespace Avatar
 
 	void Init(std::span<const std::uint32_t> a_forms)
 	{
-		std::vector<std::uint32_t> displays{ 0 };   // herself first, then her forms' creatures ahead of her first shift
+		std::vector<std::uint32_t> displays{ 0 };   // the player first, then their forms' creatures ahead of their first shift
 		displays.insert(displays.end(), a_forms.begin(), a_forms.end());
 		Dress(std::move(displays));
 	}
@@ -381,6 +430,8 @@ namespace Avatar
 	}
 	void SetMount(std::uint32_t display)
 	{
+		RaceCamera(std::nullopt);   // mount camera snapshots must not retain the race correction
+		g_mountHeight = 0;
 		g_mountDisplay = display;
 		if (!display) { g_mountData = nullptr; MountCamera(0); }
 		else {
@@ -390,11 +441,12 @@ namespace Avatar
                 std::vector<glm::mat4> bones;
                 wowcore::poseBones(data->body.model,wowcore::sequenceWithFallback(data->body.model,0),0,0,bones);
                 const auto saddle=wowcore::mountedRiderMatrix(data->body.model,bones,data->look.scale);
-                if (saddle) MountCamera((*saddle)[3].z*kUnitsPerYard);
+                if (saddle) { g_mountHeight = (*saddle)[3].z*kUnitsPerYard; MountCamera(g_mountHeight); }
             }
         }
 	}
 	const Loaded* MountData() { return g_mountData.load(); }
+	void          SetMountFlying(bool a_flying) { g_mountFlying = a_flying; }
 
 	void Redress()
 	{
@@ -428,9 +480,25 @@ namespace Avatar
 		if (active) {
 			Surrogate::Refresh();
 		}
+		std::optional<float> headOffset;
+		const auto* data = g_data.load();
+		if (active && data && !data->display && data->appearance == Character::Looks()) {
+			// Their Helm attachment (11; 0 is the shield's), as the Skyrim head node it stands for, against the
+			// surrogate's: nothing while their surrogate's head is theirs, the rest where its size is capped or poses differ.
+			std::vector<glm::mat4> bones;
+			const auto pose = Current();
+			wowcore::poseBones(data->body.model, wowcore::sequenceWithFallback(data->body.model, pose.animation), pose.timeMs, 0, bones);
+			const auto head = wowcore::attachmentMatrix(data->body.model, bones, 11);
+			const auto nativeHead = Portrait::HeadPosition(player);
+			const auto factor = Surrogate::HeadFactor(data->appearance.race, data->appearance.sex);
+			if (head && nativeHead && factor) headOffset = (*head)[3].z * data->look.scale * kUnitsPerYard * *factor -
+				(nativeHead->z - player->GetPosition().z);
+		}
+		RaceCamera(headOffset);
 		Motion     motion = ChooseMotion(player, dt);
-		const auto stance = Character::Melee().ready;   // squared up with her weapon while she fights
-		if (motion.animation == 0 && Melee::Attacking()) {
+		const auto nativeStance = data && !data->display ? PlayerWeapons::ReadyStance() : std::nullopt;
+		const auto stance = nativeStance.value_or(Character::Melee().ready);
+		if (motion.animation == 0 && (Melee::Attacking() || (nativeStance && g_shownDrawn))) {
 			motion.animation = stance;
 		}
 		std::int32_t upperAnimation = -1;
@@ -439,7 +507,12 @@ namespace Avatar
 			const auto* data = g_data.load();
 			const int seq = data ? wowcore::findSequence(data->body.model, static_cast<std::uint32_t>(g_action.animation)) : -1;
 			actionTime = static_cast<float>((now - g_action.since) * 1000.0);
-			if (seq < 0 || (!g_action.loop && actionTime >= data->body.model.sequences[seq].duration)) {
+			if (seq >= 0 && !g_action.loop && g_action.then >= 0 && actionTime >= data->body.model.sequences[seq].duration) {
+				g_action = { g_action.then, true, now, g_action.upperBody };
+				actionTime = 0;
+				std::lock_guard lock(g_lock);
+				g_pose.timeMs = 0;
+			} else if (seq < 0 || (!g_action.loop && actionTime >= data->body.model.sequences[seq].duration)) {
 				g_action.animation = -1;
 			} else if (g_action.upperBody && g_display == 0) {
 				upperAnimation = g_action.animation; // legs keep locomotion while the torso swings
@@ -458,6 +531,7 @@ namespace Avatar
 		const auto mount = g_mountDisplay.load();
 		std::lock_guard lock(g_lock);
 		if (mount && g_mountData) {
+			if (g_mountFlying && wowcore::findSequence(g_mountData.load()->body.model, 135) >= 0) motion.animation = 135;   // Fly
 			if (g_pose.mountDisplay != mount || g_pose.mountAnimation != motion.animation) g_pose.mountTimeMs = 0;
 			else g_pose.mountTimeMs += static_cast<float>(dt * 1000.0) * rate;
 			g_pose.mountDisplay = mount;
@@ -485,6 +559,7 @@ namespace Avatar
 			g_shownDrawn = g_drawn;
 		}
 		g_pose.weaponsDrawn = g_shownDrawn;
+		g_pose.nativeWeaponSlots = PlayerWeapons::NativeSlots();
 	}
 
 	void Act(std::int32_t a_animation, bool a_loop, bool a_upperBody)
@@ -495,6 +570,14 @@ namespace Avatar
 	}
 
 	void StopActing() { g_action.animation = -1; }
+
+	void ActThenLoop(std::int32_t a_once, std::int32_t a_loop)
+	{
+		Act(a_once, false);
+		g_action.then = a_loop;
+	}
+
+	std::int32_t Acting() { return g_action.animation; }
 
 	std::optional<double> EventAt(std::uint32_t a_animation, const std::string& a_id)
 	{
@@ -517,7 +600,7 @@ namespace Avatar
 			g_drawSwitchAt = -1;
 			return;
 		}
-		// Sheath (89) for a weapon on her back, HipSheath (90) for one at her hip (item_template.sheath 3); the weapon
+		// Sheath (89) for a weapon on their back, HipSheath (90) for one at their hip (item_template.sheath 3); the weapon
 		// changes place at the animation's own moment ($SHR: 433 ms of Sheath's 667).
 		const auto hand = Character::InSlot(15);
 		const std::int32_t anim = hand && hand->sheath == 3 ? 90 : 89;
@@ -550,7 +633,14 @@ namespace Avatar
 
 	void IntegrationChanged(bool active)
 	{
-		if (active) return;
+		if (active) {   // their surrogate takes their body's sex and size as the player starts, not only at their next change or load
+			const auto looks = Character::Looks();
+			Surrogate::SetSex(looks.sex == 1);
+			Surrogate::SetSize(looks.race, looks.sex);
+			return;
+		}
+		RaceCamera(std::nullopt);
+		Surrogate::RestoreSize();
 		for (const auto& [setting, value] : g_nativeCameraFloats) setting->data.f = value;
 		for (const auto& [setting, value] : g_nativeCameraBools) setting->data.b = value;
 		g_nativeCameraFloats.clear(); g_nativeCameraBools.clear();

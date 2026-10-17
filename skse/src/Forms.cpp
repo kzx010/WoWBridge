@@ -21,15 +21,16 @@ namespace Forms
 		// The service's stats.resources (Player::RegenerateAll / Regenerate at the realm's rates).
 		constexpr float  kEnergyPerTick = 20, kRageDecayPerTick = 2.5f, kMax = 100;
 		constexpr double kTick = 2.0;
-		// Her form's Skyrim side (Carriers::Buff) is kept under one key, whichever form it is.
+		// Their form's Skyrim side (Carriers::Buff) is kept under one key, whichever form it is.
 		constexpr std::uint32_t kFormBuff = 0xF0000001;
 		constexpr std::uint32_t kTalentBuff = 0xF0000002;
 		constexpr std::uint32_t kMoonkinPartyBuff = 0xF0000003;
 		constexpr std::uint32_t kFeralStealthBuff = 0xF0000004;
 		constexpr std::uint32_t kLeaderPartyBuff = 0xF0000005;
+		constexpr std::uint32_t kProwlMuffleBuff = 0xF0000007;
 		constexpr std::uint32_t kProwl = 9913;
 		constexpr std::uint32_t kShadowmeld = 20580;
-		constexpr float         kStealthAlpha = 0.2f;   // her own model while stealthed (the client's, evidence/formref/prowl_1440.png)
+		constexpr float         kStealthAlpha = 0.2f;   // their own model while stealthed (the client's, evidence/formref/prowl_1440.png)
 
 		// Rage over time from an aura: Enrage's gain, Frenzied Regeneration's rage turned into health.
 		struct RageAura
@@ -49,31 +50,40 @@ namespace Forms
 		float                g_rage = 0, g_energy = 0;
 		struct Combo { RE::ActorHandle target; int points = 0; };
 		std::map<RE::FormID, Combo> g_combos;
+        bool ValidComboTarget(RE::Actor* actor)
+        {
+            return actor && !actor->IsDead() && !actor->IsDisabled() && !actor->IsDeleted();
+        }
+
 		bool                 g_prowling = false;
 		bool                 g_shadowmeld = false;
 		RE::NiPoint3         g_shadowmeldAt;
 		std::uint32_t        g_prowlSpell = kProwl;
 		std::uint32_t        g_nextSwing = 0;
 		std::vector<RageAura> g_rageAuras;
+		std::optional<json> g_loadedResources;
 		double               g_noDecayUntil = 0;   // Enrage's interrupt_regen
 		double               g_nextEnergy = 0, g_nextDecay = 0;
 		float                g_health = -1;        // last frame's, for rage from damage taken
-		json                 g_formAura;           // her form's aura, for its Skyrim side again (in and out of water)
+		json                 g_formAura;           // their form's aura, for its Skyrim side again (in and out of water)
 		bool                 g_aquaticInWater = false; // console land previews remain possible until the first swim
 		bool                 g_swimBoost = false;  // Aquatic Form's swim speed applied
-		bool                 g_sneakProwl = false; // Skyrim's sneak taken for her prowl
+		bool                 g_sneakProwl = false; // Skyrim's sneak taken for their prowl
 		double               g_prowlSince = 0;
 		json                 g_profileAsked;
 		std::uint32_t        g_profileEpoch = 0;
 		double               g_nextProfile = 0;
 		bool                 g_profilePending = false;
 		float                g_castingRegen = 0;
+		bool                 g_castingRegenHeld = false;   // testing: probes that pay exact magicka
+		float                g_runSpeedPercent = 0, g_mountedSpeedPercent = 0;   // Pursuit of Justice (stats.paladin)
 		double               g_lastRegen = 0, g_nextParty = 0;
 		float                g_reflectionRestored = 0;
 		std::map<RE::FormID, RE::ActorHandle> g_moonkinParty;
 		std::map<RE::FormID, RE::ActorHandle> g_leaderParty;
 		json                 g_talentProfile = json::object();
 		float                g_stealthApplied = 0;
+		bool                 g_muffled = false;
 		bool                 g_leaderShown = false;
 		int                  g_threatRedirects = 0;
 		std::mt19937         g_threatRng{std::random_device{}()};
@@ -81,8 +91,8 @@ namespace Forms
 		RE::PlayerCharacter* Player() { return RE::PlayerCharacter::GetSingleton(); }
 		float Cap(float a_value) { return std::clamp(a_value, 0.0f, kMax); }
 
-		// The interface (docs/druid-client.md): the shapeshift bar's form, her power bar's kind and her prowl, the combo
-		// points on her target - each told as it changes. Her rage or energy itself goes with her unit snapshot (Bridge).
+		// The interface (docs/druid-client.md): the shapeshift bar's form, their power bar's kind and their prowl, the combo
+		// points on their target - each told as it changes. Their rage or energy itself goes with their unit snapshot (Bridge).
 		void Show()
 		{
 			const float stealthBonus = g_prowling && g_form == "cat" ? g_talentProfile.value("stealth_level_bonus", 0.f) : 0;
@@ -91,6 +101,13 @@ namespace Forms
 				if (stealthBonus > 0) Carriers::Buff(Player(), kFeralStealthBuff, "Feral Instinct", {
 					{0, stealthBonus, RE::ActorValue::kSneakingModifier}}, 1e7f);
 				g_stealthApplied = stealthBonus;
+			}
+			// WoW's Prowl is silent. Skyrim's invisibility hides only sight: walking, their footsteps gave the player away at a dozen
+			// yards (the user's report; wow_prowl_detection read 34-81). Muffle's silent feet while the player prowls (-10).
+			if (const bool muffled = g_prowling && g_form == "cat"; muffled != g_muffled) {
+				Carriers::Unbuff(Player(), kProwlMuffleBuff);
+				if (muffled) Carriers::Buff(Player(), kProwlMuffleBuff, "Prowl", { { 0, 1.0f, RE::ActorValue::kMovementNoiseMult } }, 1e7f);
+				g_muffled = muffled;
 			}
 			static int shownForm = -1;
 			static bool shownProwl = false, shownStealth = false;
@@ -127,8 +144,8 @@ namespace Forms
 			}
 		}
 
-		// A form's Skyrim side: its fixed health (converted), armor (a share of what her gear gives), running speed (and
-		// Aquatic Form's swimming speed while she swims, its water breathing).
+		// A form's Skyrim side: its fixed health (converted), armor (a share of what their gear gives), running speed (and
+		// Aquatic Form's swimming speed while the player swims, its water breathing).
 		void FormBuff(const json& a_aura)
 		{
 			auto*                         player = Player();
@@ -137,7 +154,7 @@ namespace Forms
 			if (const int health = a_aura.value("skyrim_health_bonus", 0); health > 0) {
 				changes.push_back({ 0, static_cast<float>(health), RE::ActorValue::kHealth });
 			}
-			if (const float pct = a_aura.value("armor_percent", 0.0f); pct != 0.0f) {   // of her worn armor's rating
+			if (const float pct = a_aura.value("skyrim_armor_percent", a_aura.value("armor_percent", 0.0f)); pct != 0.0f) {   // service owns form/Thick Hide conversion
 				changes.push_back({ 0, WornArmor() * pct / 100.0f, RE::ActorValue::kDamageResist });
 			}
 			// Same native avoidance equivalent as Quickness: .12% mitigation per
@@ -160,6 +177,7 @@ namespace Forms
 
 		void SetForm(const json& a_aura)
 		{
+			logger::info("form: {} -> {} ({})", g_form, a_aura.value("form", "none"), a_aura.value("action", ""));   // diagnostic: who leaves
 			const bool leave = a_aura.value("action", "") == "leave" || a_aura.value("form", "none") == "none";
 			g_form = leave ? "none" : a_aura.value("form", "none");
 			g_power = leave ? "mana" : a_aura.value("power", "mana");
@@ -169,6 +187,10 @@ namespace Forms
 			if (a_aura.value("clears_prowl", false)) {
 				g_prowling = false;
 			}
+			// Aura::HandleShapeshiftBoosts removes IsRemovedOnShapeLost auras.
+			// The periodic resource/heal payloads live outside Cast's aura list.
+			g_rageAuras.clear();
+			g_noDecayUntil = 0;
 			g_nextSwing = 0;
 			g_formAura = leave ? json() : a_aura;
 			g_talentProfile = leave ? json::object() : a_aura;
@@ -178,7 +200,11 @@ namespace Forms
 			} else {
 				FormBuff(a_aura);
 			}
-			Avatar::SetForm(leave ? 0 : a_aura.value("display_id", 0u));
+			// null for the form the player leaves: value() substitutes its default only for a missing key, and throws on null.
+			auto display = a_aura.contains("display_id") && a_aura["display_id"].is_number_unsigned() ? a_aura["display_id"].get<std::uint32_t>() : 0u;
+			if (Character::Looks().race == 6) display = display == 892 ? 8571 : display == 2281 ? 2289 : display == 15374 ? 15375 : display;
+			else display = display == 8571 ? 892 : display == 2289 ? 2281 : display == 15375 ? 15374 : display;
+			Avatar::SetForm(leave ? 0 : display);
 			Character::SetShapeshifted(!leave);
 			logger::info("forms: {} ({})", g_form, g_power);
 			Show();
@@ -272,16 +298,17 @@ namespace Forms
 					WowUi::Run(sheet + "}}})");
 					std::vector<Carriers::Change> changes;
 					if (g_form == "none") {
-						const float armor = r["form"].value("armor_percent", 0.0f) - base["form"].value("armor_percent", 0.0f);
+						const float armor = r["form"].value("skyrim_armor_percent", r["form"].value("armor_percent", 0.0f)) -
+							base["form"].value("skyrim_armor_percent", base["form"].value("armor_percent", 0.0f));
 						if (armor != 0) {
 							changes.push_back({ 0, WornArmor() * armor / 100.0f, RE::ActorValue::kDamageResist });
 						}
 					}
 					const auto delta = [&](const char* a_stat) { return r["stats"].value(a_stat, 0.0f) - base["stats"].value(a_stat, 0.0f); };
-					// Reflection adds its spirit-derived mana inside WoW's five-second
-					// rule. Native magicka regeneration continues under Skyrim's rules.
-					g_castingRegen = std::max(0.0f, r["regen"].value("per_sec_casting", 0.0f) -
-						base["regen"].value("per_sec_casting", 0.0f)) * 0.2f;
+					// The spirit regen WoW lets continue inside the five-second rule (Reflection, Innervate's aura 134,
+					// gear) is added then; native magicka regeneration continues under Skyrim's rules. Not against the
+					// baseline: that keeps Innervate and their gear, so their share would cancel out (audit G5).
+					g_castingRegen = std::max(0.0f, r["regen"].value("per_sec_casting_spirit", 0.0f)) * 0.2f;
 					// Strength -> carry weight / weapon damage modifiers; agility -> movement; stamina -> health;
 					// intellect -> magicka; spirit -> magicka regeneration, as gear and stat auras do.
 					for (const auto& change : std::vector<Carriers::Change>{ { 0x7A0F4, delta("str") },
@@ -291,6 +318,12 @@ namespace Forms
 							changes.push_back(change);
 						}
 					}
+					// Pursuit of Justice: on foot its run speed is Unit::UpdateSpeed's main modifier (SpeedMult points);
+					// mounted, its share multiplies the mount's speed instead (Mounts reads MountedSpeedPercent).
+					const auto paladin = r.value("paladin", json::object());
+					g_runSpeedPercent = paladin.value("movement_speed_percent", 0.0f);
+					g_mountedSpeedPercent = paladin.value("mounted_speed_percent", 0.0f);
+					if (g_runSpeedPercent != 0) changes.push_back({ 0, g_runSpeedPercent, RE::ActorValue::kSpeedMult });
 					Carriers::Unbuff(Player(), kTalentBuff);
 					if (!changes.empty()) {
 						Carriers::Buff(Player(), kTalentBuff, "Talents", changes, 1e7f);
@@ -400,12 +433,11 @@ namespace Forms
 				g_noDecayUntil = end;
 			}
 		}
+		// Growl's taunt event is its aura's (Cast holds the taunted unit on the player while it lasts).
 		for (const auto& e : a_outcome.value("events", json::array())) {
 			const auto type = e.value("type", "");
 			if (type == "next_swing") {
 				g_nextSwing = e.value("spell", 0u);
-			} else if (type == "taunt" && a_target) {   // Growl: it turns on her
-				a_target->StartCombat(Player());
 			} else if (type == "power") {
 				if (e.value("power", "") == "rage") {
 					g_rage = Cap(g_rage + e.value("amount", 0.0f));
@@ -429,6 +461,15 @@ namespace Forms
 			Cast::EndAura(g_prowlSpell);
 		}
 		Show();
+	}
+
+	bool CanPay(const json& a_outcome)
+	{
+		const auto power = a_outcome.value("power", "mana");
+		if (power != "rage" && power != "energy") return true;
+		const float cost = a_outcome.value("cost", 0.f) + a_outcome.value("extra_power_cost", 0.f);
+		const float pool = power == "rage" ? g_rage : g_energy;
+		return power == g_power && std::isfinite(cost) && cost >= 0 && cost <= pool;
 	}
 
 	bool Pay(const json& a_outcome)
@@ -464,10 +505,22 @@ namespace Forms
 
 	void AttackThreat(const json& a_reply, RE::Actor* a_target)
 	{
-		if (!a_target || a_target->IsDead() || (g_form != "bear" && g_form != "dire_bear")) return;
-		const float bonus = a_reply.value("feral_threat_bonus_percent",0.f);
+		const bool paladin = Character::Get().classId == 2;
+		if (!a_target || a_target->IsDead() || (!paladin && g_form != "bear" && g_form != "dire_bear")) return;
+		const float bonus = paladin ? std::max(0.f, (a_reply.value("threat_multiplier", 1.f) - 1.f) * 100.f) :
+			a_reply.value("feral_threat_bonus_percent",0.f);
 		auto* combat = a_target->GetActorRuntimeData().combatController;
 		auto current = combat ? combat->targetHandle.get() : RE::NiPointer<RE::Actor>{};
+		if (paladin && a_reply.value("threat_multiplier", 1.f) < 1 && current.get() == Player()) {
+			// Skyrim has no threat table: a reduced-threat damaging hit can leave a nearby follower on top.
+			if (std::uniform_real_distribution<float>(0, 1)(g_threatRng) < a_reply.value("threat_multiplier", 1.f)) return;
+			RE::Actor* next = nullptr;
+			for (std::size_t i = 0; i < 4; ++i) if (auto* member = Bridge::PartyMember(i); member && !member->IsDead() &&
+				!Cast::Unattackable(member) && member->GetPosition().GetDistance(a_target->GetPosition()) <= 30 * Avatar::kUnitsPerYard &&
+				(!next || member->GetPosition().GetDistance(a_target->GetPosition()) < next->GetPosition().GetDistance(a_target->GetPosition()))) next = member;
+			if (next) { a_target->StopCombat(); if (a_target->StartCombat(next)) ++g_threatRedirects; }
+			return;
+		}
 		if (bonus <= 0 || !current || !current->IsPlayerTeammate() || current.get() == Player()) return;
 		if (std::uniform_real_distribution<float>(0,100)(g_threatRng) < bonus) {
 			a_target->StopCombat();
@@ -518,7 +571,7 @@ namespace Forms
 		MoonkinParty(now);
 		const float elapsed = static_cast<float>(std::clamp(now - g_lastRegen, 0.0, 0.25));
 		g_lastRegen = now;
-		if (g_castingRegen > 0 && Cast::InFiveSecondRule() && !player->IsDead()) {
+		if (g_castingRegen > 0 && !g_castingRegenHeld && Cast::InFiveSecondRule() && !player->IsDead()) {
 			player->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kMagicka, g_castingRegen * elapsed);
 			g_reflectionRestored += g_castingRegen * elapsed;
 		}
@@ -535,7 +588,7 @@ namespace Forms
 		}
 		if (g_shadowmeld) {
 			// Skyrim keeps a remembered combat target despite invisibility. Drop only
-			// actors targeting her; repeat while concealed so AI cannot reacquire her.
+			// actors targeting the player; repeat while concealed so AI cannot reacquire the player.
 			if (auto* processes = RE::ProcessLists::GetSingleton()) {
 				processes->ForAllActors([player](RE::Actor* actor) {
 					auto* combat = actor ? actor->GetActorRuntimeData().combatController : nullptr;
@@ -557,7 +610,7 @@ namespace Forms
 		}
 		std::erase_if(g_combos, [](const auto& entry) {
 			const auto actor = entry.second.target.get();
-			return !actor || actor->IsDead() || actor->IsDeleted();
+			return !ValidComboTarget(actor.get());
 		});
 		if (g_form == "aquatic") {
 			g_aquaticInWater = g_aquaticInWater || Swimming();
@@ -601,7 +654,7 @@ namespace Forms
 		if (g_formAura.is_object() && g_formAura.value("swim_speed_percent", 0.0f) != 0.0f && Swimming() != g_swimBoost) {
 			FormBuff(g_formAura);   // Aquatic Form's speed is a swimming speed
 		}
-		// Prowl and Shadowmeld use Skyrim's sneak (its detection) and her faded model; leaving sneak ends stealth.
+		// Prowl and Shadowmeld use Skyrim's sneak (its detection) and their faded model; leaving sneak ends stealth.
 		// A bear, a stag or a seal does not sneak: Skyrim's sneak is left in those forms.
 		const bool stealthed = g_prowling || g_shadowmeld;
 		if (stealthed != g_sneakProwl) {
@@ -627,7 +680,7 @@ namespace Forms
 		if (!SneakAllowed() && player->IsSneaking()) {
 			SetSneaking(false);
 		}
-		// Rage from damage taken in a bear form: her health's fall, in WoW's units (Skyrim's x4), as the core rewards it.
+		// Rage from damage taken in a bear form: their health's fall, in WoW's units (Skyrim's x4), as the core rewards it.
 		if ((g_form == "bear" || g_form == "dire_bear") && g_health >= 0 && health < g_health - 0.5f) {
 			Service::Request({ { "op", "rage_from_damage_taken" }, { "damage", std::lround((g_health - health) * 4.0f) }, { "victim_level", player->GetLevel() } },
 				[epoch = g_profileEpoch](const json& r) {
@@ -638,7 +691,25 @@ namespace Forms
 				});
 		}
 		g_health = health;
-		Show();   // tells the interface only what changed (combo points follow her target)
+		Show();   // tells the interface only what changed (combo points follow their target)
+	}
+
+	json SaveResources()
+	{
+		const double now = Frame::Now();
+		json saved = {{"form", g_form}, {"rage", g_rage}, {"energy", g_energy},
+			{"energy_in", g_nextEnergy - now}, {"decay_in", g_nextDecay - now},
+			{"no_decay_in", g_noDecayUntil - now}, {"rage_auras", json::array()}};
+		for (const auto& a : g_rageAuras) saved["rage_auras"].push_back({{"spell", a.spell}, {"next", a.next - now},
+			{"end", a.end - now}, {"every", a.every}, {"per_tick", a.perTick}, {"max_per_tick", a.maxPerTick},
+			{"health_per_rage", a.healthPerRage}, {"crits", a.crits}, {"tick", a.tick},
+			{"crit_multiplier", a.critMultiplier}, {"respite", a.respite}});
+		return saved;
+	}
+
+	void LoadResources(const json& a_saved)
+	{
+		g_loadedResources = a_saved;
 	}
 
 	void Reset()
@@ -655,8 +726,10 @@ namespace Forms
 		for (const auto& [id, handle] : g_leaderParty) if (auto actor = handle.get()) Carriers::Unbuff(actor.get(), kLeaderPartyBuff);
 		g_leaderParty.clear();
 		Carriers::Unbuff(Player(), kFeralStealthBuff);
+		Carriers::Unbuff(Player(), kProwlMuffleBuff);
 		g_talentProfile = json::object();
 		g_stealthApplied = 0;
+		g_muffled = false;
 		g_threatRedirects = 0;
 		if (g_leaderShown) WowUi::Run("__WBAuraRemove('player',24932)");
 		g_leaderShown = false;
@@ -665,6 +738,8 @@ namespace Forms
 		g_form = "none";
 		g_power = "mana";
 		g_rage = g_energy = 0;
+		g_nextEnergy = g_nextDecay = Frame::Now() + kTick;
+		g_noDecayUntil = 0;
 		g_combos.clear();
 		g_prowling = false;
 		g_shadowmeld = false;
@@ -688,24 +763,39 @@ namespace Forms
 				Apply(outcome, nullptr);
 			}
 		}
+		// Helpful aura timers pause across logout, just like Cast's other timers.
+		if (g_loadedResources) {
+			const auto saved = std::exchange(g_loadedResources, std::nullopt).value();
+			const double now = Frame::Now();
+			g_energy = saved.value("energy", 0.f); g_rage = saved.value("rage", 0.f);
+			g_nextEnergy = now + saved.value("energy_in", kTick);
+			g_nextDecay = now + saved.value("decay_in", kTick);
+			if (saved.value("form", "none") == g_form && (g_form == "bear" || g_form == "dire_bear")) {
+				g_noDecayUntil = now + saved.value("no_decay_in", 0.0);
+				for (const auto& a : saved.value("rage_auras", json::array())) {
+					RageAura r;
+					r.spell = a["spell"]; r.next = now + a["next"].get<double>(); r.end = now + a["end"].get<double>();
+					r.every = a["every"]; r.perTick = a["per_tick"]; r.maxPerTick = a["max_per_tick"];
+					r.healthPerRage = a["health_per_rage"]; r.crits = a["crits"].get<std::vector<bool>>();
+					r.tick = a["tick"]; r.critMultiplier = a["crit_multiplier"]; r.respite = a["respite"];
+					g_rageAuras.push_back(std::move(r));
+				}
+			}
+		}
 	}
 
 	bool SneakAllowed() { return g_form == "none" || g_form == "cat"; }
 
 	json SnapshotForTesting()
 	{
-		const double now = Frame::Now();
-		json saved = {{"form", g_form}, {"power", g_power}, {"form_aura", g_formAura}, {"rage", g_rage}, {"energy", g_energy},
+		json saved = SaveResources();
+		saved.update({{"power", g_power}, {"form_aura", g_formAura},
 			{"prowling", g_prowling}, {"prowl_spell", g_prowlSpell}, {"shadowmeld", g_shadowmeld},
-			{"sneaking", Player()->IsSneaking()},
-			{"next_swing", g_nextSwing}, {"energy_in", g_nextEnergy - now}, {"decay_in", g_nextDecay - now},
-			{"no_decay_in", g_noDecayUntil - now}, {"aquatic_in_water", g_aquaticInWater},
-			{"combos", json::array()}, {"rage_auras", json::array()}};
-		for (const auto& [id, combo] : g_combos) saved["combos"].push_back({{"target", id}, {"points", combo.points}});
-		for (const auto& a : g_rageAuras) saved["rage_auras"].push_back({{"spell", a.spell}, {"next", a.next - now},
-			{"end", a.end - now}, {"every", a.every}, {"per_tick", a.perTick}, {"max_per_tick", a.maxPerTick},
-			{"health_per_rage", a.healthPerRage}, {"crits", a.crits}, {"tick", a.tick},
-			{"crit_multiplier", a.critMultiplier}, {"respite", a.respite}});
+			{"sneaking", Player()->IsSneaking()}, {"next_swing", g_nextSwing},
+			{"aquatic_in_water", g_aquaticInWater}, {"combos", json::array()}});
+		for (const auto& [id, combo] : g_combos)
+            if (auto actor=combo.target.get(); ValidComboTarget(actor.get()))
+                saved["combos"].push_back({{"target", id}, {"points", combo.points}});
 		return saved;
 	}
 
@@ -732,19 +822,23 @@ namespace Forms
 		g_noDecayUntil = now + a_saved["no_decay_in"].get<double>();
 		g_aquaticInWater = a_saved["aquatic_in_water"];
 		g_combos.clear();
-		for (const auto& c : a_saved["combos"]) if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(c["target"].get<RE::FormID>()); actor && !actor->IsDead())
+		for (const auto& c : a_saved["combos"]) if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(c["target"].get<RE::FormID>()); ValidComboTarget(actor))
 			g_combos[actor->GetFormID()] = {actor->CreateRefHandle(), c["points"].get<int>()};
 		g_rageAuras.clear();
 		for (const auto& a : a_saved["rage_auras"]) {
 			RageAura restored{a["spell"], now + a["next"].get<double>(), now + a["end"].get<double>(),
 				a["every"], a["per_tick"], a["max_per_tick"], a["health_per_rage"], a["crits"].get<std::vector<bool>>(),
-				a["tick"], a["crit_multiplier"], a["respite"]};
+				a["crit_multiplier"], a["tick"], a["respite"]};
 			g_rageAuras.push_back(std::move(restored));
 		}
 		Show();
 	}
 
 	const std::string& Current() { return g_form; }
+	void HoldCastingRegenForTesting(bool a_hold) { g_castingRegenHeld = a_hold; }
+	float RunSpeedPercent() { return g_runSpeedPercent; }
+	float MountedSpeedPercent() { return g_mountedSpeedPercent; }
+
 	nlohmann::json TalentDiagnostics()
 	{
 		return {{"reflection_per_second", g_castingRegen}, {"reflection_restored", g_reflectionRestored},
@@ -769,7 +863,7 @@ namespace Forms
 	int Power() { return static_cast<int>(g_power == "rage" ? g_rage : g_energy); }
 	int ComboPoints(RE::Actor* a_target)
 	{
-		if (!a_target || a_target->IsDead()) return 0;
+		if (!ValidComboTarget(a_target)) return 0;
 		const auto found = g_combos.find(a_target->GetFormID());
 		return found != g_combos.end() && found->second.target.get().get() == a_target ? found->second.points : 0;
 	}

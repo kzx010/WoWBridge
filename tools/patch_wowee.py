@@ -1542,6 +1542,135 @@ def patch_classic_interface_probe() -> None:
     print('patched classic interface aura diagnostic')
 
 
+def patch_edit_settext() -> None:
+    """An edit box's OnTextSet fires once, from lua_EditBox_SetText with `this` published: the Lua SetText also called
+    it bare, and ChatEdit_ParseText(this) then failed for every SetText on the chat box from code (e156080)."""
+    if '// it, publishing `this` as the 1.12 handlers read it' in ENGINE.read_text():
+        return
+    _replace(ENGINE, [(r'''        // that something put a channel prefix in it. Declared on the chat edit
+        // box and dispatched by nothing until now.
+        "    if self.__isEditBox then\n"
+        "        __WoweeEditSetText(self, text)\n"
+        "        local h = self.__scripts and self.__scripts.OnTextSet\n"
+        "        if h then h(self) end\n"
+''', r'''        // that something put a channel prefix in it. lua_EditBox_SetText fires
+        // it, publishing `this` as the 1.12 handlers read it (WoWBridge: this
+        // also called it a second time, bare, and ChatEdit_ParseText(this) then
+        // failed on a nil box - every SetText on the chat box from code).
+        "    if self.__isEditBox then\n"
+        "        __WoweeEditSetText(self, text)\n"
+''')])
+
+
+def patch_thick_outline_advance() -> None:
+    """THICKOUTLINE widens every glyph advance by one pixel (evidence/fontref/client_style_widths)."""
+    cpp = WW / 'src/ui/interface_fonts.cpp'
+    if 'float interfaceFontStyleAdvance(' in cpp.read_text():
+        return
+    _replace(cpp, [
+        ('''// Pen advance and (wide) the width of the widest line, over UTF-8 text; a newline starts a line.
+float measureLines(FaceMetrics& m, float emPx, const char* text, bool wide) {
+    const double P = interfaceLineFromEm(emPx);
+    int pen = 0, best = 0;
+    uint32_t last = 0;
+    const char* end = text + std::strlen(text);
+    for (const char* s = text; s < end;) {
+        unsigned int c = 0;
+        s += ImTextCharFromUtf8(&c, s, end);
+        if (c == '\\n') { best = std::max(best, wide && last ? pen - penOf(m, P, last) + ownWidthOf(m, P, last) : pen); pen = 0; last = 0; continue; }
+        pen += penOf(m, P, c);
+        last = c;
+    }
+    best = std::max(best, wide && last ? pen - penOf(m, P, last) + ownWidthOf(m, P, last) : pen);
+    return static_cast<float>(best);
+}''', '''// Pen advance and (wide) the width of the widest line, over UTF-8 text; a newline starts a line. advancePx widens
+// every glyph advance (interfaceFontStyleAdvance): all of them for the pen, all but the last glyph's for a width.
+float measureLines(FaceMetrics& m, float emPx, const char* text, bool wide, float advancePx) {
+    const double P = interfaceLineFromEm(emPx);
+    int pen = 0, glyphs = 0;
+    double best = 0.0;
+    uint32_t last = 0;
+    const auto line = [&] {
+        const bool own = wide && last;
+        const double drawn = own ? pen - penOf(m, P, last) + ownWidthOf(m, P, last) : pen;
+        return drawn + double(advancePx) * (own ? glyphs - 1 : glyphs);
+    };
+    const char* end = text + std::strlen(text);
+    for (const char* s = text; s < end;) {
+        unsigned int c = 0;
+        s += ImTextCharFromUtf8(&c, s, end);
+        if (c == '\\n') { best = std::max(best, line()); pen = 0; glyphs = 0; last = 0; continue; }
+        pen += penOf(m, P, c);
+        ++glyphs;
+        last = c;
+    }
+    best = std::max(best, line());
+    return static_cast<float>(best);
+}'''),
+        ('''float interfaceMeasure(ImFont* font, float size, const std::string& text) {
+    return interfaceTextPx(font, size * gPixelScale, text.c_str()) / gPixelScale;''',
+         '''float interfaceMeasure(ImFont* font, float size, const std::string& text, float advancePx) {
+    return interfaceTextPx(font, size * gPixelScale, text.c_str(), advancePx) / gPixelScale;'''),
+        ('''float interfaceTextPx(ImFont* font, float emPx, const char* text) {
+    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, true);''',
+         '''float interfaceTextPx(ImFont* font, float emPx, const char* text, float advancePx) {
+    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, true, advancePx);'''),
+        ('''    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, false);''',
+         '''    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, false, 0.0f);'''),
+        ('''// its rounded physical extent. Negative X does not extend GetStringWidth.
+float interfaceFontStylePadding(''', '''// its rounded physical extent. Negative X does not extend GetStringWidth.
+// THICKOUTLINE also widens every glyph advance by one physical pixel: "45", "1000"
+// and "Elunara" measure 1, 3 and 6 px wider than the padding alone, in both faces
+// at every captured height; OUTLINE advances are unchanged.
+float interfaceFontStyleAdvance(const std::string& outline) { return outline == "THICK" ? 1.0f : 0.0f; }
+float interfaceFontStylePadding('''),
+        ('''                         float fontHeight) {
+    if (text.empty()) return 0.0f;
+    const float size = interfaceFontSize(fontHeight);
+    if (ImFont* font = interfaceFaceOrDefault(fontFace)) {
+        return interfaceMeasure(font, size, text);''', '''                         float fontHeight, float advancePx) {
+    if (text.empty()) return 0.0f;
+    const float size = interfaceFontSize(fontHeight);
+    if (ImFont* font = interfaceFaceOrDefault(fontFace)) {
+        return interfaceMeasure(font, size, text, advancePx);'''),
+    ])
+    _replace(WW / 'include/ui/interface_fonts.hpp', [
+        ('float interfaceFontStylePadding(const std::string& outline, bool shadow, float shadowX);\n',
+         'float interfaceFontStyleAdvance(const std::string& outline);   // extra pixels per glyph advance (THICKOUTLINE)\n'
+         'float interfaceFontStylePadding(const std::string& outline, bool shadow, float shadowX);\n'),
+        ('                         float fontHeight);', '                         float fontHeight, float advancePx = 0.0f);'),
+        ('float interfaceMeasure(ImFont* font, float size, const std::string& text);',
+         'float interfaceMeasure(ImFont* font, float size, const std::string& text, float advancePx = 0.0f);'),
+        ('float interfaceTextPx(ImFont* font, float emPx, const char* text);   // a string\'s width',
+         'float interfaceTextPx(ImFont* font, float emPx, const char* text, float advancePx = 0.0f);   // a string\'s width'),
+    ])
+    _replace(ENGINE, [
+        ('                       float fontHeight) {', '                       float fontHeight, float advancePx = 0.0f) {'),
+        ('    return wowee::ui::interfaceTextWidth(text, fontFace, fontHeight);',
+         '    return wowee::ui::interfaceTextWidth(text, fontFace, fontHeight, advancePx);'),
+        ('wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight),\n        w->fontOutline,',
+         'wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight,\n'
+         '        wowee::ui::interfaceFontStyleAdvance(w->fontOutline)), w->fontOutline,'),
+        ('wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight),\n            w->fontOutline,',
+         'wowee::ui::interfaceStyleTextWidth(measureTextWidth(w->text, w->fontFace, w->fontHeight,\n'
+         '            wowee::ui::interfaceFontStyleAdvance(w->fontOutline)), w->fontOutline,'),
+    ])
+    # Layout only: glyphs are still drawn at their plain advances (no native THICKOUTLINE image captured yet).
+    _replace(WW / 'src/ui/widget_renderer.cpp', [
+        ('        return interfaceStyleTextWidth(interfaceMeasure(runFont, size, piece), w->fontOutline, w->hasShadow, w->shadowX);',
+         '        return interfaceStyleTextWidth(interfaceMeasure(runFont, size, piece, interfaceFontStyleAdvance(w->fontOutline)),\n'
+         '                                       w->fontOutline, w->hasShadow, w->shadowX);'),
+        ('''            const std::string measured = strippedText(w->text);
+            ImVec2 extent =
+                font ? ImVec2(interfaceTextPx(font, size, measured.c_str()),''',
+         '''            const std::string measured = strippedText(w->text);
+            const float styleAdvance = interfaceFontStyleAdvance(w->fontOutline);
+            ImVec2 extent =
+                font ? ImVec2(interfaceTextPx(font, size, measured.c_str(), styleAdvance),'''),
+    ])
+    print('patched THICKOUTLINE glyph advances')
+
+
 def apply_all(root: Path | None = None) -> None:
     """Apply the same ordered patch bundle for refreshes and direct invocation."""
     global WW, ENGINE
@@ -1581,6 +1710,8 @@ def apply_all(root: Path | None = None) -> None:
         patch_retained_widget_runtime()
         patch_font_readback()
         patch_classic_interface_probe()
+        patch_edit_settext()
+        patch_thick_outline_advance()
     finally:
         WW, ENGINE = previous
 

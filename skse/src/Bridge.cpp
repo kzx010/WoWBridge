@@ -11,6 +11,7 @@
 
 #include "Avatar.h"
 #include "../../wowcore/include/wowcore/combat_feedback.hpp"
+#include "../../wowcore/include/wowcore/minimap.hpp"
 #include "SpellVisuals.h"
 #include "Cast.h"
 #include "Character.h"
@@ -24,11 +25,44 @@
 #include "Portrait.h"
 #include "Progression.h"
 #include "Quests.h"
+#include "Reactions.h"
 #include "Taxi.h"
 #include "ui/WowUi.h"
 
 namespace Bridge
 {
+    // Main thread, per service request. Keep raw AVs and actual applied bridge
+    // modifiers separate; the service must not mirror its own carriers twice.
+    nlohmann::json NativeActorValues(RE::Actor* actor)
+    {
+        auto data=nlohmann::json{{"live",nlohmann::json::object()},{"owned",nlohmann::json::object()},
+            {"base",nlohmann::json::object()}};
+        if (!actor) return data;
+        auto* av=actor->AsActorValueOwner();
+        for (const int id : {27,28,29,39,40,41,42,43,44,45,83,155,156,157}) {
+            const auto value=static_cast<RE::ActorValue>(id);
+            data["live"][std::to_string(id)]=av->GetActorValue(value);
+            if (id>=27 && id<=29) data["base"][std::to_string(id)]=av->GetBaseActorValue(value);
+        }
+        if (auto* effects=actor->GetActiveEffectList()) for (auto* effect : *effects) {
+            const auto* base=effect ? effect->GetBaseObject() : nullptr;
+            if (!base || !effect->spell || effect->flags.any(RE::ActiveEffect::Flag::kInactive,RE::ActiveEffect::Flag::kDispelled)) continue;
+            const auto* file=effect->spell->GetFile(0);
+            const std::string_view source=file ? file->GetFilename() : "";
+            const std::string_view name=base->fullName.c_str();
+            // Generated equip/set abilities belong to these plugins. Runtime
+            // aura/racial MGEFs have these names; unrelated runtime enchantments
+            // using vanilla MGEFs remain external, even on a WoW item.
+            const bool owned=source=="WoWBridge.esp" || source=="WoWBridgeArmory.esp" ||
+                (base->GetFormID()>=0xFF000000 && (name=="WoWBridge aura" || name=="Quickness" || name=="Nature Resistance" || name=="Frost Resistance"));
+            const auto* value=owned ? skyrim_cast<RE::ValueModifierEffect*>(effect) : nullptr;
+            if (!value || !std::isfinite(value->value)) continue;
+            const auto key=std::to_string(static_cast<int>(value->actorValue));
+            if (data["live"].contains(key)) data["owned"][key]=data["owned"].value(key,0.f)+value->value;
+        }
+        return data;
+    }
+
 	namespace
 	{
 		RE::ActorHandle g_target;
@@ -42,6 +76,63 @@ namespace Bridge
 		std::uint32_t g_plateEpoch = 1;
 
 		constexpr float kUnitsPerYard = 64.0f;
+
+        // Main-thread diagnostic; no clock reads or actor counting when inactive.
+        // Measured 1.28 ms mean with 31 Whiterun market actors and every tracking category on (run 20261014-142421);
+        // 2 ms (about 12% of a 60 FPS frame) flags a regression of half again, not a target.
+        constexpr double kScanBudgetMs=2.0;
+        bool g_scanActive=false, g_scanMeasuring=false, g_scanValid=true;
+        nlohmann::json g_scanSite, g_scanResult={{"active",false},{"done",false}};
+        std::chrono::steady_clock::time_point g_scanIssued, g_scanStarted, g_scanPrevious;
+        double g_scanSum=0, g_scanMax=0, g_scanActorSum=0;
+        std::size_t g_scanFrames=0, g_scanActorMin=SIZE_MAX, g_scanActorMax=0;
+        std::set<RE::FormID> g_scanActors;
+
+        void FinishNPCScanCost(const char* error="")
+        {
+            const double mean=g_scanFrames ? g_scanSum/g_scanFrames : 0;
+            g_scanActive=false;
+            g_scanResult={{"active",false},{"done",true},{"mean_ms",mean},{"max_ms",g_scanMax},
+                {"frames",g_scanFrames},{"duration_s",g_scanMeasuring ? std::chrono::duration<double>(std::chrono::steady_clock::now()-g_scanStarted).count() : 0},
+                {"actor_count",g_scanActorMax},{"actor_count_min",g_scanFrames ? g_scanActorMin : 0},
+                {"actor_count_mean",g_scanFrames ? g_scanActorSum/g_scanFrames : 0},
+                {"budget_mean_ms",kScanBudgetMs},{"budget_reason","about 12% of a 60 FPS frame; 31 market actors measured 1.28 ms"},
+                {"scope","NameplatePart + MinimapPart, including POIs/serialization; all tracking categories"},
+                {"site",g_scanSite},{"error",error},
+                {"pass",*error=='\0' && g_scanValid && g_scanFrames>=30 && g_scanActorMin>0 && mean<kScanBudgetMs}};
+            Console::Print(std::format("NPC scan: mean {:.3f} ms, max {:.3f} ms, actors {}..{} (mean {:.1f}), {} frames / {:.2f} s; budget mean <{} ms: {} {}",
+                mean,g_scanMax,g_scanFrames ? g_scanActorMin : 0,g_scanActorMax,g_scanFrames ? g_scanActorSum/g_scanFrames : 0,
+                g_scanFrames,g_scanResult["duration_s"].get<double>(),kScanBudgetMs,g_scanResult["pass"].get<bool>() ? "PASS" : "FAIL",error));
+        }
+
+        void SampleNPCScanCost(RE::PlayerCharacter* player,double milliseconds)
+        {
+            const auto now=std::chrono::steady_clock::now();
+            if (now-g_scanIssued<std::chrono::seconds(8)) return;
+            const auto& p=g_scanSite["position"];
+            const RE::NiPoint3 expected{p[0].get<float>(),p[1].get<float>(),p[2].get<float>()};
+            auto* world=player->GetWorldspace();
+            const bool atSite=world && world->GetFormID()==g_scanSite["world"].get<RE::FormID>() &&
+                player->GetPosition().GetDistance(expected)<4096;
+            auto* ui=RE::UI::GetSingleton();
+            const bool playable=atSite && ui && !ui->GameIsPaused();
+            if (!g_scanMeasuring) {
+                if (!playable) {
+                    if (now-g_scanIssued>std::chrono::seconds(30)) FinishNPCScanCost("market arrival/close console timed out");
+                    return;
+                }
+                g_scanMeasuring=true; g_scanStarted=now; g_scanPrevious=now;
+            }
+            // A paused/loading interval or leaving the market invalidates this run.
+            g_scanValid &= playable && now-g_scanPrevious<std::chrono::milliseconds(500);
+            g_scanPrevious=now;
+            if (playable) {
+                ++g_scanFrames; g_scanSum+=milliseconds; g_scanMax=std::max(g_scanMax,milliseconds);
+                g_scanActorSum+=g_scanActors.size(); g_scanActorMin=std::min(g_scanActorMin,g_scanActors.size());
+                g_scanActorMax=std::max(g_scanActorMax,g_scanActors.size());
+            }
+            if (now-g_scanStarted>=std::chrono::seconds(10)) FinishNPCScanCost(g_scanValid ? "" : "paused/loading gap or left the market");
+        }
 
 		float Current(RE::Actor* a_actor, RE::ActorValue a_value) { return a_actor->AsActorValueOwner()->GetActorValue(a_value); }
 		float Maximum(RE::Actor* a_actor, RE::ActorValue a_value)
@@ -142,8 +233,8 @@ namespace Bridge
 				reaction <= 2 ? std::array{ 1.0f, 0.0f, 0.0f } : reaction == 4 ? std::array{ 1.0f, 1.0f, 0.0f } : std::array{ 0.0f, 1.0f, 0.0f });
 		}
 
-		// Her level is Skyrim's. A rise is WoW's level up (__WBLevelUp: its chat lines and sound; the light at her feet by
-		// the levelUp command), told half a second after it (the attribute she chose may land a frame later than the
+		// Their level is Skyrim's. A rise is WoW's level up (__WBLevelUp: its chat lines and sound; the light at the player's feet by
+		// the levelUp command), told half a second after it (the attribute the player chose may land a frame later than the
 		// level: its gain is measured then). Keep the notification in the snapshot: the render thread may coalesce
 		// several main-thread ticks. Publish the actual level immediately; only the celebration waits.
 		int g_levelShown = 0;
@@ -168,7 +259,7 @@ namespace Bridge
 				g_levelUp = "nil";
 			}
 			if (!rising) {
-				base = now;   // what she has before the next rise
+				base = now;   // what the player has before the next rise
 				return level;
 			}
 			if (Frame::Now() - risingSince < 0.5) {
@@ -186,7 +277,7 @@ namespace Bridge
 		{
 			const auto hp = static_cast<int>(std::ceil(Current(a_player, RE::ActorValue::kHealth)));
 			const auto hpMax = static_cast<int>(std::ceil(Maximum(a_player, RE::ActorValue::kHealth)));
-			// skyrim: her mana is magicka, and the spell tooltips quote what the service answers in (service/skyrim.py).
+			// skyrim: their mana is magicka, and the spell tooltips quote what the service answers in (service/skyrim.py).
 			const auto skill = [&](RE::ActorValue a_value) { return static_cast<int>(Current(a_player, a_value)); };
 			std::string skills;
 			for (const auto& [name, value] : {
@@ -253,6 +344,19 @@ namespace Bridge
 				female ? 3 : 2, powerType, resource);
 		}
 
+		// Where their head is on screen (fractions), for their chat bubble; false when it is not (first person, off screen).
+		std::string HeadPart(RE::PlayerCharacter* a_player)
+		{
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			const auto [width, height] = RE::BSGraphics::Renderer::GetScreenSize();
+			const bool first = camera && camera->currentState && camera->currentState->id == RE::CameraState::kFirstPerson;
+			const auto head = Portrait::HeadPosition(a_player);
+			float x = 0, y = 0;
+			if (first || !head || width <= 0 || height <= 0 || !Picker::WorldToScreen(*head + RE::NiPoint3{ 0, 0, 24 }, x, y) ||
+				!std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0 || x >= width || y >= height) return "head=false";
+			return std::format("head={{x={:.6f},y={:.6f}}}", x / width, y / height);
+		}
+
 		std::string NameplatePart(RE::PlayerCharacter* a_player)
 		{
 			// The vanilla client's short nameplate range is 20 yards. Read nodes and
@@ -274,7 +378,13 @@ namespace Bridge
 				if (!Picker::ScreenRay(x, y, origin, direction) || Picker::Cast(origin, at, false, actor.get()).hit) continue;
 				auto row = UnitTable(a_player, actor.get());
 				row.pop_back();
-				rows += row + std::format(", x={:.8f}, y={:.8f} }},", x / width, y / height);
+				rows += row + std::format(", x={:.8f}, y={:.8f}", x / width, y / height);
+				// Its chat bubble's point (wowapi_bubbles.lua), as ChatBubbleFrame places it: 0.7 yards over the top of its
+				// model (bounds x scale, as GetHeight). Off the top of the screen the bubble is, too.
+				float bx = 0, by = 0;
+				if (Picker::WorldToScreen(actor->GetPosition() + RE::NiPoint3{ 0, 0, actor->GetHeight() + 0.7f * kUnitsPerYard }, bx, by) &&
+					std::isfinite(bx) && std::isfinite(by)) rows += std::format(", bx={:.8f}, by={:.8f}", bx / width, by / height);
+				rows += " },";
 				g_plateActors[actor->GetFormID()] = actor->CreateRefHandle();
 			}
 			return std::format("nameplates={{epoch={},units={{{}}}}}", g_plateEpoch, rows);
@@ -334,7 +444,7 @@ namespace Bridge
 			}
 			return "";
 		}
-		RE::NiPoint3        g_holdTarget;   // where what she holds is being pulled (tests read it)
+		RE::NiPoint3        g_holdTarget;   // where what the player holds is being pulled (tests read it)
 		std::string MouseoverPart(RE::PlayerCharacter* a_player)
 		{
 			const auto ref = g_hover.get();
@@ -344,7 +454,8 @@ namespace Bridge
 			if (auto* actor = ref->As<RE::Actor>()) {
 				return "mouseover = " + UnitTable(a_player, actor);
 			}
-			const std::string name = ref->GetDisplayFullName();
+			// Its name as plain text: Scaleform markup (a quest diamond) is stripped as its activation prompt's is.
+			const std::string name = NativeText::Activation(ref->GetDisplayFullName());
 			if (name.empty()) {
 				return "mouseover = false";
 			}
@@ -375,7 +486,7 @@ namespace Bridge
 			}
 			const float hours = RE::Calendar::GetSingleton() ? RE::Calendar::GetSingleton()->GetHour() : 12.0f;
 			const int   h = static_cast<int>(hours) % 24, m = static_cast<int>((hours - std::floor(hours)) * 60.0f);
-			// Her septims as WoW money, 1 septim = 1 gold (the user's choice), in copper as GetMoney answers.
+			// Their septims as WoW money, 1 septim = 1 gold (the user's choice), in copper as GetMoney answers.
 			const auto money = std::min<std::int64_t>(std::int64_t{ a_player->GetGoldAmount() } * 10000, INT32_MAX);
 			return std::format("world = {{ zone = {}, subzone = {}, hour = {}, minute = {}, money = {} }}", LuaQuote(zone),
 				LuaQuote(subzone == zone ? "" : subzone), h, m, std::max<std::int64_t>(money, 0));
@@ -437,6 +548,128 @@ namespace Bridge
 				p.x/kUnitsPerYard,p.y/kUnitsPerYard,player->GetHeading(false),interior?"true":"false",pois);
 		}
 
+		// Indoors the client shows its building's floor plan; a Skyrim interior's walkable floor (its navmesh) stands in
+		// for it. Sent when their cell or its loaded navmesh changes; an empty plan outdoors.
+		void PublishFloor(const RE::TESObjectCELL* a_cell)
+		{
+			static RE::FormID  sentCell = 0;
+			static std::size_t sentTriangles = 0;
+			auto* meshes = a_cell && a_cell->IsInteriorCell() ? a_cell->GetRuntimeData().navMeshes : nullptr;
+			std::size_t triangles = 0;
+			if (meshes) for (const auto& mesh : meshes->navMeshes) triangles += mesh ? mesh->triangles.size() : 0;
+			const RE::FormID cell = meshes ? a_cell->GetFormID() : 0;
+			if (cell == sentCell && triangles == sentTriangles) return;
+			sentCell = cell, sentTriangles = triangles;
+			std::vector<wowcore::MinimapFloorTriangle> floor;
+			floor.reserve(triangles);
+			if (meshes) for (const auto& mesh : meshes->navMeshes) {
+				if (!mesh) continue;
+				const auto& v = mesh->vertices;
+				for (const auto& t : mesh->triangles) {
+					using Flag = RE::BSNavmeshTriangle::TriangleFlag;
+					if (t.triangleFlags.any(Flag::kDeleted) || t.vertices[0] >= v.size() || t.vertices[1] >= v.size() || t.vertices[2] >= v.size()) continue;
+					const auto& a = v[t.vertices[0]].location; const auto& b = v[t.vertices[1]].location; const auto& c = v[t.vertices[2]].location;
+					const float low = std::min({ a.z, b.z, c.z }), high = std::max({ a.z, b.z, c.z });
+					wowcore::MinimapFloorTriangle f{ { a.x / kUnitsPerYard, a.y / kUnitsPerYard }, { b.x / kUnitsPerYard, b.y / kUnitsPerYard },
+						{ c.x / kUnitsPerYard, c.y / kUnitsPerYard }, (low + high) / 2 / kUnitsPerYard };
+					f.rise = (high - low) / 2 / kUnitsPerYard;
+					// A wall: no floor across the edge, in this navmesh or a linked one.
+					for (int e = 0; e < 3; ++e) {
+						if (t.triangles[e] == 0xFFFF && !t.triangleFlags.any(static_cast<Flag>(1 << e))) f.walls |= 1u << e;
+					}
+					floor.push_back(f);
+				}
+			}
+			WowUi::SetMinimapFloor(std::move(floor));
+		}
+
+		// A text emote (DoEmote: /dance, /wave, /spit): their own line in chat, as the server tells the client, their race and
+		// sex's voice, and its animation - once, or a state the player keeps until the player moves (dancing, sitting, kneeling).
+		bool g_emoteHeld = false;
+		void Emote(RE::PlayerCharacter* a_player, const std::string& a_token)
+		{
+			const auto looks = Character::Looks();
+			const auto e = WowUi::EmoteText(a_token, looks.race, looks.sex);
+			if (!e) return;
+			auto* target = Target();
+			std::string text = e->alone;
+			if (target && target != a_player && !e->atTarget.empty()) {   // at their target, as the client's /wave does
+				text = e->atTarget;
+				if (const auto at = text.find("%s"); at != std::string::npos) text.replace(at, 2, target->GetDisplayFullName());
+			}
+			WowUi::Run(std::format("__WBFire('CHAT_MSG_TEXT_EMOTE',{},{})", LuaQuote(text), LuaQuote(Integration::PlayerName())));
+			if (e->sound) WowUi::PlaySound(e->sound);
+			Reactions::OnEmote(a_player, target, a_token);
+			// The client's stand states: down, then held (SitGroundDown/SitGround, SleepDown/Sleep, KneelStart/KneelLoop).
+			if (e->specProc == 1 && e->standState) {
+				const std::array<std::pair<int, int>, 3> states = { { { 96, 97 }, { 99, 100 }, { 114, 115 } } };
+				const int index = e->standState == 1 ? 0 : e->standState == 3 ? 1 : e->standState == 8 ? 2 : -1;
+				if (index >= 0) Avatar::ActThenLoop(states[index].first, states[index].second);
+				g_emoteHeld = index >= 0;
+			} else if (e->specProc == 1) {   // /stand
+				Avatar::StopActing(); g_emoteHeld = false;
+			} else if (e->anim) {
+				Avatar::Act(static_cast<std::int32_t>(e->anim), e->specProc == 2);
+				g_emoteHeld = e->specProc == 2;
+			}
+		}
+
+		// Moving, jumping or casting ends an emote the player holds, as in the client.
+		void EmoteEnds(RE::PlayerCharacter* a_player)
+		{
+			if (!g_emoteHeld) return;
+			const auto* controls = RE::PlayerControls::GetSingleton();
+			const bool moving = (controls && (controls->data.moveInputVec.Length() > 0.01f || controls->data.autoMove)) ||
+				a_player->IsInMidair() || Cast::Casting();
+			if (moving || Avatar::Acting() < 0) {
+				if (moving) Avatar::StopActing();
+				g_emoteHeld = false;
+			}
+		}
+
+		std::string TreasureBlips(RE::PlayerCharacter* player, std::uint32_t mask)
+		{
+			static std::vector<RE::FormID> containers, factions;
+			static double next = 0;
+			if (!mask) { containers.clear(); factions.clear(); next = 0; return {}; }
+			static std::set<RE::FormID> merchants;
+			if (Frame::Now() >= next) {
+				// Every 5 s (a hitch on a modded load: the whole form table): containers and merchants' chests kept
+				// from inside the one read lock; nothing looked up again per frame (review, October 16).
+				next = Frame::Now()+5; containers.clear(); factions.clear(); merchants.clear();
+				// As CompassLocations: never walk attached-cell arrays while the loader changes them.
+				const auto [forms, lock] = RE::TESForm::GetAllForms();
+				RE::BSReadLockGuard guard(lock.get());
+				if (forms) for (const auto& [id, form] : *forms) if (form) {
+					if (form->GetFormType() == RE::FormType::Reference) {
+						const auto* base = static_cast<RE::TESObjectREFR*>(form)->GetBaseObject();
+						if (base && base->As<RE::TESObjectCONT>()) containers.push_back(id);
+					} else if (form->GetFormType() == RE::FormType::Faction) {
+						if (const auto* ref = static_cast<RE::TESFaction*>(form)->vendorData.merchantContainer) merchants.insert(ref->GetFormID());
+					}
+				}
+			}
+			std::string blips;
+			const auto* here = player->GetParentCell(); const auto p = player->GetPosition();
+			for (const auto id : containers) {
+				auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+				auto* cell = ref ? ref->GetParentCell() : nullptr;
+				if (!ref || !cell || !cell->IsAttached() || !ref->Is3DLoaded() || ref->IsDeleted() || ref->IsDisabled() ||
+					ref->IsActivationBlocked() || merchants.contains(id) || ref->GetOwner() || cell->GetOwner()) continue;
+				if (here->IsInteriorCell() ? cell != here : cell->IsInteriorCell() || ref->GetWorldspace() != player->GetWorldspace()) continue;
+				const auto at = ref->GetPosition();
+				if (!std::isfinite(at.x) || !std::isfinite(at.y) || std::hypot(at.x-p.x,at.y-p.y) > 200.f*kUnitsPerYard) continue;
+				// Include lootable CONTs, including locked chests, urns, strongboxes and other treasure vessels. Reading
+				// without initialization preserves unopened leveled loot; emptied containers no longer have a blip.
+				const auto items = ref->GetInventory([](RE::TESBoundObject&) { return true; }, true);
+				if (std::ranges::none_of(items, [](const auto& item) { return item.first && item.second.first > 0; })) continue;
+				const auto* name = ref->GetDisplayFullName(); if (!name || !*name) continue;
+				blips += std::format("{{ guid = {}, name = {}, x = {:.6f}, y = {:.6f}, reaction = 4, resource = 6 }},",
+					id,LuaQuote(name),at.x/kUnitsPerYard,at.y/kUnitsPerYard);
+			}
+			return blips;
+		}
+
 		// Copy terrain identity, pose and compass targets on the main thread.
 		// Interiors retain directional POIs, but have no terrain or world-map coordinates.
 		std::string MinimapPart(RE::PlayerCharacter* a_player)
@@ -449,22 +682,27 @@ namespace Bridge
 				return "minimap = false";
 			}
 			const bool interior = cell->IsInteriorCell();
+			PublishFloor(cell);
 			for (int depth = 0; !interior && world->parentWorld && depth < 16 && world->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLODData); ++depth) {
 				world = world->parentWorld;
 			}
 			const auto p = a_player->GetPosition();
 			std::string parents;
-			auto* parent = interior ? nullptr : world->parentWorld;
+			// Only parents whose LOD the worldspace draws (PNAM use-LOD-data): the walled cities show Tamriel's
+			// terrain, Markarth, Blackreach and the cave worldspaces their own; the atlas builder applies the same rule.
+			const auto lodParent = [](RE::TESWorldSpace* w) {
+				return w && w->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLODData) ? w->parentWorld : nullptr; };
+			auto* parent = interior ? nullptr : lodParent(world);
 			for (int depth = 0; parent && parent != world && depth < 16; ++depth) {
 				parents += LuaQuote(parent->GetFormEditorID()) + ",";
-				parent = parent->parentWorld;
+				parent = lodParent(parent);
 			}
-			struct Candidate { RE::FormID id, quest; std::string kind, name; double bearing; int markerType=0; };
+			struct Candidate { RE::FormID id, quest; std::string kind, name; double bearing; int markerType=0; RE::NiPoint3 at{}; int icon=0; bool discovered=true; };
 			std::vector<Candidate> candidates;
 			std::string pois;
 			auto add = [&](RE::FormID id, const char* kind, const std::string& name, const RE::NiPoint3& at, int icon, bool discovered, RE::FormID quest = 0) {
 				if (name.empty() || !std::isfinite(at.x) || !std::isfinite(at.y)) return;
-				candidates.push_back({id,quest,kind,name,std::atan2(at.x-p.x,at.y-p.y)*180/std::numbers::pi});
+				candidates.push_back({id,quest,kind,name,std::atan2(at.x-p.x,at.y-p.y)*180/std::numbers::pi,0,at,icon,discovered});
 				pois += std::format("{{ guid = {}, kind = {}, name = {}, x = {:.6f}, y = {:.6f}, icon = {}, discovered = {}, quest = {} }},",
 					id, LuaQuote(kind), LuaQuote(name), at.x / kUnitsPerYard, at.y / kUnitsPerYard, icon, discovered ? "true" : "false", quest);
 			};
@@ -501,7 +739,7 @@ namespace Bridge
 				std::erase_if(candidates,[](const auto& c) { return c.kind=="location"; });
 				for (const auto& location:CompassLocations::Snapshot(a_player))
 					candidates.push_back({location.id,0,"location",location.name,
-						std::atan2(location.position.x-p.x,location.position.y-p.y)*180/std::numbers::pi,location.type});
+						std::atan2(location.position.x-p.x,location.position.y-p.y)*180/std::numbers::pi,location.type,location.position,LocationIcon(static_cast<RE::MARKER_TYPE>(location.type))});
 				// Names only: native HUD markers still determine which enemies appear.
 				if (std::ranges::any_of(compass["markers"],[](const auto& marker) { return marker.at("frame").template get<int>()==4; })) {
 					if (auto* lists=RE::ProcessLists::GetSingleton()) {
@@ -514,7 +752,7 @@ namespace Bridge
 								const auto at=Quests::CompassPosition(a_player,actor.get(),nullptr);
 								const std::string name=actor->GetDisplayFullName();
 								if (at && !name.empty()) candidates.push_back({actor->GetFormID(),0,"enemy",name,
-									std::atan2(at->x-p.x,at->y-p.y)*180/std::numbers::pi});
+									std::atan2(at->x-p.x,at->y-p.y)*180/std::numbers::pi,0,*at});
 							}
 					}
 				}
@@ -523,24 +761,29 @@ namespace Bridge
 					const int frame=marker["frame"]; const double bearing=marker["bearing"];
 					const std::string kind=frame<=2 ? "quest" : frame==3 ? "custom" : frame==4 ? "enemy" : "location";
 					std::string name=frame==1 ? "Quest objective" : frame==2 ? "Quest destination (door)" : frame==3 ? "Custom map marker" : frame==4 ? "Enemy" : "Location";
-					RE::FormID id=0,quest=0; double nearest=3;
+					RE::FormID id=0,quest=0; double nearest=3; const Candidate* matched=nullptr;
 					for (const auto& candidate : candidates) if (candidate.kind==kind &&
 						(kind!="location" || frame==4+candidate.markerType || frame==71+candidate.markerType)) {
 						const double delta=std::abs(std::remainder(candidate.bearing-bearing,360.0));
-						if (delta<nearest) { nearest=delta; name=candidate.name; id=candidate.id; quest=candidate.quest; }
+						if (delta<nearest) { nearest=delta; name=candidate.name; id=candidate.id; quest=candidate.quest; matched=&candidate; }
 					}
 					const double radians=bearing*std::numbers::pi/180;
-					// A native compass marker is a bearing, independent of map zoom.
-					pois+=std::format("{{ guid={}, quest={}, kind={}, name={}, x={:.6f}, y={:.6f}, native={}, opacity={:.6f}, scale={:.6f} }},",
-						id,quest,LuaQuote(kind),LuaQuote(name),p.x/kUnitsPerYard+std::sin(radians)*1e6,p.y/kUnitsPerYard+std::cos(radians)*1e6,
-						frame,marker["opacity"].get<double>(),marker["scale"].get<double>());
+					// A native compass marker is a bearing, independent of map zoom; a matched candidate also carries its
+					// real position and WoW icon so the renderer can place it as 1.12 would (undiscovered: frames 71+).
+					const auto at=matched ? RE::NiPoint3{matched->at.x/kUnitsPerYard,matched->at.y/kUnitsPerYard,0} :
+						RE::NiPoint3{float(p.x/kUnitsPerYard+std::sin(radians)*1e6),float(p.y/kUnitsPerYard+std::cos(radians)*1e6),0};
+					pois+=std::format("{{ guid={}, quest={}, kind={}, name={}, x={:.6f}, y={:.6f}, bearing={:.6f}, placed={}, icon={}, discovered={}, native={}, opacity={:.6f}, scale={:.6f} }},",
+						id,quest,LuaQuote(kind),LuaQuote(name),at.x,at.y,bearing,matched ? "true" : "false",matched ? matched->icon : 0,
+						matched && (kind!="location" || frame<71) ? "true" : "false",frame,marker["opacity"].get<double>(),marker["scale"].get<double>());
 				}
 			}
 			std::string blips;
-			const auto mask = interior ? 0u : Cast::TrackingMask();
-			if (mask) {
+			const auto mask = interior ? 0u : g_scanActive ? 0x1FFu : Cast::TrackingMask();
+			const auto resources = Cast::ResourceTrackingMask();
+			blips += TreasureBlips(a_player, resources);
+			if (mask && RE::ProcessLists::GetSingleton()) {
 				// Every loaded actor, whatever its process level (walking all attached references each frame raced the
-				// loader threads' cell changes and crashed a cow). Not restricted to her target, hostility, camera or sight.
+				// loader threads' cell changes and crashed a cow). Not restricted to their target, hostility, camera or sight.
 				auto* lists = RE::ProcessLists::GetSingleton();
 				auto  each = [&](auto&& a_visit) {
 					for (auto* handles : { &lists->highActorHandles, &lists->middleHighActorHandles, &lists->middleLowActorHandles, &lists->lowActorHandles }) {
@@ -561,14 +804,15 @@ namespace Bridge
 					if (type == std::end(types) || !(mask & (1u << (type - std::begin(types))))) return;
 					const auto at = actor->GetPosition();
 					if (std::hypot(at.x - p.x, at.y - p.y) <= 200.0f * kUnitsPerYard) {
+						if (g_scanActive) g_scanActors.insert(actor->GetFormID());
 						blips += std::format("{{ guid = {}, name = {}, x = {:.6f}, y = {:.6f}, reaction = {} }},",
 							actor->GetFormID(), LuaQuote(actor->GetDisplayFullName()), at.x / kUnitsPerYard, at.y / kUnitsPerYard, Reaction(actor));
 					}
 				});
 			}
-			return std::format("minimap = {{ worldspace = {}, parents = {{ {} }}, x = {:.6f}, y = {:.6f}, heading = {:.6f}, trackingMask = {}, blips = {{ {} }}, pois = {{ {} }}, compass = {} }}",
+			return std::format("minimap = {{ worldspace = {}, parents = {{ {} }}, x = {:.6f}, y = {:.6f}, z = {:.6f}, heading = {:.6f}, trackingMask = {}, resourceTrackingMask = {}, blips = {{ {} }}, pois = {{ {} }}, compass = {} }}",
 				LuaQuote(interior ? std::format("interior:{:08X}", cell->GetFormID()) : std::string(world->GetFormEditorID())),
-				parents, p.x / kUnitsPerYard, p.y / kUnitsPerYard, a_player->GetHeading(false), mask, blips, pois, nativeCompass ? "true" : "false");
+				parents, p.x / kUnitsPerYard, p.y / kUnitsPerYard, p.z / kUnitsPerYard, a_player->GetHeading(false), resources ? 0x10000u | resources : mask, resources, blips, pois, nativeCompass ? "true" : "false");
 		}
 
 		// Tab targeting: the units in front of you, nearest first, in sight and within 40 yards; each press takes the
@@ -616,7 +860,7 @@ namespace Bridge
 				SetTarget(nullptr);
 			} else if (a_name == "AttackTarget") {
 				Melee::Start(Target());
-			} else if (a_name == "ToggleSheath") {   // her weapon, not Skyrim's: she draws and sheathes as the client does
+			} else if (a_name == "ToggleSheath") {   // their weapon, not Skyrim's: the player draws and sheathes as the client does
 				Avatar::SetWeaponsDrawn(!Avatar::WeaponsDrawn(), true);
 			} else if (a_name == "TargetUnit") {
 				if (arg(0) == "player") {
@@ -682,7 +926,7 @@ namespace Bridge
 			}
 			static std::set<std::pair<std::uint32_t, std::string>> shown;
 			std::set<std::pair<std::uint32_t, std::string>>        now;
-			std::vector<std::pair<std::string, std::string>>         said;
+			std::vector<std::pair<RE::NiPointer<RE::TESObjectREFR>, std::string>> said;
 			{
 				RE::BSSpinLockGuard guard(subtitles->lock);
 				for (const auto& s : subtitles->subtitles) {
@@ -694,19 +938,20 @@ namespace Bridge
 					const auto key = std::make_pair(s.speaker.native_handle(), text);
 					now.insert(key);
 					if (!shown.contains(key)) {
-						said.emplace_back(speaker->GetDisplayFullName(), text);
+						said.emplace_back(speaker, text);
 					}
 				}
 			}
 			shown = std::move(now);
 			for (const auto& [who, text] : said) {
-				WowUi::Run(std::format("__WBSay({}, {})", LuaQuote(who), LuaQuote(text)));
+				Say(who.get(), text);
 			}
 		}
 
-		// A fall as the client's server takes it (Player::HandleFall): from where she left the ground to where she lands,
-		// in yards; 14.57 and more costs 0.018 x drop - 0.2426 of her health (20 yards 12%, 69 all of it), water none.
-		// Skyrim's own fall damage for her is off (fJumpFallHeightMin): a drop from a roof had killed her.
+		// A fall as the client's server takes it (Player::HandleFall): from where the player left the ground to where the player lands,
+		// in yards; 14.57 and more costs 0.018 x (drop - safe fall) - 0.2426 of their health (20 yards 12%, 69 all of it),
+		// water none. Safe fall (SPELL_AURA_SAFE_FALL) is Feline Grace's 17 yards, in Cat Form only (its ShapeshiftMask).
+		// Skyrim's own fall damage for the player is off (fJumpFallHeightMin): a drop from a roof had killed the player.
 		RE::Setting* g_fallSetting = nullptr;
 		std::optional<float> g_nativeFallHeight;
 		bool g_fallAirborne = false;
@@ -727,7 +972,8 @@ namespace Bridge
 			}
 			if (!inAir && g_fallAirborne && !a_player->IsDead() && !a_player->AsActorState()->IsSwimming()) {
 				const float drop = (g_fallFromZ - a_player->GetPositionZ()) / kUnitsPerYard;
-				const float share = drop >= 14.57f ? 0.018f * drop - 0.2426f : 0.0f;
+				const float safeFall = Forms::Current() == "cat" && Progression::Knows(20719) ? 17.0f : 0.0f;
+				const float share = drop >= 14.57f ? 0.018f * (drop - safeFall) - 0.2426f : 0.0f;
 				if (share > 0.0f) {
 					const float hpMax = Maximum(a_player, RE::ActorValue::kHealth);
 					const float damage = std::min(share * hpMax, hpMax);
@@ -774,7 +1020,7 @@ namespace Bridge
 
 		// What a reference under the pointer offers, as the client's cursor says it: attack a hostile unit, speak to a
 		// person, loot a corpse, pick up an item, gather a plant, use anything else that can be used; with Alt held, attack
-		// anything she may strike (the user's scheme: right click is Skyrim's E, Alt+right click attacks). "" for nothing.
+		// anything the player may strike (the user's scheme: right click is Skyrim's E, Alt+right click attacks). "" for nothing.
 		const char* Offer(RE::TESObjectREFR* a_ref, bool a_alt)
 		{
 			if (!a_ref || a_ref->IsDeleted() || a_ref->IsDisabled() || a_ref->IsPlayerRef()) return "";
@@ -1071,7 +1317,7 @@ namespace Bridge
 
 		// Skyrim HUD elements the WoW HUD replaces (docs: plan "Skyrim's native health/magicka/stamina bars, crosshair,
 		// activation prompt and enemy bar are hidden"), by their instance names in HUDMovieBaseInstance. The minimap
-		// now replaces compass POIs. SkyrimSpells::Cooldowns publishes GetVoiceRecoveryTime to her WoW bars;
+		// now replaces compass POIs. SkyrimSpells::Cooldowns publishes GetVoiceRecoveryTime to their WoW bars;
 		// messages, subtitles, quest updates and the sneak eye stay (they are separate root children).
 		// Re-applied every frame: the HUD's own scripts show some of them again (the crosshair on every activation).
 		constexpr const char* kHidden[] = {
@@ -1110,7 +1356,11 @@ namespace Bridge
 
 	void IntegrationChanged(bool active)
 	{
-		if (active) return;
+		if (active) {
+			// Their Show Helm / Show Cloak again: their interface may have started, and sent them, while it was off.
+			WowUi::Run("if __WBShowGear then __WBShowGear() end if __WBAreaFriendly then __WBAreaFriendly() end");
+			return;
+		}
 		CompassMarkers::Update(false);
 		if (g_fallSetting && g_nativeFallHeight) g_fallSetting->data.f = *g_nativeFallHeight;
 		g_nativeFallHeight.reset();
@@ -1144,11 +1394,19 @@ namespace Bridge
 		return a_actor->IsPlayerTeammate() || a_actor->HasKeywordString("ActorTypeNPC") ? 5 : 4;
 	}
 
-	bool Attackable(RE::Actor* a_actor) { return a_actor && a_actor != RE::PlayerCharacter::GetSingleton(); }
+	bool Attackable(RE::Actor* a_actor) { return a_actor && a_actor != RE::PlayerCharacter::GetSingleton() && !Cast::Unattackable(a_actor); }
 	void OpenSkyrimMenu(const std::string& a_name) { OpenMenu(a_name); }
 	RE::NiPoint3 HoldTarget() { return g_holdTarget; }
 	bool         Holding() { return static_cast<bool>(g_held); }
-	const char* CreatureTypeName(RE::Actor* a_actor) { return CreatureType(a_actor); }
+	const char* CreatureTypeName(RE::Actor* a_actor)
+	{
+		// Vampires and Dremora can also be Skyrim NPCs; the Paladin's creature gates need their Undead/Demon type.
+		if (a_actor && Character::Get().classId == 2) {
+			if (a_actor->HasKeywordString("ActorTypeUndead")) return "Undead";
+			if (a_actor->HasKeywordString("ActorTypeDaedra")) return "Demon";
+		}
+		return CreatureType(a_actor);
+	}
 
 	bool Healable(RE::Actor* a_actor) { return a_actor && Reaction(a_actor) != 2; }
 
@@ -1173,7 +1431,16 @@ namespace Bridge
 		g_last.clear();
 		// Run tasks follow the latest snapshot on the render thread. A delayed
 		// invalidation must not clear a newer world's already published actors.
-		WowUi::Run(std::format("if not __WB.nameplates or (__WB.nameplates.epoch or 0)<{0} then __WBNameplates({{epoch={0},units={{}}}}) end", g_plateEpoch));
+		WowUi::Run(std::format("if not __WB.nameplates or (__WB.nameplates.epoch or 0)<{0} then __WBNameplates({{epoch={0},units={{}}}}) end "
+			"if __WBClearChatBubbles then __WBClearChatBubbles() end", g_plateEpoch));
+	}
+
+	void Say(RE::TESObjectREFR* a_speaker, std::string_view a_text)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!a_speaker || !player || a_text.empty()) return;
+		WowUi::Run(std::format("__WBSay({}, {}, {}, {:.2f})", LuaQuote(a_speaker->GetDisplayFullName()), LuaQuote(a_text),
+			a_speaker->GetFormID(), player->GetPosition().GetDistance(a_speaker->GetPosition()) / kUnitsPerYard));
 	}
 
 	RE::Actor* PartyMember(std::size_t a_index)
@@ -1193,7 +1460,7 @@ namespace Bridge
 		g_targetSelf = a_actor && a_actor->IsPlayerRef();
 		g_target = a_actor && !g_targetSelf ? a_actor->CreateRefHandle() : RE::ActorHandle{};
 		if (Target() != before) {
-			Portrait::Capture(g_targetSelf ? nullptr : a_actor);   // the face for the target frame (hers is drawn already)
+			Portrait::Capture(g_targetSelf ? nullptr : a_actor);   // the face for the target frame (theirs is drawn already)
 			// Auto-attack follows a new hostile target, as the client's does; anything else stops it.
 			if (Melee::Attacking()) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1205,6 +1472,24 @@ namespace Bridge
 			}
 		}
 	}
+
+    void StartNPCScanCost(const nlohmann::json& site)
+    {
+        g_scanSite=site;
+        if (!g_scanSite.contains("position")) {
+            // The original Whiterun cow grid remains the explicit missing-reference fallback.
+            g_scanSite["world"]=0x1A26F;
+            g_scanSite["position"]={26624.f,-6144.f,-3392.f};
+        }
+        g_scanActive=true; g_scanMeasuring=false; g_scanValid=true;
+        g_scanFrames=0; g_scanSum=0; g_scanMax=0; g_scanActorSum=0;
+        g_scanActorMin=SIZE_MAX; g_scanActorMax=0;
+        g_scanIssued=std::chrono::steady_clock::now();
+        g_scanResult={{"active",true},{"done",false},{"site",g_scanSite},{"budget_mean_ms",kScanBudgetMs}};
+    }
+
+    nlohmann::json NPCScanCost() { return g_scanResult; }
+    void CancelNPCScanCost() { if (g_scanActive) FinishNPCScanCost("cancelled (load/new game or explicit stop)"); }
 
 	void Tick()
 	{
@@ -1218,7 +1503,11 @@ namespace Bridge
 			return;
 		}
 		if (auto* ui = RE::UI::GetSingleton(); !ui || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) return;
-		const auto nameplates = NameplatePart(player); // refresh click eligibility before draining UI commands
+		const bool scanFrame=g_scanActive;
+        const auto scanStart=scanFrame ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (scanFrame) g_scanActors.clear();
+        const auto nameplates = NameplatePart(player); // refresh click eligibility before draining UI commands
+        const double plateMs=scanFrame ? std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-scanStart).count() : 0;
 		RefreshParty();
 		// WoW cursor control in play; a self-test run drives cursor mode itself.
 		if (!Input::CursorMode() && Config::Get().cursor && !Config::Get().autorun) {
@@ -1232,7 +1521,7 @@ namespace Bridge
 				// useAction(slot, spell, onSelf) / castSpell(spell)
 				const auto id = std::strtoll(arg(c.name == "useAction" ? 1 : 0).c_str(), nullptr, 10);
 				const auto spell = static_cast<std::uint32_t>(std::max<long long>(id, 0));
-				if (SkyrimSpells::Use(id)) {   // her Skyrim spells, shouts and powers (below 0)
+				if (SkyrimSpells::Use(id)) {   // their Skyrim spells, shouts and powers (below 0)
 				} else if (spell == 6603) {
 					Melee::Toggle(Target());   // the Attack action
 				} else if (spell) {
@@ -1246,14 +1535,14 @@ namespace Bridge
 				if (epoch == g_plateEpoch) if (const auto found = g_plateActors.find(id); found != g_plateActors.end()) {
 					if (const auto actor = found->second.get(); actor && !actor->IsDead() && !actor->IsDisabled() && !actor->IsDeleted()) SetTarget(actor.get());
 				}
-			} else if (c.name == "cancelAura") {   // a right click on one of her buffs: a helpful one comes off
+			} else if (c.name == "cancelAura") {   // a right click on one of their buffs: a helpful one comes off
 				const auto id = static_cast<std::uint32_t>(std::strtoul(arg(0).c_str(), nullptr, 10));
 				if (arg(1) == "1") {
 					SkyrimAuras::Cancel(id);
 				} else {
 					Cast::CancelAura(id);
 				}
-			} else if (c.name == "shapeshift") {   // the shapeshift bar: a form (its spell, which also leaves it), 0 back to her
+			} else if (c.name == "shapeshift") {   // the shapeshift bar: a form (its spell, which also leaves it), 0 back to the player
 				const int  index = std::atoi(arg(0).c_str());
 				const auto& current = Forms::Current();
 				const std::uint32_t now = current == "dire_bear" ? 9634 : current == "bear" ? 5487 : current == "aquatic" ? 1066 :
@@ -1266,6 +1555,8 @@ namespace Bridge
 				Progression::LearnTalent(std::atoi(arg(0).c_str()), std::atoi(arg(1).c_str()));
 			} else if (c.name == "requestTalents") {
 				Progression::RefreshTalents();
+			} else if (c.name == "talentWipe") {   // CONFIRM_TALENT_WIPE accepted: its offer's session and the price shown
+				Progression::ConfirmTalentWipe(static_cast<std::uint32_t>(std::strtoul(arg(0).c_str(), nullptr, 10)), std::atoi(arg(1).c_str()));
 			} else if (c.name == "levelUp") {
 				SpellVisuals::Play(SpellVisuals::kLevelUp, SpellVisuals::Kit::Impact, {}, false);
 			} else if (c.name == "stopCasting") {
@@ -1273,6 +1564,27 @@ namespace Bridge
 				Cast::Stop();
 			} else if (c.name == "stopTargeting") {
 				Cast::CancelPlacing();
+			} else if (c.name == "emote") {
+				Emote(player, arg(0));
+			} else if (c.name == "areaFriendly") {   // Interface Options' Area Spells Hit Friendly
+				Cast::SetAreaFriendly(arg(0) == "1");
+			} else if (c.name == "showGear") {   // Show Helm, Show Cloak (Interface Options): 1 shown, 0 hidden
+				Character::SetShown(arg(0) != "0", arg(1) != "0");
+			} else if (c.name == "appearance") {   // the customization window's Accept (race, sex, skin, face, hair style and colour,
+				const auto n = [&](std::size_t i) { return static_cast<std::uint32_t>(std::strtoul(arg(i).c_str(), nullptr, 10)); };
+				if (c.args.empty()) {          // facial hair), or its Cancel (nothing)
+					Character::KeepLooks();
+				} else if (c.args.size() != 7 || !Character::SetLooks({ n(0), n(1), n(2), n(3), n(4), n(5), n(6) })) {
+					logger::warn("bridge: appearance {} {} {} {} {} {} {} refused", n(0), n(1), n(2), n(3), n(4), n(5), n(6));
+				}
+			} else if (c.name == "chat") {   // SendChatMessage: what the player says, yells or emotes, as the server echoes it back
+				std::string type = arg(1).empty() ? "SAY" : arg(1);
+				std::ranges::transform(type, type.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+				if ((type == "SAY" || type == "YELL" || type == "EMOTE") && !arg(0).empty()) {
+					WowUi::Run(std::format("__WBFire({},{},{},GetDefaultLanguage('player'))", LuaQuote("CHAT_MSG_" + type), LuaQuote(arg(0)),
+						LuaQuote(Integration::PlayerName())));
+					if (type != "EMOTE") Reactions::OnChat(player, Target(), arg(0));   // a spoken greeting is answered
+				}
 			} else if (c.name == "testCommand") {
 				Console::Command(arg(0),arg(1),arg(2));
 			} else if (c.name == "menu") {
@@ -1286,6 +1598,8 @@ namespace Bridge
 		Input::UpdateRunByButtons();
 		HoldUnderPointer(player);
 		FallDamage(player);
+		EmoteEnds(player);
+		Reactions::Tick();
 		Subtitles();
 		if (static bool held = false; static_cast<bool>(g_held) != held) {
 			held = !held;
@@ -1298,7 +1612,10 @@ namespace Bridge
 		Portrait::Update();
 		Avatar::Tick();
 		HideSkyrimHud();
-		std::string snapshot = "{ " + PlayerPart(player) + ", " + PartyPart(player) + ", " + TargetPart(player) + ", " + MouseoverPart(player) + ", " + WorldPart(player) + ", " + MinimapPart(player) + ", " + WorldMapPart(player) + ", " + nameplates + ", comboPoints=" + std::to_string(Forms::ComboPoints()) + " }";
+        const auto mapStart=scanFrame ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto minimap=MinimapPart(player);
+        if (scanFrame && g_scanActive) SampleNPCScanCost(player,plateMs+std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-mapStart).count());
+		std::string snapshot = "{ " + PlayerPart(player) + ", " + PartyPart(player) + ", " + TargetPart(player) + ", " + MouseoverPart(player) + ", " + WorldPart(player) + ", " + minimap + ", " + WorldMapPart(player) + ", " + nameplates + ", " + HeadPart(player) + ", comboPoints=" + std::to_string(Forms::ComboPoints()) + " }";
 		if (snapshot != g_last) {
 			g_last = snapshot;
 			WowUi::Publish(std::move(snapshot));

@@ -15,6 +15,7 @@ TALENT_FORM_SPELLS = {24858: 'moonkin'}
 TALENT_ABILITIES = {16979}
 DISPLAY = {'cat': 892, 'travel': 632, 'aquatic': 2428, 'bear': 2281, 'dire_bear': 2281}
 DISPLAY['moonkin'] = 15374
+TAUREN_DISPLAY = {**DISPLAY, 'cat': 8571, 'bear': 2289, 'dire_bear': 2289, 'moonkin': 15375}
 LINKED = {'none': (), 'cat': (3025,), 'bear': (1178, 21178), 'dire_bear': (9635, 21178),
           'travel': (5419,), 'aquatic': (5421,)}
 LINKED['moonkin'] = (24905,)
@@ -24,6 +25,8 @@ ABILITIES = {9881, 9908, 6795, 9898, 8983, 5229, 22896, 9850, 9830, 9904, 9896,
 
 def ability(cat, sid):
     """Identify mechanics by progression chain; read values from the cast rank."""
+    if sid == 20549:
+        return sid   # racial dispatch shares this route, but is not a class feral ability
     chain = cat.chain(sid)
     return next((anchor for anchor in ABILITIES | TALENT_ABILITIES | {5209} if cat.chain(anchor) == chain), None)
 
@@ -115,9 +118,9 @@ def profile(cat, ch):
         return sum(v for s, e, v in effects if s[f'EffectApplyAuraName{e}'] == aura)
     w = ch.melee_weapon()
     low, high = ch.weapon_damage_range()
-    return {'form': ch.form, 'power': 'energy' if ch.form == 'cat' else
+    out = {'form': ch.form, 'power': 'energy' if ch.form == 'cat' else
             ('rage' if ch.form in ('bear', 'dire_bear') else 'mana'),
-            'display_id': DISPLAY.get(ch.form), 'attack_speed_ms': w['delay'],
+            'display_id': (TAUREN_DISPLAY if ch.race == 6 else DISPLAY).get(ch.form), 'attack_speed_ms': w['delay'],
             'weapon_damage': {'min': w['min'], 'max': w['max']},
             'damage': {'min': low, 'max': high}, 'attack_power': ch.attack_power(),
             'attack_power_bonus': total(99) + (ch.stats['agi'] if ch.form == 'cat' else 0),
@@ -135,6 +138,35 @@ def profile(cat, ch):
                                     'radius_yd': cat.radius_yd(cat.spell(24932), 1)}
                                    if 17007 in ch.talent_spells and ch.form in ('cat', 'bear', 'dire_bear') else None),
             'linked_spells': list(LINKED[ch.form])}
+    if ch.native_mode:
+        out['skyrim_armor_percent'] = native_armor_percent(cat, ch)
+    return out
+
+
+def native_armor_percent(cat, ch, form=None):
+    """Replace only the form multiplier, retaining multiplicative Thick Hide."""
+    from service.skyrim_balance import FORM_ARMOR_PERCENT
+    form_bonus = sum(v for s, e, v in boosts(cat, ch, ch.form) if s[f'EffectApplyAuraName{e}'] == 142)
+    combined = ch.multiplier(142, 1) if ch.talent_mode else 1 + form_bonus / 100
+    form = ch.form if form is None else form
+    target_bonus = sum(v for s, e, v in boosts(cat, ch, form) if s[f'EffectApplyAuraName{e}'] == 142)
+    return round((combined / (1 + form_bonus / 100) *
+                  (1 + FORM_ARMOR_PERCENT.get(form, target_bonus) / 100) - 1) * 100, 8)
+
+
+def floor_base(ch, s, e, raw, completed, cp=0):
+    """Interpolate only the unmodified rank roll; all bonus additions stay full size."""
+    reference = ch.feral_base_references.get(s['Id'])
+    if reference is None:
+        return completed
+    from service.skyrim_balance import FERAL_BASE_FLOOR
+    top = F.effect_value(reference, e, 60, None, maximum=True)
+    top += int(reference.get(f'EffectPointsPerComboPoint{e}', 0) * cp)
+    maximum = F.effect_value(s, e, ch.level, None, maximum=True)
+    maximum += int(s.get(f'EffectPointsPerComboPoint{e}', 0) * cp)
+    # Scale the rolled base's range proportionally, as caster rank budgets do.
+    # Maximum rank at level 60 keeps its original rolls exactly.
+    return completed + raw * FERAL_BASE_FLOOR * max(0, top / maximum - 1) if maximum > 0 else completed
 
 
 def _aura(cat, ch, s, e, **fields):
@@ -146,26 +178,30 @@ def _aura(cat, ch, s, e, **fields):
     return out
 
 
-def _value(s, ch, e, rng, cp=0):
+def _value(s, ch, e, rng, cp=0, *, raw=False, native_floor=False):
     # Object.cpp:CalculateSpellEffectValue: combo contribution precedes ALL_EFFECTS mods.
     value = F.effect_value(s, e, ch.level, rng) + int(s.get(f'EffectPointsPerComboPoint{e}', 0) * cp)
-    return int(F.apply_spell_mod(s, F.SPELLMOD_ALL_EFFECTS, value, ch.mods, eff=e))
+    completed = int(F.apply_spell_mod(s, F.SPELLMOD_ALL_EFFECTS, value, ch.mods, eff=e))
+    if native_floor:
+        completed = floor_base(ch, s, e, value, completed, cp)
+    return (completed, value) if raw else completed
 
 
-def _bonus(ch, s, e, base, dot=False):
+def _bonus(ch, s, e, base, dot=False, raw_base=None, cp=0):
     # Unit.cpp:MeleeDamageBonusDone/SpellBonusWithCoeffs; feral uses physical
     # flat damage, not caster spell power. AP coefficient is independent of it.
     value = F.bonus_with_coeffs(s, e, base, ch.total(13, 1), ch.mods)
     value += int(ch.attack_power() * s.get(f'EffectBonusCoefficientFromAP{e}', 0))
     value *= ch.multiplier(79, 1)
-    return max(0, int(F.apply_spell_mod(s, F.SPELLMOD_DOT if dot else F.SPELLMOD_DAMAGE, value, ch.mods)))
+    completed = max(0, int(F.apply_spell_mod(s, F.SPELLMOD_DOT if dot else F.SPELLMOD_DAMAGE, value, ch.mods)))
+    return floor_base(ch, s, e, raw_base, completed, cp) if raw_base is not None else completed
 
 
 def _bleed(cat, ch, s, e, rng, cp):
-    base = _value(s, ch, e, rng, cp)
+    base, raw = _value(s, ch, e, rng, cp, raw=True)
     if ability(cat, s['Id']) == 9896:  # SpellAuras.cpp:HandlePeriodicDamage: Rip AP capped at four CP.
         base += int(ch.attack_power() * min(cp, 4) / 100)
-    amount = _bonus(ch, s, e, base, dot=True)
+    amount = _bonus(ch, s, e, base, dot=True, raw_base=raw, cp=cp)
     a = _aura(cat, ch, s, e, type='damage', per_tick=amount, school=0, bleed=True)
     a['ticks'] = [{'t_ms': t, 'amount': amount, 'resisted': 0}
                   for t in range(a['amplitude_ms'], a['duration_ms'] + 1, a['amplitude_ms'])]
@@ -187,6 +223,9 @@ def _metadata(cat, ch, s):
 
 def resolve(cat, ch, req, executing_swing=False):
     s, caster = cat.spell(req['spell']), req.get('caster', {})
+    if s['Id'] == 20549:
+        from service.racials import resolve_stomp
+        return resolve_stomp(cat, ch, req)
     power, cp = state(caster)
     validate_form(s, caster)
     kind = ability(cat, s['Id'])
@@ -203,7 +242,8 @@ def resolve(cat, ch, req, executing_swing=False):
         changed = character.build(cat, ch.items, ch.level, auras=caster.get('auras', []),
                                   form='none' if leaving else form, race=ch.race, cls=ch.cls,
                                   talents=ch.talents if ch.talent_mode else None,
-                                  indoors=ch.indoors or req.get('ctx', {}).get('indoors', False))
+                                  indoors=ch.indoors or req.get('ctx', {}).get('indoors', False),
+                                  skyrim=ch.skyrim_skills if ch.native_mode else False)
         aura = _aura(cat, ch, s, 1, type='shapeshift', **profile(cat, changed))
         aura.update(action='leave' if leaving else 'enter', previous_form=ch.form,
                     removes=['root', 'removable_snare', 'water_walk'], clears_prowl=True,
@@ -250,16 +290,17 @@ def resolve(cat, ch, req, executing_swing=False):
         return result
     if kind == 9881 and not executing_swing:
         out.update(cost_deferred=True)
-        out['events'].append({'type': 'next_swing', 'spell': sid, 'bonus_damage': _value(s, ch, 1, rng)})
+        out['events'].append({'type': 'next_swing', 'spell': sid, 'bonus_damage': _value(s, ch, 1, rng, native_floor=True)})
         return out
     if kind == 5229:
         out['auras'].append(_aura(cat, ch, s, 1, type='periodic_power', power='rage',
                                   per_tick=_value(s, ch, 1, rng) / 10))
         trigger = linked_spell(cat, 25503)
-        # EffectDummy passes custom points for effect 1, but the current core's
-        # original_data row has its armor aura in effect 2. Preserve that row.
+        # SpellEffects.cpp EffectDummy casts 25503 with -27 (Dire Bear -16) as its first effect's custom points, but the
+        # armor aura is its second effect, so the core's custom value misses it and leaves the row's -26 for both forms.
+        # The client's tooltip and the core's intent agree on 27% / 16%: apply those to the armor aura.
         e = next(e for e in spells._effects(trigger) if trigger[f'EffectApplyAuraName{e}'] == 101)
-        amount = (-27 if ch.form == 'bear' else -16) if e == 1 else _value(trigger, ch, e, rng)
+        amount = -16 if ch.form == 'dire_bear' else -27
         out['auras'].append(_aura(cat, ch, trigger, e, type='armor_percent', amount=amount,
                                   school_mask=1, spell=25503))
         out['auras'].append(_aura(cat, ch, s, 3, type='interrupt_regen', power='rage', dummy_combat=True))
@@ -338,22 +379,27 @@ def resolve(cat, ch, req, executing_swing=False):
                     low, high = ch.weapon_damage_range()
                     percent = ch.multiplier(79, 1)
                     low, high = low / percent, high / percent
-                    base, multiplier = 0, 1
+                    base, multiplier, floor_delta = 0, 1, 0
                     for e in spells._effects(s):
                         if s[f'Effect{e}'] == 58:
-                            base += _value(s, ch, e, rng)
+                            value, raw = _value(s, ch, e, rng, raw=True)
+                            base += value
+                            floor_delta += floor_base(ch, s, e, raw, value) - value
                         elif s[f'Effect{e}'] == 31:
                             multiplier *= _value(s, ch, e, rng) / 100
                             base = int(base * multiplier)
-                    damage = (base + int(rng.randint(int(low), int(high)) * multiplier)) * percent
+                            floor_delta *= multiplier
+                    roll = rng.randint(int(low), int(high))
+                    damage = (base + int(roll * multiplier)) * percent
                     damage = max(0, int(F.apply_spell_mod(s, F.SPELLMOD_DAMAGE, damage, ch.mods)))
+                    damage += floor_delta + ch.feral_weapon_floor(roll, low, high) * multiplier
                 else:
-                    base = _value(s, ch, 1, rng, cp)
+                    base, raw = _value(s, ch, 1, rng, cp, raw=True)
                     if kind == 31018:
                         extra = power.get('energy', 0) - out['cost']
                         base += int(extra * s['DmgMultiplier1']) + int(ch.attack_power() * .03 * cp)
                         out.update(extra_power_cost=extra)
-                    damage = _bonus(ch, s, 1, base)
+                    damage = _bonus(ch, s, 1, base, raw_base=raw, cp=cp)
                 dest.append(melee.ability_damage(cat, ch, s, target, damage, rng))
                 if kind == 9904:
                     out['auras'].append(_bleed(cat, ch, s, 2, rng, cp))

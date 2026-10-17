@@ -13,6 +13,10 @@ ARMOR_DIVISORS = {1: 15, 2: 8, 3: 12, 4: 30}
 # detrimental (flag 0x4). Its positive magnitude subtracts armor; do not negate it again.
 ARMOR_BUFF, ARMOR_DEBUFF = 0xE5F55, 0x10319D
 MAGICKA_REGEN = STAT[6][0][0]  # 0x7A0FD EnchFortifyMagickaRateConstantSelf
+# Skyrim.esm Peak Value Modifiers EnchResistPoisonConstantSelf (primary AV 40 PoisonResist) and
+# EnchResistDiseaseConstantSelf (AV 45 ResistDisease). Skyrim's own immunity to poison and disease is 100 of each:
+# Hevnoraak's mask (ENCH 0x01729C EnchDragonPriestIron) carries exactly these two at magnitude 100.
+RESIST_POISON, RESIST_DISEASE, IMMUNE = 0x0FF15E, 0x100E60, 100
 
 
 def aura_effects(aura: dict) -> list[dict]:

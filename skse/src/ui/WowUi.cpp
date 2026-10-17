@@ -9,6 +9,7 @@
 
 #include "Audio.h"
 #include "Config.h"
+#include "Frame.h"
 #include "Bridge.h"
 #include "Bags.h"
 #include "Merchant.h"
@@ -149,6 +150,8 @@ namespace WowUi
 		std::vector<Click> g_clicks;
 		std::atomic<bool>  g_overUi = false;
 		std::string        g_worldCursor;   // from the main thread
+		std::optional<std::vector<wowcore::MinimapFloorTriangle>> g_floor;   // a new floor plan, until applied
+		std::vector<wowcore::MinimapFloorTriangle> g_lastFloor;   // the current one, for a new session (ReloadUI)
 		std::vector<std::function<void()>> g_tasks;   // main -> render, run in order before the next frame
 		std::vector<Command>     g_commands;    // render -> main
         UiProfile::State        g_profile; // main thread, persisted in the co-save
@@ -195,11 +198,11 @@ namespace WowUi
 
 		std::map<std::string, std::string> g_cvars;   // the ones changed: config-cache.wtf (render thread)
 
-		// Where her bar is kept between sessions; a self-test run keeps its own (it starts from the realm's bar).
+		// Where their bar is kept between sessions; a self-test run keeps its own (it starts from the realm's bar).
 		std::filesystem::path ActionsFile() { return Wtf(Config::Get().autorun ? "actions-test.lua" : "actions.lua", true); }
 		std::filesystem::path LayoutFile() { return Wtf(Config::Get().autorun ? "layout-cache-test.txt" : "layout-cache.txt", true); }
 
-		// Her action bar as Lua (__WB.actions), from the interface's own table: what the server keeps (character_action).
+		// Their action bar as Lua (__WB.actions), from the interface's own table: what the server keeps (character_action).
 		std::string ActionsLua(lua_State* a_lua)
 		{
 			std::string lua = "__WB.actions = {";
@@ -259,9 +262,26 @@ namespace WowUi
 			return Audio::Play(wav, a_sound.volume, a_sound.loop);
 		}
 
-		// A WoW sound by its SoundEntries name or by file (the interface's PlaySound / PlaySoundFile).
+		std::atomic<std::uint32_t> g_interfaceSounds = 0;
+
+		// A WoW sound by its SoundEntries name or by file (the interface's PlaySound / PlaySoundFile). One take per name
+		// per instant, as the client sounds: B shows five bags and each one's OnShow asks for igBackPackOpen, and five
+		// randomly picked takes at once sound like a pile of bags. An instant: the same frame (full bags can take longer
+		// than 50 ms to show) or 50 ms.
 		void PlayWowSound(std::string_view a_name, bool a_isFile)
 		{
+			static std::string   last;
+			static auto          lastAt = std::chrono::steady_clock::time_point{};
+			static std::uint64_t lastFrame = 0;
+			const auto           now = std::chrono::steady_clock::now();
+			const auto           frame = Frame::Count();
+			if (a_name == last && (frame == lastFrame || now - lastAt < std::chrono::milliseconds(50))) {
+				return;
+			}
+			last = a_name;
+			lastAt = now;
+			lastFrame = frame;
+			++g_interfaceSounds;
 			if (a_isFile) {
 				if (const auto wav = Samples(std::string(a_name))) {
 					Audio::Play(wav, 1.0f);
@@ -338,6 +358,10 @@ namespace WowUi
 				logger::error("wow ui: interface engine: {}", err);
 				return false;
 			}
+			{   // a new session (ReloadUI) gets the floor plan the player stands on again
+				std::lock_guard lock(g_exchange);
+				if (!g_floor && !g_lastFloor.empty()) g_floor = g_lastFloor;
+			}
 			ImGuiContext* previous = ImGui::GetCurrentContext();
 			ImGui::SetCurrentContext(g->ui->imguiContext());
 			const bool backend = ImGui_ImplDX11_Init(a_device, a_context);
@@ -385,7 +409,7 @@ namespace WowUi
 					Run(s, "__WBFire('PLAYER_LOGOUT')", 0, "=logout");
 					SaveWtf(s);
 					if (a_cmd == "reloadUI") g->reload = true;   // rebuild after this Lua call has returned
-				} else if (a_cmd == "actionChanged") {   // a spell put on or taken off her bar: kept for the next session
+				} else if (a_cmd == "actionChanged") {   // a spell put on or taken off their bar: kept for the next session
 					WriteText(ActionsFile(), ActionsLua(s));
 				} else if (a_cmd == "barToggles") {   // the extra action bars shown (Interface Options), as the client keeps them
 					std::string lua = "__WB.barToggles = {";
@@ -411,8 +435,9 @@ namespace WowUi
 					}
 				} else if (a_cmd == "useAction" || a_cmd == "castSpell" || a_cmd == "castSpellByName" || a_cmd == "stopCasting" ||
 						   a_cmd == "command" || a_cmd == "spellTargetUnit" || a_cmd == "menu" || a_cmd == "stopTargeting" ||
-						   a_cmd == "cancelAura" || a_cmd == "shapeshift" || a_cmd == "levelUp" || a_cmd == "learnTalent" || a_cmd == "requestTalents" ||
-						   a_cmd == "nameplateTarget" || a_cmd == "testCommand") {
+						   a_cmd == "cancelAura" || a_cmd == "shapeshift" || a_cmd == "levelUp" || a_cmd == "learnTalent" || a_cmd == "requestTalents" || a_cmd == "talentWipe" ||
+						   a_cmd == "nameplateTarget" || a_cmd == "testCommand" || a_cmd == "emote" || a_cmd == "chat" || a_cmd == "showGear" || a_cmd == "areaFriendly" ||
+						   a_cmd == "appearance") {
 					if (!Integration::Active()) return 0;
 					Command c{ a_cmd, {} };
 					for (int i = 2; i <= lua_gettop(s); ++i) {
@@ -433,16 +458,16 @@ namespace WowUi
 			if (!Run(L, state.text, state.size, "@slice_state.lua") || !Run(L, "__WBFixture('idle')", 0, "=fixture")) {
 				return false;
 			}
-			// Her action bar as she left it, else as the realm keeps it (character_action), not the recorded fixture's.
+			// Their action bar as the player left it, else as the realm keeps it (character_action), not the recorded fixture's.
 			if (const auto saved = ColdPersistence::DefaultUi(Config::Get().autorun,g_profileReload,Config::Get().testOnly) ? std::string() : ReadText(ActionsFile()); !saved.empty()) {
 				Run(L, saved.c_str(), saved.size(), "=actions");
 			} else {
-				if (!Character::Get().actions.empty()) {
+				if (Character::HasActions()) {   // under the sheet's lock: identity changes write it on the main thread
 					const auto bar = Character::ActionsLua();
 					Run(L, bar.c_str(), bar.size(), "=actions");
 				}
-				// The rest of her caster-form book where the realm's bar left room: the main bar's last slots, then the
-				// bottom left bar (actions 61-72, shown from the start). She moves them as she likes; that is kept.
+				// The rest of their caster-form book where the realm's bar left room: the main bar's last slots, then the
+				// bottom left bar (actions 61-72, shown from the start). The player moves them as the player likes; that is kept.
 				static constexpr std::pair<int, std::uint32_t> kBook[] = { { 8, 25298 }, { 9, 9858 }, { 10, 9885 }, { 11, 9910 },
 					{ 12, 22812 }, { 61, 9907 }, { 62, 18658 }, { 63, 29166 }, { 64, 9863 }, { 65, 21850 }, { 66, 20748 },
 					{ 67, 2782 }, { 68, 2893 }, { 69, 8946 }, { 70, 9901 } };
@@ -450,10 +475,13 @@ namespace WowUi
 				for (const auto& [slot, spell] : kBook) {
 					book += std::format(" if not a[{0}] and not on[{1}] then a[{0}] = {{ spell = {1} }} end", slot, spell);
 				}
-				book += " __WBDefaultFormActions()";   // her forms' pages: Attack first, then the form's abilities
+				book += " __WBDefaultFormActions()";   // their forms' pages: Attack first, then the form's abilities
 				Run(L, book.c_str(), book.size(), "=book");
 			}
-			// The extra action bars shown: as she left them, else the bottom left one (where the book's rest is).
+			// Their look and each sex's packaged one, for the customization window.
+			const auto looks = Character::AppearanceLua();
+			Run(L, looks.c_str(), looks.size(), "=appearance");
+			// The extra action bars shown: as the player left them, else the bottom left one (where the book's rest is).
 			if (const auto bars = ColdPersistence::DefaultUi(Config::Get().autorun,g_profileReload,Config::Get().testOnly) ? std::string() : ReadText(Wtf(Config::Get().autorun ? "bars-test.lua" : "bars.lua", true)); !bars.empty()) {
 				Run(L, bars.c_str(), bars.size(), "=bars");
 			} else {
@@ -594,6 +622,9 @@ namespace WowUi
 			task();
 		}
 		// Rendering reads only copied Lua pose/blips; no Skyrim traversal here.
+		if (auto floor = [] { std::lock_guard lock(g_exchange); return std::exchange(g_floor, std::nullopt); }()) {
+			g->ui->setMinimapFloor(std::move(*floor));
+		}
 		g->ui->applyLiveMinimap(&g->minimap);
 		// CharacterModelFrame uses the very same assembled look as the world renderer.
 		// A new session must receive it again, including ReloadUI.
@@ -601,7 +632,7 @@ namespace WowUi
 			g->ui->setPlayerLook(look->look, look->appearance, look->items); g->characterLook=look;
 		}
 
-		// Her face in the player's portraits (a live render, drawn as a disc by the widget renderer).
+		// Their face in the player's portraits (a live render, drawn as a disc by the widget renderer).
 		if (auto* portrait = WowModels::Portrait()) {
 			auto& widgets = g->ui->engine().widgets();
 			const auto face = reinterpret_cast<std::uint64_t>(portrait);
@@ -671,7 +702,7 @@ namespace WowUi
 			g->ui->pointer(x, y);
 			// A press no WoW frame took is a click in the world, as the client's: either button's on release, and only
 			// when it did not drag meanwhile (a left drag turns the camera, a right drag steers) and the two were not held
-			// together (both held run her forward).
+			// together (both held run the player forward).
 			static bool leftInWorld = false, rightInWorld = false, together = false;
 			const bool  pressL = b.left && !g_lastButtons.left, pressR = b.right && !g_lastButtons.right;
 			const bool  releaseL = !b.left && g_lastButtons.left, releaseR = !b.right && g_lastButtons.right;
@@ -881,6 +912,7 @@ namespace WowUi
 		}
 		f.known = true;
 		f.name = s->name;
+		f.rangeMin = s->rangeMin;
 		f.rangeMax = s->rangeMax;
 		f.speed = s->speed;
 		for (const auto& e : s->effects) {
@@ -890,7 +922,7 @@ namespace WowUi
 		// ImplicitTargetA: 6 single enemy, 28/53/16 places and areas at a place; friends, self and the rest are not harmful.
 		f.harmful = s->implicitTarget == 6;
 		f.ground = s->implicitTarget == 28 || s->implicitTarget == 53 || s->implicitTarget == 16;
-		f.self = s->implicitTarget == 1 || s->implicitTarget == 22;   // the caster, or around her
+		f.self = a_spell == 20549 || s->implicitTarget == 1 || s->implicitTarget == 22;   // the caster, or around the player
 		return f;
 	}
 
@@ -902,6 +934,13 @@ namespace WowUi
 		}
 		const auto s = g->db->spellSounds(a_spell);
 		return { s.precast, s.cast, s.impact, s.state, s.channel, s.precastAnim, s.castAnim, s.channelAnim };
+	}
+
+	std::optional<Emote> EmoteText(std::string_view a_token, std::uint32_t a_race, std::uint32_t a_sex)
+	{
+		std::lock_guard session(g_session);
+		const auto e = Ready() ? g->db->emote(a_token, a_race, a_sex) : std::nullopt;
+		return e ? std::optional<Emote>(Emote{ e->anim, e->specProc, e->standState, e->sound, e->alone, e->atTarget }) : std::nullopt;
 	}
 
 	std::uint32_t SwingSound(std::uint32_t a_swingType, bool a_crit)
@@ -923,12 +962,26 @@ namespace WowUi
 		return s ? MeleeSounds{ s->swing, s->impact, s->exertion } : MeleeSounds{};
 	}
 
+	std::uint32_t InterfaceSounds() { return g_interfaceSounds; }
+
 	std::uint64_t PlaySound(std::uint32_t a_soundId, const RE::NiPoint3* a_at)
 	{
 		std::lock_guard session(g_session);
 		const auto* sound = a_soundId && Ready() ? g->db->sound(a_soundId) : nullptr;
 		return sound ? PlayEntry(*sound, a_at) : 0;
 	}
+
+	std::atomic<std::size_t> g_floorSize = 0;
+
+	void SetMinimapFloor(std::vector<wowcore::MinimapFloorTriangle> a_floor)
+	{
+		std::lock_guard lock(g_exchange);
+		g_floorSize = a_floor.size();
+		g_lastFloor = a_floor;
+		g_floor = std::move(a_floor);
+	}
+
+	std::size_t MinimapFloorSize() { return g_floorSize; }
 
 	void SetWorldCursor(std::string a_name)
 	{

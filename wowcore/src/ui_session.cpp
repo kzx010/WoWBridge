@@ -2,11 +2,15 @@
 
 #include "addons/lua_engine.hpp"
 #include "addons/lua_api_helpers.hpp"
+#include "addons/lua_handler_globals.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "rendering/vk_context.hpp"
+#include "ui/framexml_emitter.hpp"
 #include "ui/interface_fonts.hpp"
 #include "ui/widget_renderer.hpp"
+#include "ui/xml_parser.hpp"
 #include "wowcore/effect.hpp"
+#include "wowcore/dbc.hpp"
 #include "wowcore/framexml.hpp"
 #include "wowcore/model.hpp"
 #include "wowcore/player_model.hpp"
@@ -29,6 +33,7 @@ extern "C" {
 #include <cstring>
 #include <optional>
 #include <limits>
+#include <set>
 #include <unordered_map>
 
 namespace wowcore {
@@ -213,17 +218,27 @@ struct UiSession::Impl {
     // y up, the extent of its blended (not additive) geometry filling the frame: where the client draws the
     // cooldown's square (evidence/hudref/gcd).
     struct ModelFrame { std::string file; uint32_t anim = 0; float ms = 0.0f; float rotation = 0.61f; };
-    std::unique_ptr<PlayerModel> playerModel, dressModel;
+    // Their dressed figure in a Model frame ("__player": CharacterModelFrame, "__dress": DressUpModel, "__customize": the
+    // customization window's): rendered to a texture of its own, again when the look or the rotation changes.
+    struct HostModel {
+        std::unique_ptr<PlayerModel> model;
+        VkDescriptorSet texture = VK_NULL_HANDLE;
+        float rotation = std::numeric_limits<float>::quiet_NaN();
+        bool dirty = true;
+        uint32_t generation = 0;
+        int size = 256;   // texels
+        void setLook(const Mpq& mpq, const Look& look) {
+            if (!model) model = std::make_unique<PlayerModel>(mpq);
+            model->setLook(look); dirty = true;
+        }
+    };
+    HostModel player, dress, customize{ .size = 768 };   // the window shows the player larger than the paper doll (4 ms a turn)
+    HostModel* hostModel(const std::string& file) {
+        return file == "__player" ? &player : file == "__dress" ? &dress : file == "__customize" ? &customize : nullptr;
+    }
     Appearance playerAppearance;
     std::vector<Worn> playerWorn, dressWorn;
-    VkDescriptorSet dressTexture = VK_NULL_HANDLE;
-    float dressRotation = std::numeric_limits<float>::quiet_NaN();
-    bool dressDirty = true;
-    uint32_t dressTextureGeneration = 0;
-    VkDescriptorSet playerTexture = VK_NULL_HANDLE;
-    float playerRotation = std::numeric_limits<float>::quiet_NaN();
-    bool playerDirty = true;
-    uint32_t playerTextureGeneration = 0;
+    bool glueLoaded = false;
     struct UiModel { std::optional<Model> model; glm::vec2 lo{0.0f}, hi{0.0f}; };
     std::unordered_map<uint32_t, ModelFrame> modelFrames;   // by widget id
     std::unordered_map<std::string, glm::vec2> textureSizes; // texels, from each BLP's header
@@ -247,11 +262,22 @@ struct UiSession::Impl {
     const MinimapWorld* minimapWorld = nullptr; // owned by the host's atlas
     std::vector<const MinimapWorld*> minimapLayers; // child first, nearest parent next
     MinimapView minimapView;
+    std::string minimapSpace;
+    struct Ping { MapPoint position; std::string worldspace; };
+    std::unordered_map<uint32_t, Ping> minimapPings;
+    float minimapPingModelScale = 1;
+    std::vector<MinimapFloorTriangle> minimapFloor;   // their interior's floor plan (host navmesh); empty outdoors
+    std::uint64_t minimapFloorVersion = 0;
+    struct { MinimapView view; double z = 0, wall = 0; std::uint64_t version = 0; MinimapFloorMesh mesh; } floorCache;   // last frame's
+    double minimapZ = std::numeric_limits<double>::quiet_NaN();   // their height, yards: the storey shown
     bool minimapPose = false;
     double minimapTrackingMask = 0;
     struct TrackedBlip { MapPoint position; int reaction; std::string name; };
     std::vector<TrackedBlip> minimapBlips;
-    struct Poi { MapPoint position; std::string name, kind; int icon; bool discovered; int nativeFrame=0; double opacity=1, scale=1; };
+    // A native compass row also carries its bearing (Skyrim places it on the rim by that) and whether the producer
+    // matched it to a real position (placed) the 1.12 presentation can use.
+    struct Poi { MapPoint position; std::string name, kind; int icon; bool discovered; int nativeFrame=0; double opacity=1, scale=1;
+                 double bearing=std::numeric_limits<double>::quiet_NaN(); bool placed=false; };
     bool minimapNative=false;
     static constexpr const char* compassAtlas="Interface\\Icons\\WB_Compass.blp";
     std::vector<Poi> minimapPois;
@@ -260,6 +286,69 @@ struct UiSession::Impl {
     MapPoint worldMapPlayer;
     double worldMapHeading = 0;
     static constexpr double poiRimInset = 10.0 / 70; // keep the visible arrow inside FrameXML's border art
+    // 1.12 model coordinates use the 768-unit canvas * 5/3. Rotating-arrow
+    // frames are .11 units wide and sit at .8 of their half width (WoW.exe).
+    static constexpr double minimapModelUnits = 768.0 * 5 / 3;
+    static constexpr double minimapGuideRadius = .11 * minimapModelUnits * .5 * .8;
+
+    bool minimapNativeArt() {
+        auto* L = engine.getState();
+        lua_getglobal(L, "GetCVar");
+        lua_pushliteral(L, "wbMinimapNativeArt");
+        bool nativeArt = true;
+        if (lua_pcall(L, 1, 1, 0) == 0) {
+            const char* value = lua_tostring(L, -1);
+            nativeArt = !value || std::strcmp(value, "0") != 0;
+        }
+        lua_pop(L, 1);
+        return nativeArt;
+    }
+
+    std::optional<MinimapPoiPlacement> minimapPoiPlacement(const MinimapView& view, const Poi& poi,
+                                                          double radius, double scale, bool nativeArt) {
+        if (poi.nativeFrame && (nativeArt || !poi.placed)) {
+            const double rad = poi.bearing * (std::acos(-1.0) / 180);
+            const MapPoint ray = std::isfinite(poi.bearing) ?
+                MapPoint{view.player.x + std::sin(rad) * 1e6, view.player.y + std::cos(rad) * 1e6} : poi.position;
+            return minimapPoi(view, ray, poiRimInset);
+        }
+        if (poi.kind == "location" || poi.kind == "enemy") {
+            const auto p = minimapProject(view, poi.position);
+            if (!p || !minimapContains(*p)) return std::nullopt;
+            return MinimapPoiPlacement{*p, false, 0};
+        }
+        const double inset = std::clamp(1 - minimapGuideRadius * scale / radius, 0.0, .99);
+        return minimapPoi(view, poi.position, inset);
+    }
+
+    // Keep the authored M2 quad and UVs: its origin is not the centre of an
+    // arbitrarily sized square. Guide/corpse models use SetModelScale(.6).
+    void minimapModelGlyph(const char* file, const char* texture, MapPoint centre, double heading,
+                           double scale, float cx, float cy, float radius,
+                           std::vector<wowee::ui::HostModelBatch>& out) {
+        const Model* m = uiModel(file);
+        if (!m || m->vertices.size() < 4) return;
+        MapPoint low{m->vertices[0].position.x, m->vertices[0].position.y}, high = low;
+        MapPoint uvLow{1, 1}, uvHigh{};
+        for (int i = 0; i < 4; ++i) {
+            const auto& v = m->vertices[i];
+            low = {std::min(low.x, double(v.position.x)), std::min(low.y, double(v.position.y))};
+            high = {std::max(high.x, double(v.position.x)), std::max(high.y, double(v.position.y))};
+            uvLow = {std::min(uvLow.x, double(v.texCoords[0].x)), std::min(uvLow.y, double(v.texCoords[0].y))};
+            uvHigh = {std::max(uvHigh.x, double(v.texCoords[0].x)), std::max(uvHigh.y, double(v.texCoords[0].y))};
+        }
+        const double factor = minimapModelUnits * scale / radius;
+        const MapPoint offset{(low.x + high.x) * .5 * factor, (low.y + high.y) * .5 * factor};
+        const double cs = std::cos(heading), sn = std::sin(heading);
+        centre = {centre.x + cs * offset.x + sn * offset.y, centre.y - sn * offset.x + cs * offset.y};
+        wowee::ui::HostModelBatch batch;
+        batch.texture = texture;
+        for (const auto& v : minimapGlyphTriangles(centre, {(high.x - low.x) * .5 * factor, (high.y - low.y) * .5 * factor},
+                                                  uvLow, uvHigh, heading))
+            batch.triangles.push_back({cx + float(v.disc.x) * radius, cy - float(v.disc.y) * radius,
+                                       float(v.uv.x), float(v.uv.y), IM_COL32_WHITE});
+        if (!batch.triangles.empty()) out.push_back(std::move(batch));
+    }
 
     MinimapView currentMinimapView(const wowee::ui::Widget& w) {
         auto view = minimapView;
@@ -275,6 +364,63 @@ struct UiSession::Impl {
         return view;
     }
 
+    bool setMinimapPing(const wowee::ui::Widget& w, MapPoint offset) {
+        const auto position = minimapUnproject(currentMinimapView(w), {offset.x * 2, offset.y * 2});
+        if (position) minimapPings[w.id] = {*position, minimapSpace};
+        return position.has_value();
+    }
+
+    MapPoint minimapPingPosition(const wowee::ui::Widget& w) {
+        const auto ping = minimapPings.find(w.id);
+        if (ping == minimapPings.end()) return {};
+        // Let the stock handler hide a ping after changing worlds, just as it
+        // hides a world position that has moved beyond the visible circle.
+        if (ping->second.worldspace != minimapSpace) return {1, 1};
+        const auto disc = minimapProject(currentMinimapView(w), ping->second.position);
+        return disc ? MapPoint{disc->x / 2, disc->y / 2} : MapPoint{1, 1};
+    }
+
+    int pingEventDepth = 0;
+    void fireMinimapPing(const std::string& unit, MapPoint offset) {
+        // The engine's string event transport only recognizes short decimal
+        // numbers. Ping coordinates are real Lua numbers even at full precision.
+        if (pingEventDepth >= 8) return;
+        ++pingEventDepth;
+        auto* L = engine.getState();
+        const int top = lua_gettop(L);
+        for (const bool frames : {false, true}) {
+            lua_getglobal(L, frames ? "__WoweeFrameEvents" : "__WoweeEvents");
+            if (lua_istable(L, -1)) lua_getfield(L, -1, "MINIMAP_PING"); else lua_pushnil(L);
+            if (lua_istable(L, -1)) {
+                const int count = static_cast<int>(lua_objlen(L, -1));
+                lua_createtable(L, count, 0); // handlers may unregister while running
+                for (int i = 1; i <= count; ++i) { lua_rawgeti(L, -2, i); lua_rawseti(L, -2, i); }
+                const int list = lua_gettop(L);
+                for (int i = 1; i <= count; ++i) {
+                    lua_rawgeti(L, list, i);
+                    if (frames && lua_istable(L, -1)) {
+                        lua_getfield(L, -1, "__scripts");
+                        if (lua_istable(L, -1)) lua_getfield(L, -1, "OnEvent"); else lua_pushnil(L);
+                    }
+                    if (lua_isfunction(L, -1)) {
+                        if (frames) lua_pushvalue(L, list + 1);
+                        lua_pushliteral(L, "MINIMAP_PING");
+                        lua_pushstring(L, unit.c_str());
+                        lua_pushnumber(L, offset.x); lua_pushnumber(L, offset.y);
+                        const int rc = frames ? wowee::addons::pcallScript(L, "OnEvent", 5, 0) : lua_pcall(L, 4, 0, 0);
+                        if (rc) {
+                            lua_setglobal(L, "__WBMinimapPingError");
+                            engine.executeString("error(__WBMinimapPingError)");
+                        }
+                    }
+                    lua_settop(L, list);
+                }
+            }
+            lua_settop(L, top);
+        }
+        --pingEventDepth;
+    }
+
     void minimapTooltip(float height) {
         auto& tree = engine.widgets();
         const auto* w = tree.findByName("Minimap");
@@ -287,10 +433,11 @@ struct UiSession::Impl {
                 (height - pointer.y - (w->bottom + w->rectH / 2) * scale) / radius};
             if (minimapContains(cursor)) {
                 const auto view = currentMinimapView(*w);
+                const bool nativeArt = minimapNativeArt();
                 double nearest = w->rectW * scale * (7.0 / 140) / radius;
                 for (const auto& poi : minimapPois) {
                     if (poi.opacity<=0 || poi.scale<=0) continue;
-                    const auto p = minimapPoi(view, poi.position, poiRimInset);
+                    const auto p = minimapPoiPlacement(view, poi, radius, w->effScale * scale, nativeArt);
                     if (!p) continue;
                     const double distance = std::hypot(p->centre.x - cursor.x, p->centre.y - cursor.y);
                     if (distance <= nearest) { nearest = distance; hover = &poi.name; }
@@ -318,19 +465,42 @@ struct UiSession::Impl {
 
     void drawMinimap(const wowee::ui::Widget& w, float x0, float y0, float x1, float y1,
                      std::vector<wowee::ui::HostModelBatch>& out) {
-        if (!minimapPose) return;
         lua_State* L = engine.getState();
+        // What the floor plan drew last (a SelfTest reads it): its triangles' vertices, their height and the pose.
+        lua_pushfstring(L, "pose=%d layers=%d floor=%d z=%f", int(minimapPose), int(minimapLayers.size()), int(minimapFloor.size()), minimapZ);
+        lua_setglobal(L, "__WBFloorState");
+        if (!minimapPose) return;
         lua_getglobal(L, "__WB");
         lua_getfield(L, -1, "trackingCreatureMask");
         lua_remove(L, -2);
         const bool tracking = lua_pcall(L, 0, 1, 0) == 0 && lua_tonumber(L, -1) != 0 &&
             lua_tonumber(L, -1) == minimapTrackingMask;
         lua_pop(L, 1);
-        if (minimapLayers.empty() && minimapPois.empty() && !minimapNative && (!tracking || minimapBlips.empty())) return;
         const auto view = currentMinimapView(w);
         const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
         const float radius = std::min(x1 - x0, y1 - y0) * 0.5f;
         if (radius <= 0) return;
+        const double scale = w.effScale * engine.widgets().uiScale();
+        // Indoors, the floor plan of their storey over darkness, as the client's building minimaps: warm stone
+        // walkable floor, its walls lighter. Flat colours on a plain white texture.
+        if (minimapLayers.empty() && !minimapFloor.empty() && std::isfinite(minimapZ)) {
+            auto& c = floorCache;   // standing still, the same mesh as last frame
+            if (c.version != minimapFloorVersion || c.z != minimapZ || c.wall != 1.0 / radius || c.view.player.x != view.player.x ||
+                c.view.player.y != view.player.y || c.view.radius != view.radius || c.view.heading != view.heading || c.view.rotate != view.rotate) {
+                c = { view, minimapZ, 1.0 / radius, minimapFloorVersion, minimapFloorMesh(view, minimapFloor, minimapZ, 1.0 / radius) };
+            }
+            const auto& mesh = c.mesh;
+            lua_pushfstring(L, "floor=%d walls=%d radius=%f", int(mesh.floor.size()), int(mesh.walls.size()), view.radius);
+            lua_setglobal(L, "__WBFloorDrawn");
+            for (const auto& [triangles, colour] : {std::pair{minimapDiscTriangles(), IM_COL32(8, 7, 6, 255)},
+                    std::pair{mesh.floor, IM_COL32(94, 82, 64, 255)}, std::pair{mesh.walls, IM_COL32(176, 160, 128, 255)}}) {
+                wowee::ui::HostModelBatch batch;
+                batch.texture = kMinimapFloorTexture;
+                for (const auto& p : triangles)
+                    batch.triangles.push_back({cx + float(p.x) * radius, cy - float(p.y) * radius, 0.5f, 0.5f, colour});
+                if (!batch.triangles.empty()) out.push_back(std::move(batch));
+            }
+        }
         // Child coverage cuts holes in parent geometry. Every terrain pixel is
         // drawn once, including at inherited alpha < 1 and offset tile grids.
         std::vector<const MinimapTile*> covering;
@@ -350,68 +520,64 @@ struct UiSession::Impl {
         if (tracking) {
             wowee::ui::HostModelBatch blips;
             blips.texture = "Interface\\Minimap\\ObjectIcons.blp";
-            const double half = (x1 - x0) * (4.0 / 140.0) / radius; // 8 interface units, independent of zoom
+            const double half = 4 * scale / radius; // 8 units, independent of zoom and frame width
             for (const auto& blip : minimapBlips) {
                 const auto d = minimapProject(view, blip.position);
                 if (!d) continue;
                 const int cell = blip.reaction <= 3 ? 1 : blip.reaction == 4 ? 0 : 2;
                 // 32x32 cells in the shipped 128x128 atlas: yellow, red, green.
                 for (const auto& v : minimapGlyphTriangles(*d, {half, half},
-                        {(cell * 32 + 0.5) / 128, 0.5 / 128}, {(cell * 32 + 31.5) / 128, 31.5 / 128}))
+                        {cell / 4.0, 0}, {(cell + 1) / 4.0, .25}))
                     blips.triangles.push_back({cx + float(v.disc.x) * radius, cy - float(v.disc.y) * radius,
                         float(v.uv.x), float(v.uv.y), IM_COL32_WHITE});
             }
             if (!blips.triangles.empty()) out.push_back(std::move(blips));
         }
         if (minimapNative) { wowee::ui::HostModelBatch warm; warm.texture=compassAtlas; out.push_back(std::move(warm)); }
+        const bool nativeArt = minimapNativeArt();
         for (const auto& poi : minimapPois) {
             if (poi.opacity<=0 || poi.scale<=0) continue;
-            const auto p = minimapPoi(view, poi.position, poiRimInset);
+            const bool nativeGlyph = poi.nativeFrame && (nativeArt || !poi.placed);
+            const auto p = minimapPoiPlacement(view, poi, radius, scale, nativeArt);
             if (!p) continue;
+            if (!nativeGlyph && p->arrow) {
+                minimapModelGlyph("Interface\\Minimap\\Rotating-MinimapArrow.mdx",
+                    poi.kind == "quest" ? "Interface\\Minimap\\Rotating-MinimapCorpseArrow.blp" :
+                                          "Interface\\Minimap\\Rotating-MinimapGuideArrow.blp",
+                    p->centre, p->heading, .6 * scale, cx, cy, radius, out);
+                continue;
+            }
             wowee::ui::HostModelBatch glyph;
             MapPoint lo{}, hi{1, 1};
-            const double half = (x1 - x0) * ((poi.nativeFrame ? 9.0*poi.scale : p->arrow ? 12.0 : 6.0) / 140) / radius;
-            if (poi.nativeFrame) {
+            const double half = nativeGlyph ? (x1 - x0) * (9.0 * poi.scale / 140) / radius :
+                (poi.kind == "custom" || poi.kind == "enemy" ? 4 : 8) * scale / radius;
+            if (nativeGlyph) {
                 glyph.texture=compassAtlas; const int index=poi.nativeFrame-1;
                 lo={((index%16)*32+.5)/512,((index/16)*32+.5)/512};
                 hi={((index%16)*32+31.5)/512,((index/16)*32+31.5)/512};
-            } else if (p->arrow) {
-                glyph.texture = poi.kind == "quest" ? "Interface\\Minimap\\Rotating-MinimapCorpseArrow.blp" :
-                                                     "Interface\\Minimap\\Rotating-MinimapGuideArrow.blp";
             } else if (poi.kind == "custom") {
                 glyph.texture = "Interface\\Minimap\\ObjectIcons.blp";
-                lo = {0.5 / 128, 32.5 / 128}; hi = {31.5 / 128, 63.5 / 128};
+                lo = {0, .25}; hi = {.25, .5};
+            } else if (poi.kind == "enemy") {
+                glyph.texture = "Interface\\Minimap\\ObjectIcons.blp";
+                lo = {.25, 0}; hi = {.5, .25};
             } else {
                 glyph.texture = "Interface\\Minimap\\POIIcons.blp";
                 const int icon = poi.kind == "quest" ? 6 : poi.icon;
-                lo = {((icon % 8) * 16 + 0.5) / 128, ((icon / 8) * 16 + 0.5) / 128};
-                hi = {((icon % 8) * 16 + 15.5) / 128, ((icon / 8) * 16 + 15.5) / 128};
+                lo = {(icon % 8) / 8.0, (icon / 8) / 8.0};
+                hi = {lo.x + .125, lo.y + .125};
             }
-            const auto colour = poi.nativeFrame ? IM_COL32(255,255,255,int(std::clamp(poi.opacity,0.0,1.0)*255)) :
-                poi.kind == "location" && !poi.discovered ? IM_COL32(150,150,150,255) : IM_COL32_WHITE;
-            for (const auto& v : minimapGlyphTriangles(p->centre, {half, half}, lo, hi, poi.nativeFrame ? 0 : p->heading))
+            const auto colour = nativeGlyph ? IM_COL32(255,255,255,int(std::clamp(poi.opacity,0.0,1.0)*255)) :
+                IM_COL32_WHITE;
+            for (const auto& v : minimapGlyphTriangles(p->centre, {half, half}, lo, hi, nativeGlyph ? 0 : p->heading))
                 glyph.triangles.push_back({cx + float(v.disc.x) * radius, cy - float(v.disc.y) * radius,
                     float(v.uv.x), float(v.uv.y), colour});
             if (!glyph.triangles.empty()) out.push_back(std::move(glyph));
         }
-        // MinimapArrow.m2 is a planar textured quad. Draw its own client BLP,
-        // upright at heading zero, in a fixed 16-interface-unit square.
         const auto arrow = minimapArrow(view);
         if (!arrow) return;
-        const double angle = view.rotate ? 0 : view.heading;
-        const double cs = std::cos(angle), sn = std::sin(angle);
-        const float half = std::min(radius * 0.5f, (x1 - x0) * (8.0f / 140.0f));
-        wowee::ui::HostModelBatch batch;
-        batch.texture = "Interface\\Minimap\\MinimapArrow.blp";
-        const MapPoint corners[] = {{-1, 1}, {1, 1}, {1, -1}, {-1, -1}};
-        const MapPoint uvs[] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-        for (const int i : {0, 1, 2, 0, 2, 3}) {
-            const auto p = corners[i];
-            batch.triangles.push_back({cx + float(cs * p.x + sn * p.y) * half,
-                                      cy - float(-sn * p.x + cs * p.y) * half,
-                                      float(uvs[i].x), float(uvs[i].y), IM_COL32_WHITE});
-        }
-        out.push_back(std::move(batch));
+        minimapModelGlyph("Interface\\Minimap\\MinimapArrow.mdx", "Interface\\Minimap\\MinimapArrow.blp",
+            {}, view.rotate ? 0 : view.heading, scale, cx, cy, radius, out);
     }
 
     void drawWorldMap(float x0, float y0, float x1, float y1,
@@ -519,28 +685,22 @@ struct UiSession::Impl {
         }
         const auto f = modelFrames.find(w.id);
         if (f == modelFrames.end()) return;
-        if (f->second.file == "__player" || f->second.file == "__dress") {
-            const bool dressing=f->second.file == "__dress";
-            auto& model=dressing ? dressModel : playerModel;
-            auto& texture=dressing ? dressTexture : playerTexture;
-            auto& generation=dressing ? dressTextureGeneration : playerTextureGeneration;
-            auto& dirty=dressing ? dressDirty : playerDirty;
-            auto& rotation=dressing ? dressRotation : playerRotation;
-            if (!model || !model->ready()) return;
-            if (generation != textures.uiTextureGeneration()) {
-                texture=VK_NULL_HANDLE; dirty=true;
-                generation=textures.uiTextureGeneration();
+        if (HostModel* h = hostModel(f->second.file)) {
+            if (!h->model || !h->model->ready()) return;
+            if (h->generation != textures.uiTextureGeneration()) {
+                h->texture=VK_NULL_HANDLE; h->dirty=true;
+                h->generation=textures.uiTextureGeneration();
             }
-            if (dirty || rotation != f->second.rotation) {
-                const auto image=model->render(f->second.rotation);
+            if (h->dirty || h->rotation != f->second.rotation) {
+                const auto image=h->model->render(f->second.rotation,h->size);
                 if (image.rgba.empty()) return;
-                if (!texture) texture=textures.uploadImGuiTexture(image.rgba.data(),image.w,image.h);
-                else if (!textures.updateImGuiTexture(texture,image.rgba.data(),image.w,image.h)) return;
-                if (!texture) return;
-                dirty=false; rotation=f->second.rotation;
+                if (!h->texture) h->texture=textures.uploadImGuiTexture(image.rgba.data(),image.w,image.h);
+                else if (!textures.updateImGuiTexture(h->texture,image.rgba.data(),image.w,image.h)) return;
+                if (!h->texture) return;
+                h->dirty=false; h->rotation=f->second.rotation;
             }
             wowee::ui::HostModelBatch batch;
-            batch.externalTexture=reinterpret_cast<uintptr_t>(texture);
+            batch.externalTexture=reinterpret_cast<uintptr_t>(h->texture);
             for (const auto& v : {wowee::ui::HostModelVertex{x0,y0,0,0,IM_COL32_WHITE},
                     {x1,y0,1,0,IM_COL32_WHITE},{x1,y1,1,1,IM_COL32_WHITE},
                     {x0,y0,0,0,IM_COL32_WHITE},{x1,y1,1,1,IM_COL32_WHITE},{x0,y1,0,1,IM_COL32_WHITE}})
@@ -554,6 +714,7 @@ struct UiSession::Impl {
         std::vector<glm::mat4> bones;
         poseBones(*m, seq, f->second.ms, 0.0f, bones);
         const glm::vec2 span = glm::max(hi - lo, glm::vec2(1e-6f));
+        const float modelScale = w.name == "MiniMapPing" ? minimapPingModelScale : 1;
         for (const auto& b : m->batches) {
             const BatchLook look = batchLook(*m, b, seq, f->second.ms, 0.0f);
             if (look.color.a <= 0.002f) continue;
@@ -573,7 +734,12 @@ struct UiSession::Impl {
                 for (int k = 0; k < 4; ++k)
                     if (v.boneWeights[k] && v.boneIndices[k] < bones.size())
                         p += (v.boneWeights[k] / 255.0f) * (bones[v.boneIndices[k]] * glm::vec4(v.position, 1.0f));
-                tri.push_back({{x0 + (p.x - lo.x) / span.x * (x1 - x0), y1 - (p.y - lo.y) / span.y * (y1 - y0)},
+                glm::vec2 at{x0 + (p.x - lo.x) / span.x * (x1 - x0), y1 - (p.y - lo.y) / span.y * (y1 - y0)};
+                if (w.name == "MiniMapPing") {
+                    const glm::vec2 centre{(x0 + x1) * .5f, (y0 + y1) * .5f};
+                    at = centre + (at - centre) * modelScale;
+                }
+                tri.push_back({at,
                                glm::vec2(look.uv * glm::vec3(v.texCoords[0], 1.0f))});
                 if (tri.size() < 3) continue;
                 // The texture's own addressing, so neither sampler's (the D3D11 one clamps, the CPU one repeats)
@@ -644,7 +810,7 @@ int lua_ModelState(lua_State* L) {
 
 int lua_PlayerModelReady(lua_State* L) {
     auto* impl=sessionImpl(L);
-    lua_pushnumber(L,impl && impl->playerModel && impl->playerModel->ready() && impl->playerTexture ? 1 : 0);
+    lua_pushnumber(L,impl && impl->player.model && impl->player.model->ready() && impl->player.texture ? 1 : 0);
     return 1;
 }
 
@@ -653,55 +819,148 @@ int lua_DressLook(lua_State* L) {
     auto* impl=sessionImpl(L);
     if (!impl) return 0;
     impl->dressWorn=lua_toboolean(L,1) ? impl->playerWorn : std::vector<Worn>{};
-    if (!impl->dressModel) impl->dressModel=std::make_unique<PlayerModel>(*impl->mpq);
-    impl->dressModel->setLook(dressCharacter(*impl->mpq,impl->playerAppearance,impl->dressWorn));
-    impl->dressDirty=true;
+    impl->dress.setLook(*impl->mpq,dressCharacter(*impl->mpq,impl->playerAppearance,impl->dressWorn));
     return 0;
 }
 int lua_DressTryOn(lua_State* L) {
     auto* impl=sessionImpl(L);
-    if (!impl || !impl->dressModel) return 0;
+    if (!impl || !impl->dress.model) return 0;
     const auto slot=static_cast<uint32_t>(luaL_checkinteger(L,1));
     const auto display=static_cast<uint32_t>(luaL_checkinteger(L,2));
     const auto sheath=static_cast<uint32_t>(luaL_optinteger(L,3,0));
     if (slot>18 || !display) return 0;
     std::erase_if(impl->dressWorn,[&](const Worn& i) { return i.slot==slot || (lua_toboolean(L,4) && i.slot==16); });
     impl->dressWorn.push_back({slot,display,sheath});
-    impl->dressModel->setLook(dressCharacter(*impl->mpq,impl->playerAppearance,impl->dressWorn));
-    impl->dressDirty=true;
-    lua_pushboolean(L,impl->dressModel->ready());
+    impl->dress.setLook(*impl->mpq,dressCharacter(*impl->mpq,impl->playerAppearance,impl->dressWorn));
+    lua_pushboolean(L,impl->dress.model->ready());
     return 1;
+}
+
+uint32_t fieldOf(lua_State* L,int index,const char* key,uint32_t fallback=0) {
+    lua_getfield(L,index,key);
+    const auto value=lua_isnumber(L,-1) ? static_cast<uint32_t>(lua_tonumber(L,-1)) : fallback;
+    lua_pop(L,1); return value;
+}
+Appearance appearanceOf(lua_State* L,int index) {
+    return {fieldOf(L,index,"race",4),fieldOf(L,index,"sex",1),fieldOf(L,index,"skin"),fieldOf(L,index,"face"),
+        fieldOf(L,index,"hairStyle"),fieldOf(L,index,"hairColor"),fieldOf(L,index,"facialHair")};
 }
 
 int lua_PlayerLook(lua_State* L) {
     auto* impl=sessionImpl(L);
     if (!impl || !lua_istable(L,1) || !lua_istable(L,2)) return 0;
-    const auto field=[&](int index,const char* key,uint32_t fallback=0) {
-        lua_getfield(L,index,key);
-        const auto value=lua_isnumber(L,-1) ? static_cast<uint32_t>(lua_tonumber(L,-1)) : fallback;
-        lua_pop(L,1); return value;
-    };
-    Appearance who{field(1,"race",4),field(1,"sex",1),field(1,"skin"),field(1,"face"),
-        field(1,"hairStyle"),field(1,"hairColor"),field(1,"facialHair")};
+    const Appearance who=appearanceOf(L,1);
     std::vector<Worn> worn;
     for (int i=1;;++i) {
         lua_rawgeti(L,2,i);
         if (!lua_istable(L,-1)) { lua_pop(L,1); break; }
         const int row=lua_gettop(L);
-        worn.push_back({field(row,"slot"),field(row,"displayId"),field(row,"sheath")});
+        worn.push_back({fieldOf(L,row,"slot"),fieldOf(L,row,"displayId"),fieldOf(L,row,"sheath")});
         lua_pop(L,1);
     }
-    if (!impl->playerModel) impl->playerModel=std::make_unique<PlayerModel>(*impl->mpq);
     impl->playerAppearance=who; impl->playerWorn=worn;
     const auto look=dressCharacter(*impl->mpq,who,worn);
-    impl->playerModel->setLook(look); impl->playerDirty=true;
-    if (!impl->dressModel) impl->dressModel=std::make_unique<PlayerModel>(*impl->mpq);
-    impl->dressWorn=worn; impl->dressModel->setLook(look); impl->dressDirty=true;
+    impl->player.setLook(*impl->mpq,look);
+    impl->dressWorn=worn; impl->dress.setLook(*impl->mpq,look);
     return 0;
 }
 
+// __WBCustomization(race, sex): what character creation lets that race and sex choose (customization()), by the
+// Appearance fields: {skin=n, face={[skin]=n}, hairStyle=n, hairColor={[style]=n}, facialHair=n, hairCustomization=
+// "NORMAL", facialHairCustomization="MARKINGS"}.
+int lua_Customization(lua_State* L) {
+    auto* impl=sessionImpl(L);
+    if (!impl) return 0;
+    const auto c=customization(*impl->mpq,static_cast<uint32_t>(luaL_checkinteger(L,1)),static_cast<uint32_t>(luaL_checkinteger(L,2)));
+    lua_newtable(L);
+    const auto counts=[&](const char* key,const std::vector<uint32_t>& by) {
+        lua_newtable(L);
+        for (size_t i=0;i<by.size();++i) { lua_pushnumber(L,by[i]); lua_rawseti(L,-2,static_cast<int>(i)); }
+        lua_setfield(L,-2,key);
+    };
+    lua_pushnumber(L,c.skins); lua_setfield(L,-2,"skin");
+    counts("face",c.faces);
+    lua_pushnumber(L,c.hairStyles); lua_setfield(L,-2,"hairStyle");
+    counts("hairColor",c.hairColors);
+    lua_pushnumber(L,c.facialHairs); lua_setfield(L,-2,"facialHair");
+    lua_pushstring(L,c.hair.c_str()); lua_setfield(L,-2,"hairCustomization");
+    lua_pushstring(L,c.facialHair.c_str()); lua_setfield(L,-2,"facialHairCustomization");
+    if (const auto races=Dbc::load(*impl->mpq,"DBFilesClient\\ChrRaces.dbc")) if (const auto row=races->rowOf(static_cast<uint32_t>(luaL_checkinteger(L,1)))) {
+        lua_pushstring(L,races->str(*row,17)); lua_setfield(L,-2,"raceName");
+        lua_pushstring(L,races->str(*row,15)); lua_setfield(L,-2,"raceToken");
+    }
+    return 1;
+}
+
+// __WBCustomizeLook(appearance): the customization window's figure ("__customize") in that look, in what the player wears
+// but their helm, so their face and hair show. Answers whether it is ready to draw.
+int lua_CustomizeLook(lua_State* L) {
+    auto* impl=sessionImpl(L);
+    if (!impl || !lua_istable(L,1)) return 0;
+    auto worn=impl->playerWorn;
+    std::erase_if(worn,[](const Worn& i) { return i.slot==0; });
+    impl->customize.setLook(*impl->mpq,dressCharacter(*impl->mpq,appearanceOf(L,1),worn));
+    lua_pushboolean(L,impl->customize.model->ready());
+    return 1;
+}
+
+// The glue screens' own text, fonts and templates (Interface\GlueXML), for a window copied from one of them.
+// __WBGlueStrings(): GlueStrings.lua's strings, in a table of their own (its ACCEPT, OKAY ... are the glue screens',
+// not the interface's). __WBGlueTemplates(): the Glue* fonts (GlueFonts.xml), the glue buttons (GlueButtons.xml) and
+// character creation's icon buttons and customization rows (CharacterCreate.xml), emitted into the interface once.
+int lua_GlueStrings(lua_State* L) {
+    auto* impl=sessionImpl(L);
+    const auto text=impl ? impl->mpq->read("Interface\\GlueXML\\GlueStrings.lua") : std::nullopt;
+    if (!text || luaL_loadbuffer(L,reinterpret_cast<const char*>(text->data()),text->size(),"@GlueStrings.lua")) return 0;
+    lua_newtable(L);                       // its globals: read through to the interface's, written here
+    lua_newtable(L);
+    lua_pushvalue(L,LUA_GLOBALSINDEX);
+    lua_setfield(L,-2,"__index");
+    lua_setmetatable(L,-2);
+    lua_pushvalue(L,-1);
+    lua_setfenv(L,-3);
+    lua_insert(L,-2);
+    if (lua_pcall(L,0,0,0)) { lua_pop(L,2); return 0; }
+    // Read the creation screen's icon coordinates and faction colours in the same isolated globals.
+    const auto creation=impl->mpq->read("Interface\\GlueXML\\CharacterCreate.lua");
+    if (!creation || luaL_loadbuffer(L,reinterpret_cast<const char*>(creation->data()),creation->size(),"@CharacterCreate.lua")) { lua_pop(L,2); return 0; }
+    lua_pushvalue(L,-2); lua_setfenv(L,-2);
+    if (lua_pcall(L,0,0,0)) { lua_pop(L,2); return 0; }
+    lua_pushnil(L);
+    lua_setmetatable(L,-2);                // only the glue screens' own strings now
+    return 1;
+}
+int lua_GlueTemplates(lua_State* L) {
+    auto* impl=sessionImpl(L);
+    if (!impl) return 0;
+    struct Part { const char* file; std::set<std::string> names; };
+    static const Part kParts[] = {
+        {"GlueFonts.xml",{"GlueFontNormal","GlueFontHighlight","GlueFontDisable","GlueFontNormalSmall","GlueFontHighlightSmall",
+            "GlueFontDisableSmall","GlueFontNormalLarge","GlueFontHighlightLarge"}},
+        {"GlueButtons.xml",{"GluePanelButtonUpTexture","GluePanelButtonDownTexture","GluePanelButtonDisabledTexture",
+            "GluePanelButtonHighlightTexture","GlueButtonTemplate","GlueButtonSmallTemplate"}},
+        {"CharacterCreate.xml",{"CharacterCreateIconButtonTemplate","CharacterCreateRaceButtonTemplate","CharacterCreateGenderButtonTemplate",
+            "CharacterCustomizationFrameTemplate"}}};
+    for (const auto& part : kParts) {
+        if (impl->glueLoaded) break;   // once a session: the interface keeps them
+        const auto data=impl->mpq->read(std::string("Interface\\GlueXML\\")+part.file);
+        wowee::ui::XmlNode root;
+        std::string error;
+        if (!data || !wowee::ui::parseXml(std::string(data->begin(),data->end()),root,error)) {
+            lua_pushnil(L); lua_pushstring(L,(part.file+(": "+error)).c_str()); return 2;
+        }
+        std::erase_if(root.children,[&](const wowee::ui::XmlNode& n) { return !part.names.contains(n.attrOr("name","")); });
+        if (!impl->engine.executeString(wowee::ui::emitFrameXml(root).lua)) {
+            lua_pushnil(L); lua_pushstring(L,impl->engine.lastError().c_str()); return 2;
+        }
+    }
+    impl->glueLoaded=true;
+    lua_pushboolean(L,1);
+    return 1;
+}
+
 // __WBPortraitUnit(texture, unit): the texture shows that unit's portrait; the host fills each such one with the unit's
-// live render every frame (her face; the target's).
+// live render every frame (their face; the target's).
 int lua_PortraitUnit(lua_State* L) {
     auto* impl = sessionImpl(L);
     if (!impl || !lua_istable(L, 1)) return 0;
@@ -749,6 +1008,46 @@ int lua_ViewportSize(lua_State* L) {
     lua_pushnumber(L,s->height()/scale);
     return 2;
 }
+
+wowee::ui::Widget* minimapWidget(lua_State* L) {
+    auto* impl = sessionImpl(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_getfield(L, 1, "__wid");
+    const auto id = static_cast<uint32_t>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+    auto* w = impl ? impl->engine.widgets().get(id) : nullptr;
+    if (!w || w->objectType != "Minimap") luaL_error(L, "expected a Minimap frame");
+    return w;
+}
+
+int lua_MinimapPingLocation(lua_State* L) {
+    auto* w = minimapWidget(L);
+    const double x = luaL_checknumber(L, 2), y = luaL_checknumber(L, 3);
+    const auto dimension = [&](const char* method) {
+        lua_getfield(L, 1, method);
+        lua_pushvalue(L, 1);
+        if (lua_pcall(L, 1, 1, 0) != 0) { lua_pop(L, 1); return 0.0; }
+        const double value = lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        return value;
+    };
+    const double width = dimension("GetWidth"), height = dimension("GetHeight");
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0) return 0;
+    auto* impl = sessionImpl(L);
+    if (!impl->setMinimapPing(*w, {x / width, y / height})) return 0;
+    // The event carries fractions of the full frame, +Y up. FrameXML owns
+    // the model, sound, five-second timer and half-second fade.
+    impl->fireMinimapPing("player", {x / width, y / height});
+    return 0;
+}
+
+int lua_MinimapGetPingPosition(lua_State* L) {
+    auto* w = minimapWidget(L);
+    const auto p = sessionImpl(L)->minimapPingPosition(*w);
+    lua_pushnumber(L, p.x);
+    lua_pushnumber(L, p.y);
+    return 2;
+}
 }  // namespace
 
 UiSession::UiSession(std::shared_ptr<Mpq> mpq, const ClientDb& db, wowee::rendering::VkContext& textures, float width,
@@ -783,6 +1082,10 @@ bool UiSession::start(std::string* error) {
     lua_State* L = impl_->engine.getState();
     lua_pushlightuserdata(L, this);
     lua_setfield(L, LUA_REGISTRYINDEX, kSessionKey);
+    lua_getglobal(L, "__WoweeFrameMT");
+    lua_pushcfunction(L, lua_MinimapPingLocation); lua_setfield(L, -2, "PingLocation");
+    lua_pushcfunction(L, lua_MinimapGetPingPosition); lua_setfield(L, -2, "GetPingPosition");
+    lua_pop(L, 1);
     lua_register(L, "__WBViewportSize", lua_ViewportSize);
     lua_register(L, "LoadAddOn", lua_LoadAddOn);
     lua_register(L, "IsAddOnLoaded", lua_IsAddOnLoaded);
@@ -793,6 +1096,10 @@ bool UiSession::start(std::string* error) {
     lua_register(L, "__WBPlayerModelReady", lua_PlayerModelReady);
     lua_register(L, "__WBModelDuration", lua_ModelDuration);
     lua_register(L, "__WBPortraitUnit", lua_PortraitUnit);
+    lua_register(L, "__WBCustomization", lua_Customization);
+    lua_register(L, "__WBCustomizeLook", lua_CustomizeLook);
+    lua_register(L, "__WBGlueStrings", lua_GlueStrings);
+    lua_register(L, "__WBGlueTemplates", lua_GlueTemplates);
     wowee::ui::setHostModelHook([impl = impl_.get()](const wowee::ui::Widget& w, float x0, float y0, float x1, float y1,
                                                      std::vector<wowee::ui::HostModelBatch>& out) {
         impl->drawModel(w, x0, y0, x1, y1, out);
@@ -831,6 +1138,13 @@ bool UiSession::loadInterface(std::string* error) {
     lua_pushnil(L); lua_setfield(L, -2, "target");
     lua_pop(L, 2);
     const FrameXmlReport r = loadFrameXml(impl_->engine, *impl_->mpq);
+    // In 1.12 UI.xsd, Model's XML scale is model scale, not frame scale.
+    // The shared emitter applies SetScale; keep the stock ping's 50-unit
+    // viewport and its anchor offsets intact, and apply .4 to the model art.
+    if (auto* ping = impl_->engine.widgets().findByName("MiniMapPing")) {
+        impl_->minimapPingModelScale = ping->scale;
+        ping->scale = 1;
+    }
     lua_getglobal(L, "__WB");
     lua_getfield(L, -1, "tokens");
     if (target == LUA_REFNIL) lua_pushnil(L);
@@ -847,16 +1161,27 @@ bool UiSession::loadInterface(std::string* error) {
 }
 
 void UiSession::setPlayerLook(const Look& look, const Appearance& appearance, const std::vector<Worn>& worn) {
-    if (!impl_->playerModel) impl_->playerModel=std::make_unique<PlayerModel>(*impl_->mpq);
-    impl_->playerModel->setLook(look); impl_->playerDirty=true;
+    impl_->player.setLook(*impl_->mpq,look);
     impl_->playerAppearance=appearance; impl_->playerWorn=worn; impl_->dressWorn=worn;
-    if (!impl_->dressModel) impl_->dressModel=std::make_unique<PlayerModel>(*impl_->mpq);
-    impl_->dressModel->setLook(dressCharacter(*impl_->mpq,appearance,worn)); impl_->dressDirty=true;
+    impl_->dress.setLook(*impl_->mpq,dressCharacter(*impl_->mpq,appearance,worn));
 }
 
-void UiSession::fire(const std::string& event, const std::vector<std::string>& args) { impl_->engine.fireEvent(event, args); }
+void UiSession::fire(const std::string& event, const std::vector<std::string>& args) {
+    // A future party source can use the same event path as the local click.
+    if (event == "MINIMAP_PING" && args.size() == 3) {
+        char *endX = nullptr, *endY = nullptr;
+        const double x = std::strtod(args[1].c_str(), &endX), y = std::strtod(args[2].c_str(), &endY);
+        if (endX != args[1].c_str() && !*endX && endY != args[2].c_str() && !*endY && std::isfinite(x) && std::isfinite(y))
+            if (const auto* w = impl_->engine.widgets().findByName("Minimap")) {
+                if (impl_->setMinimapPing(*w, {x, y})) impl_->fireMinimapPing(args[0], {x, y});
+                return;
+            }
+    }
+    impl_->engine.fireEvent(event, args);
+}
 
 void UiSession::setMinimap(const MinimapAtlas* atlas, const std::string& worldspace, MapPoint player, double heading) {
+    impl_->minimapSpace = worldspace;
     impl_->minimapView = {player, 200, heading, false};
     impl_->minimapPose = !worldspace.empty() && minimapProject(impl_->minimapView, player).has_value();
     impl_->minimapBlips.clear();
@@ -901,16 +1226,19 @@ void UiSession::setMinimap(const MinimapAtlas* atlas, const std::string& worldsp
                     };
                     const MapPoint at{number("x"), number("y")};
                     auto name = string("name"), kind = string("kind");
-                    const double icon = number("icon"), native=number("native"), opacity=number("opacity"), size=number("scale");
+                    const double icon = number("icon"), native=number("native"), opacity=number("opacity"), size=number("scale"), bearing=number("bearing");
                     const bool nativeValid=std::isfinite(native) && native>=1 && native<=152 && std::floor(native)==native;
                     if (impl_->minimapNative && !nativeValid) impl_->minimapNative=false;
                     lua_getfield(L, -1, "discovered");
                     const bool discovered = lua_toboolean(L, -1); lua_pop(L, 1);
+                    lua_getfield(L, -1, "placed");
+                    const bool placed = lua_toboolean(L, -1); lua_pop(L, 1);
                     if (minimapProject(impl_->minimapView, at) && !name.empty() &&
                         (kind == "quest" || kind == "custom" || kind == "location" || (kind == "enemy" && nativeValid)))
                         impl_->minimapPois.push_back({at, std::move(name), std::move(kind),
                             std::isfinite(icon) && icon >= 0 && icon <= 42 ? static_cast<int>(icon) : 5, discovered,nativeValid ? static_cast<int>(native) : 0,
-                            std::isfinite(opacity) ? std::clamp(opacity,0.0,1.0) : 1,std::isfinite(size) ? std::clamp(size,0.0,3.0) : 1});
+                            std::isfinite(opacity) ? std::clamp(opacity,0.0,1.0) : 1,std::isfinite(size) ? std::clamp(size,0.0,3.0) : 1,
+                            nativeValid ? bearing : std::numeric_limits<double>::quiet_NaN(), placed});
                 }
                 lua_pop(L, 1);
             }
@@ -941,7 +1269,7 @@ void UiSession::setMinimap(const MinimapAtlas* atlas, const std::string& worldsp
         }
         lua_pop(L, 1);
         // Normalize against stable combined bounds, never against whichever tile
-        // happens to be underneath her (which would jump at the child's edge).
+        // happens to be underneath the player (which would jump at the child's edge).
         size_t tiles = 0;
         const MinimapTile* under = nullptr;
         MapPoint low{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()}, high{-low.x, -low.y};
@@ -982,7 +1310,12 @@ void UiSession::setMinimap(const MinimapAtlas* atlas, const std::string& worldsp
     }
     lua_settop(L, top);
     if (auto* w = impl_->engine.widgets().findByName("Minimap"))
-        w->hostModel = !impl_->minimapLayers.empty() || (impl_->minimapPose && (!impl_->minimapBlips.empty() || !impl_->minimapPois.empty()));
+        w->hostModel = impl_->minimapPose;
+}
+
+void UiSession::setMinimapFloor(std::vector<MinimapFloorTriangle> floor) {
+    impl_->minimapFloor = std::move(floor);
+    ++impl_->minimapFloorVersion;
 }
 
 void UiSession::applyLiveMinimap(const MinimapAtlas* atlas) {
@@ -1003,6 +1336,7 @@ void UiSession::applyLiveMinimap(const MinimapAtlas* atlas) {
             lua_pop(L, 1); return value;
         };
         player = {number("x"), number("y")}; heading = number("heading");
+        impl_->minimapZ = number("z");
     }
     lua_settop(L, top);
     setMinimap(atlas, world, player, heading);
@@ -1072,6 +1406,10 @@ ImDrawData* UiSession::frame(float elapsed, const std::function<void(ImDrawList*
     io.DeltaTime = elapsed > 0 ? elapsed : 1.0f / 60.0f;
     io.MousePos = impl_->pointer;   // GetCursorPosition reads it (the host does not drive ImGui's input)
     auto& tree = impl_->engine.widgets();
+    if (const auto* ping = tree.findByName("MiniMapPing"); ping && ping->shown) {
+        const auto model = impl_->modelFrames.find(ping->id);
+        if (model != impl_->modelFrames.end()) model->second.ms += std::max(0.0f, elapsed) * 1000;
+    }
     impl_->engine.dispatchOnUpdate(elapsed);
     impl_->renderer.layout(tree, width_, height_);
     impl_->minimapTooltip(height_);

@@ -67,7 +67,25 @@ public:
 private:
     std::map<std::string, MinimapWorld> worlds_;
 };
+// An interior's floor plan, from the host's navmesh: positions in yards (east/north) and the
+// triangle's mean height in yards. Bit i of `walls` marks edge i (a-b, b-c, c-a) as a wall: no
+// neighbouring floor across it. Indoors the 1.12 client shows its building's floor plan (WMO
+// minimap textures); Skyrim interiors have none, so the walkable floor stands in for it.
+struct MinimapFloorTriangle {
+    MapPoint a, b, c;
+    double z = 0;        // the middle of its height range, yards
+    unsigned walls = 0;
+    double rise = 0;     // half its height range: a long ramp belongs to every storey it touches
+};
 struct MinimapVertex { MapPoint disc, uv; };
+// Their storey of a floor plan in disc space, as triangle lists clipped to the 64-sided mask: the floor
+// within three yards of their height `z`, and its walls as bands `wallHalfWidth` disc units either side.
+struct MinimapFloorMesh { std::vector<MapPoint> floor, walls; };
+// The plain white client texture the floor plan's flat colours tint.
+inline constexpr const char* kMinimapFloorTexture = "Interface\\ChatFrame\\ChatFrameBackground.blp";
+MinimapFloorMesh minimapFloorMesh(const MinimapView& view, const std::vector<MinimapFloorTriangle>& floor, double z,
+                                  double wallHalfWidth);
+std::vector<MapPoint> minimapDiscTriangles();   // the whole mask
 struct MinimapPoiPlacement { MapPoint centre; bool arrow; double heading; };
 // In-range icons keep their position; distant targets remain on the rim. Inset is in disc units.
 std::optional<MinimapPoiPlacement> minimapPoi(const MinimapView& view, MapPoint position, double inset);

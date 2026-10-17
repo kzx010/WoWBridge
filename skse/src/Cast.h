@@ -20,8 +20,8 @@ namespace Cast
 	void ResetForTesting();   // remove native WoW buffs too; do not restore a pending save record
 	std::function<bool()> PreserveForTesting();   // restore all runtime auras (including other actors), cooldowns/GCD/FSR
 	void FormForTesting(std::uint32_t a_spell, const nlohmann::json& a_outcome);   // resolved form aura; 0 leaves
-	// A save keeps what a WoW logout keeps (Player::SaveToDB): her mana, her cooldowns and the auras on her - not those
-	// she put on others. A load brings them back as a login does (Player::_LoadAuras, _LoadSpellCooldowns): helpful
+	// A save keeps what a WoW logout keeps (Player::SaveToDB): their mana, their cooldowns and the auras on their - not those
+	// the player put on others. A load brings them back as a login does (Player::_LoadAuras, _LoadSpellCooldowns): helpful
 	// auras as they were, harmful ones and cooldowns less the real time since the save, ticks on their old timers.
 	nlohmann::json Snapshot();
 	void           Restore(const nlohmann::json& a_saved);
@@ -31,7 +31,11 @@ namespace Cast
 	void Use(std::uint32_t a_spell);
 	bool ItemReady(std::uint32_t a_spell);
 	void ItemCooldown(std::uint32_t a_spell, std::uint32_t a_ms);
+	// Item use timers beside the spell IDs (Player::AddCooldown with an item): the spell timer an item starts, under
+	// the item's entry (it blocks only that item: WorldObject::IsSpellReady), and its category's, shared.
+	constexpr std::uint32_t kItemTimer = 0x20000000, kItemCategory = 0x40000000;
 	void Stop();               // SpellStopCasting
+	void Interrupt();          // hostile interruption; Improved Concentration Aura's mechanic resistance applies
 	void OnHit(bool a_byYourself);   // you were hit: pushback
 	void IncomingHit(RE::Actor* a_attacker, RE::FormID a_source = 0, RE::FormID a_projectile = 0);
 	bool InFiveSecondRule();
@@ -39,7 +43,7 @@ namespace Cast
 	// Supply a real service response to the production timer/completion path.
 	void BeginForTesting(std::uint32_t a_spell, const nlohmann::json& a_outcome, RE::Actor* a_target = nullptr);
 	nlohmann::json TalentDiagnostics();
-	void Damaged(RE::Actor* a_victim, int a_amount);   // she hurt it some other way (a swing): roots on it may break
+	void Damaged(RE::Actor* a_victim, int a_amount);   // the player hurt it some other way (a swing): roots on it may break
 	// Ground spells (Hurricane): Use enters placement (SpellIsTargeting); a left click on the ground places it, a
 	// right click or SpellStopTargeting cancels.
 	bool Placing();
@@ -49,11 +53,28 @@ namespace Cast
 	int  Mana();
 	int  MaxMana();
 	bool Casting();
+	// Interface Options: their area spells strike friendly people too (off: WoW's rule, they are spared).
+	void SetAreaFriendly(bool a_hit);
 	std::uint32_t TrackingMask();   // PLAYER_TRACK_CREATURES, from active self auras
+	std::uint32_t ResourceTrackingMask(); // PLAYER_TRACK_RESOURCES; Paladin Find Treasure (lock type 6)
+	double AuraRemaining(std::uint32_t a_spell);   // their own aura of that spell: seconds left, 0 when it is not on the player
 	void FormTracking(const nlohmann::json& a_outcome);   // Cat entry: learned Track Humanoids, unless Herbs/Minerals
-	void EndAura(std::uint32_t a_spell);   // her aura of that spell fades now (as it would at its end)
-	void CancelAura(std::uint32_t a_spell);   // the same, for a helpful one only (her right click: CancelPlayerBuff)
+	void EndAura(std::uint32_t a_spell, RE::Actor* a_target = nullptr);   // that aura fades now; no target: their own
+	void CancelAura(std::uint32_t a_spell);   // the same, for a helpful one only (their right click: CancelPlayerBuff)
 	void Augment(nlohmann::json& a_caster);   // active caster auras and remaining talent-proc cooldowns
-	void AugmentTarget(nlohmann::json& a_target, RE::Actor* a_actor); // live Faerie Fire armor reduction
+	void AugmentTarget(nlohmann::json& a_target, RE::Actor* a_actor); // native defences, armor reduction; Paladin health/auras/judgements
 	void TalentEffects(const nlohmann::json& a_outcome, RE::Actor* a_target, bool a_consume = true);
+	void MeleeEffects(const nlohmann::json& a_outcome, RE::Actor* a_target);
+	bool MovementImmune(RE::Actor* a_actor);
+	bool Pacified(RE::Actor* a_actor = nullptr);
+	bool Unattackable(RE::Actor* a_actor);
+	void JudgedHit(RE::Actor* a_attacker, RE::Actor* a_target, float a_damage, const char* a_kind = "melee", std::uint32_t a_seed = 0);
+	// Testing and the native pre-damage hook use the same deferred defence request and application.
+	void DefenseForTesting(RE::Actor* a_attacker, float a_damage, std::uint32_t a_seed,
+		bool a_inFront = true, bool a_sitting = false);
+	void DefenseReplyForTesting(const nlohmann::json& a_reply); // one explicit fixture reply through native hit completion
+	void DefenseFailureForTesting(RE::Actor* a_attacker, float a_damage, const std::string& a_fault);
+	void PartyPollFailureForTesting(); // expire a stuck poll through the production watchdog
+	bool PartyHitForTesting(RE::Actor* a_member, RE::Actor* a_attacker, float a_damage, bool a_blocked = false);
+	void WeaponHitForTesting(RE::Actor* a_attacker, RE::Actor* a_victim, float a_damage, bool a_blocked = false);
 }

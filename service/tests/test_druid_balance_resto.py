@@ -6,6 +6,7 @@ Expected values are independent client/CMaNGOS rules, not generated assertions.
 """
 import random
 import unittest
+from service import formulas as F
 from unittest.mock import patch
 
 from service.catalog import Catalog
@@ -94,6 +95,8 @@ class DruidBalanceRestoration(unittest.TestCase):
         self.assertEqual(hit['consumed_auras'], [16689])
         root = next(a for a in hit['procs'][0]['auras'] if a['type'] == 'root')
         self.assertEqual(root['duration_ms'], 12000)
+        # Its Entangling Roots shares the cast spell's family flags: IsSingleTargetSpells ends either on the last unit.
+        self.assertEqual((root['single_target']['family'], root['single_target']['flags']), (7, 0x200))
         self.assertEqual(hit['procs'][0]['target'], 'target')
         self.assertNotIn('procs', self.svc.handle({**req, 'weapon_hit': False}))
         self.assertNotIn('procs', self.svc.handle({**req, 'caster': self.caster(761, 1)}))
@@ -182,7 +185,8 @@ class DruidBalanceRestoration(unittest.TestCase):
                         out = swing(rank)
                         self.assertEqual(out['outcome'], base['outcome'])
                         self.assertAlmostEqual(out['damage'], base['damage'] * (1 + .02 * rank), delta=2)
-                self.assertGreater(swing(5)['damage'], base['damage'])
+                # The 10% gain can round to the same native health integer.
+                self.assertGreaterEqual(swing(5)['damage'], base['damage'])
 
     def test_improved_thorns(self):
         self.effects(782, 9910, 25, target={'kind': 'self'})
@@ -330,8 +334,12 @@ class DruidBalanceRestoration(unittest.TestCase):
                 wow_tick = self.cast(830, rank, 9841, items=items)['auras'][0]['per_tick']
                 for skill in (15, 100):
                     hot = self.cast(830, rank, 9841, items=items, skyrim={'restoration': skill})['auras'][0]
-                    # This rank's native budget applies after the talent/gear bonus.
-                    expected = round(wow_tick * self.cat.balance[9841].health_factor)
+                    # The rank floor applies to base power; all added healing
+                    # uses the chain's shared top-rank conversion.
+                    spell = self.cat.spell(9841)
+                    base = int(F.effect_value(spell, 1, 60, None, maximum=True))
+                    expected = round(base * self.cat.balance[9841].health_factor +
+                                     (wow_tick-base) * self.cat.balance[25299].health_factor)
                     self.assertEqual(hot['per_tick'], expected)
                     self.assertEqual(hot['amplitude_ms'], 3000)
                     self.assertEqual(hot['ticks'], [{'t_ms': ms, 'amount': expected}
@@ -406,7 +414,12 @@ class DruidBalanceRestoration(unittest.TestCase):
                             **caster, 'skyrim': {'restoration': level}}})
                         self.assertEqual(native['consumed_target_hot'], spell)
                         amount = native['events'][0]['amount']
-                        self.assertEqual(amount, max(1, round(wow['events'][0]['amount'] * factor)))
+                        base_tick = int(F.effect_value(self.cat.spell(spell), 1 if spell in (774, 9841, 25299) else 2,
+                                                     60, None, maximum=True))
+                        base = 1 + ticks * base_tick
+                        bonus_factor = self.cat.balance[spell].bonus_health_factor or factor
+                        expected = round(base * factor + (wow['events'][0]['amount'] - base) * bonus_factor)
+                        self.assertLessEqual(abs(amount - max(1, expected)), 1)
                         # Within rounding and Swiftmend's flat/bonus healing,
                         # it releases four/six native ticks, not 50x WoW ticks.
                         native_hot = self.svc.handle({**hot_request, 'caster': {

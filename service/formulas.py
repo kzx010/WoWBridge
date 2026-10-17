@@ -13,7 +13,17 @@ UNIT_CPP = Path(__file__).resolve().parents[2] / 'WoW/cmangos/mangos-classic/src
 
 # Spell families / classes
 SPELLFAMILY_DRUID = 7
-CLASS_DRUID = 11
+CLASS_WARRIOR, CLASS_PALADIN, CLASS_HUNTER, CLASS_ROGUE, CLASS_PRIEST = 1, 2, 3, 4, 5
+CLASS_SHAMAN, CLASS_MAGE, CLASS_WARLOCK, CLASS_DRUID = 7, 8, 9, 11
+# ChrClasses.dbc (1.12.1): ID -> Filename (lower case), and the class's SpellClassSet (its spells' SpellFamilyName).
+CLASS_IDS = {'warrior': 1, 'paladin': 2, 'hunter': 3, 'rogue': 4, 'priest': 5, 'shaman': 7, 'mage': 8, 'warlock': 9,
+             'druid': 11}
+CLASS_SPELL_FAMILY = {1: 4, 2: 10, 3: 9, 4: 8, 5: 6, 7: 11, 8: 3, 9: 5, 11: 7}
+
+
+def f32(value: float) -> float:
+    """Round to an IEEE single, as CMaNGOS's float arithmetic stores every intermediate."""
+    return struct.unpack('<f', struct.pack('<f', value))[0]
 # DmgClass
 DMG_NONE, DMG_MAGIC, DMG_MELEE, DMG_RANGED = 0, 1, 2, 3
 # SpellModOp (SharedDefines.h)
@@ -53,6 +63,77 @@ def melee_crit_from_agility(cls: int, level: int, agility: float) -> float:
     return agility / (lo * (60.0 - level) / 59.0 + hi * (level - 1.0) / 59.0)
 
 
+# StatSystem.cpp PLAYER_BASE_DODGE (Player::UpdateDodgePercentage): each class's static dodge percent.
+BASE_DODGE = {1: 0.0, 2: 0.75, 3: 0.64, 4: 0.0, 5: 3.0, 7: 1.75, 8: 3.25, 9: 2.0, 11: 0.75}
+# StatSystem.cpp Player::UpdateParryPercentage / UpdateBlockPercentage: 5% base once the unit CanParry / CanBlock.
+BASE_PARRY = BASE_BLOCK = 5.0
+# Unit::SetCanBlock comes from SPELL_EFFECT_BLOCK (Spell::EffectBlock, SpellEffects.cpp:4889): spell 107 'Block' is a
+# creation spell (playercreateinfo_spell) of these classes only.
+BLOCK_CLASSES = frozenset((1, 2, 7))
+# Unit::SetCanParry comes from SPELL_EFFECT_PARRY (Spell::EffectParry, SpellEffects.cpp:4884): no class starts with
+# spell 3127 'Parry'; trainers teach it (npc_trainer(_template) spell 3128) at these levels, by TrainerClass.
+PARRY_LEVEL = {1: 6, 2: 8, 3: 8, 4: 12}
+
+
+def dodge_from_agility(cls: int, level: int, agility: float) -> float:
+    """Player::GetDodgeFromAgility (Player.cpp:4937): as the crit rate, except rogues' and hunters' own rates."""
+    rates = {1: (3.9, 20.0), 2: (4.6, 20.0), 3: (1.8, 26.5), 4: (1.1, 14.5), 5: (11.0, 20.0), 7: (4.6, 20.0),
+             8: (12.9, 20.0), 9: (8.4, 20.0), 11: (4.6, 20.0)}
+    if cls not in rates:
+        return 0.0
+    lo, hi = rates[cls]
+    return agility / (lo * (60.0 - level) / 59.0 + hi * (level - 1.0) / 59.0)
+
+
+def attack_power_base(cls: int, level: int, strength: float, agility: float) -> float:
+    """Player::UpdateAttackPowerAndDamage (StatSystem.cpp:203), melee: the class's BASE_VALUE before auras. A Druid's
+    agility in Cat Form (SHAPESHIFT_FLAG_AGILITY_ATTACK_BONUS) is added by the caller."""
+    level, strength, agility = float(level), float(strength), float(agility)
+    if cls in (CLASS_WARRIOR, CLASS_PALADIN, CLASS_DRUID):
+        return level * 3.0 + strength * 2.0 - 20.0
+    if cls in (CLASS_ROGUE, CLASS_HUNTER):
+        return level * 2.0 + strength + agility - 20.0
+    if cls == CLASS_SHAMAN:
+        return level * 2.0 + strength * 2.0 - 20.0
+    if cls in (CLASS_MAGE, CLASS_PRIEST, CLASS_WARLOCK):
+        return strength - 10.0
+    return 0.0
+
+
+def ranged_attack_power_base(cls: int, level: int, agility: float, feral_form: bool = False) -> float:
+    """Player::UpdateAttackPowerAndDamage(ranged=true) (StatSystem.cpp:217): Hunters 2 x level + 2 x agility - 10,
+    Rogues and Warriors level + agility - 10, a Druid in Cat/Bear/Dire Bear Form none, every other class agility - 10."""
+    level, agility = float(level), float(agility)
+    if cls == CLASS_HUNTER:
+        return level * 2.0 + agility * 2.0 - 10.0
+    if cls in (CLASS_ROGUE, CLASS_WARRIOR):
+        return level + agility - 10.0
+    if cls == CLASS_DRUID and feral_form:
+        return 0.0
+    return agility - 10.0
+
+
+def shield_block_value(flat: float, strength: float, pct: float = 1.0) -> int:
+    """Player::GetShieldBlockValue (Player.cpp:4884): (the shield's block + SPELL_AURA_MOD_SHIELD_BLOCKVALUE + strength
+    / 20 - 1) x SPELL_AURA_MOD_SHIELD_BLOCKVALUE_PCT, never below zero, truncated."""
+    return int(max(0.0, (flat + strength / 20.0 - 1.0) * pct))
+
+
+def stat_total(base: float, total: float, base_pcts=(), total_pcts=()) -> int:
+    """Unit::GetTotalStatValue (Unit.cpp:9063) in CMaNGOS's single precision, truncated by Player::UpdateStats:
+    ((create + item stats) x BASE_PCT + buffs) x TOTAL_PCT. Each percent aura multiplies its group by
+    (100 + amount) / 100 (Unit::HandleStatModifier, Unit.cpp:8995): SPELL_AURA_MOD_PERCENT_STAT the base,
+    SPELL_AURA_MOD_TOTAL_STAT_PERCENTAGE the total (SpellAuras.cpp:3542)."""
+    def product(amounts):
+        value = 1.0
+        for amount in amounts:
+            amount = -200.0 if amount <= -100.0 else amount
+            value = f32(value * f32(f32(100.0 + amount) / 100.0))
+        return value
+    value = f32(f32(f32(base) * product(base_pcts)) + f32(total))
+    return int(f32(value * product(total_pcts)))
+
+
 def roll_chance(rng: random.Random, pct: float) -> bool:
     """roll_chance_f: true with probability pct/100."""
     return pct > rng.random() * 100.0
@@ -70,12 +151,13 @@ def spell_rank_level(spell: dict, caster_level: int) -> int:
 
 
 def effect_value(spell: dict, eff: int, caster_level: int, rng: random.Random | None, maximum: bool = False,
-                 mods: list | None = None) -> float:
-    """WorldObject::CalculateSpellEffectValue (Object.cpp:2916). eff is 1-based."""
+                 mods: list | None = None, base_points: int | None = None) -> float:
+    """WorldObject::CalculateSpellEffectValue (Object.cpp:2916). eff is 1-based. base_points: a CastCustomSpell
+    value, which stands in for EffectBasePoints + EffectBaseDice (basePoints = *effBasePoints - baseDice)."""
     base_dice = spell[f'EffectBaseDice{eff}']
     per_level = spell[f'EffectRealPointsPerLevel{eff}']
     dice_per_level = spell[f'EffectDicePerLevel{eff}']
-    base = float(spell[f'EffectBasePoints{eff}'])
+    base = float(spell[f'EffectBasePoints{eff}'] if base_points is None else base_points - base_dice)
     rand_points = spell[f'EffectDieSides{eff}']
     if per_level != 0:
         level = spell_rank_level(spell, caster_level)
@@ -124,9 +206,17 @@ def affects(mod: dict, spell: dict) -> bool:
     return mod['family'] == spell['SpellFamilyName'] and bool(int(spell['SpellFamilyFlags']) & mod['mask'])
 
 
+class SpellMods(list):
+    """Player::m_spellMods with its owner's class family (ChrClasses SpellClassSet): the spells apply_spell_mod's
+    legacy gate lets through without class-driven mods. A plain list is the Druid's."""
+    def __init__(self, mods=(), family: int = SPELLFAMILY_DRUID):
+        super().__init__(mods)
+        self.family = family
+
+
 def apply_spell_mod(spell: dict, op: int, value: float, mods: list, eff: int | None = None) -> float:
     """Player::ApplySpellMod (Player.h:2577): sum flat and pct mods for op that affect spell."""
-    if spell['SpellFamilyName'] != SPELLFAMILY_DRUID and not any(m.get('class_driven') for m in mods):
+    if spell['SpellFamilyName'] != getattr(mods, 'family', SPELLFAMILY_DRUID) and not any(m.get('class_driven') for m in mods):
         return value
     flat, pct = 0, 100
     for m in mods:
@@ -167,7 +257,7 @@ def skill_max(level: int) -> int:
     return level * 5
 
 
-def effective_resist_percent(caster_level: int, target_level: int, resistance: int, binary: bool, target_is_creature: bool) -> float:
+def effective_resist_percent(caster_level: int, target_level: int, resistance: float, binary: bool, target_is_creature: bool) -> float:
     """Unit::CalculateEffectiveMagicResistancePercent (Unit.cpp:3911), single school, no penetration."""
     if resistance >= 0:
         skill = max(skill_max(caster_level), 100)
@@ -254,10 +344,18 @@ def mana_from_intellect(intellect: float) -> float:
 
 
 def mana_regen_per_second(cls: int, spirit: float) -> float:
-    """Unit::OCTRegenMPPerSpirit (Unit.cpp): per-2s tick value / 2."""
+    """Unit::OCTRegenMPPerSpirit (Unit.cpp:11907): per-2s tick value / 2; Warriors and Rogues none."""
     add = {11: spirit / 5 + 15, 3: spirit / 5 + 15, 8: spirit / 4 + 12.5, 2: spirit / 5 + 15,
            5: spirit / 4 + 12.5, 7: spirit / 5 + 17, 9: spirit / 5 + 15}.get(cls, 0.0)
     return add / 2.0
+
+
+def health_regen_per_second(cls: int, spirit: float) -> float:
+    """Unit::OCTRegenHPPerSpirit (Unit.cpp:11884): Player::RegenerateHealth (Player.cpp:2377) adds it times the
+    elapsed seconds on each 2-second regeneration tick (REGEN_TIME_FULL), so it is health per second."""
+    return {11: spirit * 0.11 + 1, 3: spirit * 0.43 - 5.5, 8: spirit * 0.11 + 1, 2: spirit * 0.25,
+            5: spirit * 0.15 + 1.4, 4: spirit * 0.84 - 13, 7: spirit * 0.28 - 3.6, 9: spirit * 0.12 + 1.5,
+            1: spirit * 1.26 - 22.6}.get(cls, 0.0)
 
 
 def reward_rage(damage: int, level: int, attacker: bool) -> float:

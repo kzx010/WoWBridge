@@ -40,8 +40,16 @@ local function rememberClientItems()
   for _, i in pairs(WB.equipment or {}) do remember(i) end
   for _, bag in pairs(WB.bags or {}) do for slot, i in pairs(bag) do if type(i)=="table" then remember(i) end end end
 end
+-- What a book or mount item teaches the player already knows: their class book's rank, or a learned mount.
+local function knows(spell)
+  for _,id in ipairs(WB.classReply and WB.classReply.known_spells or {}) do if id==spell then return true end end
+end
+local function learned(teaches)
+  if not teaches.mount then return knows(teaches.spell) end
+  for _,m in ipairs(WB.mountCatalog or {}) do if m.key==teaches.mount then return m.learned end end
+end
 -- Older packaged gear already has the captured client tooltips; new exports also carry item_template data.
--- Build those with the client vocabulary; instance crafting effects follow the base WoW stats.
+-- Build those with the client vocabulary; armour and damage are Skyrim's, other stats the base WoW ones.
 local function wowTooltip(i)
   local w=i.wow
   if not w then
@@ -68,16 +76,34 @@ local function wowTooltip(i)
   local weapons={[0]="Axe",[1]="Axe",[2]="Bow",[3]="Gun",[4]="Mace",[5]="Mace",[6]="Polearm",[7]="Sword",
     [8]="Sword",[10]="Staff",[13]="Fist Weapon",[15]="Dagger",[18]="Crossbow",[19]="Wand"}
   if slots[w.InventoryType] then tinsert(lines,{left=slots[w.InventoryType],right=(w.class==4 and armor or weapons)[w.subclass] or ""}) end
-  if w.armor and w.armor>0 then line(w.armor.." Armor") end
+  -- Skyrim's armour and damage in the client's lines: what Skyrim says of this copy (tempered, with their skill and
+  -- perks), else the export's conversion (gear.json skyrim, the ESP's own numbers); an older export's WoW numbers.
+  -- A weapon the player could swing reads as their swing deals it now (the service's __WB.skyrimWeapons, this copy's
+  -- tempering on top; damage per second is that swing's). Otherwise Skyrim's one damage figure is spread over WoW's
+  -- ranges and schools as WoW spreads its own. Speed stays the WoW swing that sets the Skyrim weapon's.
+  local skyrim=i.skyrim or {}
+  local armorValue=i.armor or skyrim.armor or not i.skyrim and w.armor
+  if armorValue and armorValue>0 then line(math.floor(armorValue+0.5).." Armor") end
+  local damage,mean=i.damage or skyrim.damage,0
+  for n=1,5 do mean=mean+((w["dmg_min"..n] or 0)+(w["dmg_max"..n] or 0))/2 end
+  local scale=damage and mean>0 and damage/mean or 1
+  local swing=w.class==2 and i.entry and WB.skyrimWeapons and WB.skyrimWeapons[i.entry]
+  if swing then
+    local temper=i.damage and i.plainDamage and i.plainDamage>0 and i.damage/i.plainDamage or 1
+    swing={min=swing.min*temper,max=swing.max*temper}
+    local first=((w.dmg_min1 or 0)+(w.dmg_max1 or 0))/2
+    scale=first>0 and (swing.min+swing.max)/2/first or 1
+  end
   local damageMin,damageMax=0,0
   local schools={[1]="Holy",[2]="Fire",[3]="Nature",[4]="Frost",[5]="Shadow",[6]="Arcane"}
   for n=1,5 do
-    local low,high=w["dmg_min"..n] or 0,w["dmg_max"..n] or 0
+    local low,high=(w["dmg_min"..n] or 0)*scale,(w["dmg_max"..n] or 0)*scale
+    if swing and n==1 then low,high=swing.min,swing.max end
     if high>0 then
       local school=schools[w["dmg_type"..n]]
-      tinsert(lines,{left=string.format("%g - %g %sDamage",low,high,school and school.." " or ""),
+      tinsert(lines,{left=string.format("%d - %d %sDamage",math.floor(low+0.5),math.floor(high+0.5),school and school.." " or ""),
         right=n==1 and string.format("Speed %.2f",(w.delay or 0)/1000) or nil})
-      damageMin,damageMax=damageMin+low,damageMax+high
+      if not swing or n==1 then damageMin,damageMax=damageMin+low,damageMax+high end
     end
   end
   if damageMax>0 and w.delay and w.delay>0 then line(string.format("(%.1f damage per second)",(damageMin+damageMax)*500/w.delay)) end
@@ -87,12 +113,14 @@ local function wowTooltip(i)
     if w[r[1]] and w[r[1]]>0 then line("+"..w[r[1]].." "..r[2].." Resistance") end
   end
   if w.MaxDurability and w.MaxDurability>0 then line("Durability "..w.MaxDurability.." / "..w.MaxDurability) end
-  if w.AllowableClass and w.AllowableClass>0 and w.AllowableClass<1535 then
+  if w.AllowableClass and w.AllowableClass>0 then
     local names={}
     for _,class in ipairs({{1,"Warrior"},{2,"Paladin"},{3,"Hunter"},{4,"Rogue"},{5,"Priest"},{7,"Shaman"},{8,"Mage"},{9,"Warlock"},{11,"Druid"}}) do
       if math.mod(math.floor(w.AllowableClass/2^(class[1]-1)),2)==1 then tinsert(names,class[2]) end
     end
-    if table.getn(names)>0 then
+    -- A mask past the nine classes' bits names those it has (the druid books' 32256 is "Classes: Druid"); one that
+    -- allows every playable class (CMaNGOS CLASSMASK_ALL_PLAYABLE, 1503) has no line, as -1 has none.
+    if table.getn(names)>0 and table.getn(names)<9 then
       local _,class=UnitClass("player")
       local ids={WARRIOR=1,PALADIN=2,HUNTER=3,ROGUE=4,PRIEST=5,SHAMAN=7,MAGE=8,WARLOCK=9,DRUID=11}
       local id=ids[class]
@@ -100,21 +128,38 @@ local function wowTooltip(i)
       tinsert(lines,{left="Classes: "..table.concat(names,", "),r=1,g=met and 1 or 32/255,b=met and 1 or 32/255})
     end
   end
+  -- A book's or mount item's requirements, red while unmet: their level (Skyrim's), the rank it needs first (the
+  -- client's "Requires %s" of its requiredspell, named with its rank as the trainer names it), and the client's
+  -- "Already known".
+  if i.teaches then
+    local function requirement(text,met) tinsert(lines,{left=text,r=1,g=met and 1 or 32/255,b=met and 1 or 32/255}) end
+    if w.RequiredLevel and w.RequiredLevel>0 then requirement(format(ITEM_MIN_LEVEL,w.RequiredLevel),(UnitLevel("player") or 0)>=w.RequiredLevel) end
+    local previous=w.requiredspell and w.requiredspell>0 and WB.spellInfo(w.requiredspell)
+    if previous then
+      requirement(format(ITEM_REQ_SKILL,previous.name..(previous.rank and previous.rank~="" and " ("..previous.rank..")" or "")),knows(w.requiredspell))
+    end
+    if learned(i.teaches) then requirement(ITEM_SPELL_KNOWN,false) end
+  end
   for n=1,5 do
     local spell=w["spellid_"..n]
     if spell and spell>0 then
       local info=WB.spellInfo(spell)
       local prefix=({[0]="Use: ",[1]="Equip: ",[2]="Chance on hit: "})[w["spelltrigger_"..n]]
-      if info and prefix then line(prefix..WB.spellText(info,info.description),true) end
+      if info and prefix then
+        local values=WB.spellTooltips and WB.spellTooltips[spell]
+        if w["spelltrigger_"..n]==0 and not values then values={item_use=true} end
+        line(prefix..WB.spellText(info,info.description,values),true)
+        if w["spelltrigger_"..n]==0 then
+          for _,text in ipairs(values and values.native_lines or {}) do line(text,true) end
+        end
+      end
     end
   end
+  if i.teaches and i.teaches.text then line("Use: "..i.teaches.text,true) end   -- 1.12's learning spells' wording
   if i.temper then line("Improved: "..i.temper) end
   for _,effect in ipairs(i.effects or {}) do line(effect,true) end
-  if i.temper or (i.effects and table.getn(i.effects)>0) then
-    if i.armor then line(string.format("Skyrim Armor: %g",i.armor)) end
-    if i.damage then line(string.format("Skyrim Damage: %g",i.damage)) end
-  end
-  if w.description and w.description~="" then line('"'..w.description..'"') end
+  -- Flavour text wraps as the client's item lines do (an unwrapped one made tooltips up to 940 units wide).
+  if w.description and w.description~="" then tinsert(lines,{left='"'..w.description..'"',r=1,g=1,b=1,wrap=1}) end
   if i.set then
     local worn,count={},0
     for _,item in pairs(WB.equipment or {}) do if item.entry then worn[item.entry]=true end end
@@ -138,6 +183,30 @@ local function wowTooltip(i)
 end
 WB.itemTooltip = wowTooltip -- shared client-format lines for native gear validation
 function __WBBagPrepareItem(item)
+  -- Derive this from the retained item_template columns too, so an older
+  -- armory.json gains a visible use action without regenerating the ESP.
+  if item.wow and not item.teaches then
+    local uses={}
+    for n=1,5 do
+      local sid=item.wow["spellid_"..n]
+      if sid and sid>0 and (item.wow["spelltrigger_"..n] or 0)==0 then
+        local info=WB.spellInfo(sid)
+        local own=item.wow["spellcooldown_"..n]
+        local category=item.wow["spellcategory_"..n]
+        local shared=item.wow["spellcategorycooldown_"..n]
+        tinsert(uses,{spell=sid,cooldown_ms=own and own>=0 and own or info and info.recovery or 0,
+          category=category and category~=0 and category or info and info.category or 0,
+          ready_category=category or 0,   -- WorldObject::IsSpellReady checks the item's own category; 0 none
+          category_cooldown_ms=shared and shared>=0 and shared or info and info.categoryRecovery or 0,
+          gcd_ms=info and info.gcd and 1500 or 0})
+      end
+    end
+    if table.getn(uses)>0 then
+      item.use=item.use or {}
+      for k,v in pairs(uses[1]) do item.use[k]=v end
+      item.use.spells=uses
+    end
+  end
   if not WB.wowBagItems then rememberClientItems() end
   local own = item.entry and WB.wowBagItems[item.entry]
   if own then
@@ -166,7 +235,7 @@ function __WBBagPrepareItem(item)
     WB.dressItems[item.entry]={display=item.display,type=item.wow.InventoryType,sheath=item.wow.sheath or 0}
   end
   if item.entry and item.entry>0 then
-    if item.wow then item.wow.RequiredLevel=0 end
+    if item.wow and not item.teaches then item.wow.RequiredLevel=0 end   -- a book or mount item keeps its level
     if item.tooltip then item.tooltip=wowTooltip(item) end
     WB.liveItemInfo=WB.liveItemInfo or {}
     WB.liveItemInfo[item.entry]=item
@@ -378,7 +447,7 @@ function __WBInventory(list, page, heldKey, origin, revision, equippedSlot)
   for _,item in pairs(WB.bagItems) do if item.wow then item.tooltip=wowTooltip(item) end end
   __WBFire("UNIT_INVENTORY_CHANGED","player")
   for slot=1,19 do __WBFire("PLAYER_EQUIPMENT_CHANGED",slot) end
-  -- A page more only once every place of hers is full (Bags.cpp places a new stack in the first free place);
+  -- A page more only once every place of theirs is full (Bags.cpp places a new stack in the first free place);
   -- existing pages are never packed to fill gaps, and an emptied last page goes.
   WB.bagPages=math.floor((high-1)/80)+1
   if heldKey~=nil or WB.bagCursor then WB.bagOrigin=origin or WB.bagOrigin setHeld(held) end
@@ -407,10 +476,37 @@ function GetContainerItemLink(...)
   if slot==nil then error("Usage: GetContainerItemLink(index, slot)",2) end
   local i=itemAt(bag,slot) if i then return i.link end
 end
+-- The host keeps an item's spell timer under the item (536870912 + entry: WorldObject::IsSpellReady blocks only that
+-- item) and its category's under 1073741824 + category; the item's own category counts (none for 0), and the GCD
+-- for a use spell that has one. A timer held until an aura fades (SPELL_ATTR_COOLDOWN_ON_EVENT) is enable 0, which
+-- FrameXML shows as a grey icon without a sweep (ContainerFrame_UpdateCooldown).
 local function itemCooldown(item)
-  local c=item and item.use and WB.cooldowns[item.use.spell]
-  if c and c[1]+c[2]>GetTime() then return c[1],c[2],1 end
-  return 0,0,item and 1 or 0
+  local start,duration,enable,now=0,0,item and 1 or 0,GetTime()
+  local function consider(c)
+    if c and c.held then start,duration,enable=c[1],c[2],0
+    elseif c and enable==1 and c[1]+c[2]>math.max(now,start+duration) then start,duration=c[1],c[2] end
+  end
+  if item and item.use and item.entry then consider(WB.cooldowns[536870912+item.entry]) end
+  for _,use in ipairs(item and item.use and (item.use.spells or {item.use}) or {}) do
+    local category=use.ready_category or use.category or 0   -- an export before ready_category: its category
+    if category>0 then consider(WB.cooldowns[1073741824+category]) end
+    if use.gcd_ms and use.gcd_ms>0 then consider(WB.gcd) end
+  end
+  return start,duration,enable
+end
+WB.itemCooldown=itemCooldown
+function WB.itemAction(entry)
+  for slot=1,19 do local i=WB.equipment[slot] if i and i.entry==entry then return i,slot end end
+  for _,i in pairs(WB.bagItems or {}) do if i.entry==entry then return i end end
+end
+-- UseAction on an item: worn equipment casts its Use: spell; the 1.12 client equips an equippable item that is not
+-- worn (as a right click in a bag does) rather than casting; a use item that is not equipment is used from the bag.
+function WB.useItemAction(entry)
+  local item,slot=WB.itemAction(entry)
+  if slot then UseInventoryItem(slot)
+  elseif item and item.wow and (item.wow.InventoryType or 0)~=0 then WB.host("bagUse",item.key)
+  elseif item and item.use then WB.host("bagUseEffect",item.key)
+  else __WBItemError("SPELL_FAILED_ITEM_NOT_READY") end
 end
 function GetContainerItemCooldown(...)
   local bag,slot = unpack(arg,1,arg.n)
@@ -528,6 +624,11 @@ local function put(bag)
 end
 function PutItemInBackpack() if WB.liveInventory then return put(0) end return recorded.PutItemInBackpack() end
 function PutItemInBag(slot) if WB.liveInventory and slot and slot>=20 and slot<=23 then return put(slot-19) end return recorded.PutItemInBag(slot) end
+-- A book's or mount item's refusal (Learning.cpp): the client's own error string, its level filled in.
+function __WBItemError(key,value)
+  local text=getglobal(key) or key
+  __WBFire("UI_ERROR_MESSAGE",value and format(text,value) or text)
+end
 function UseContainerItem(...)
   local bag,slot = unpack(arg,1,arg.n)
   if not WB.liveInventory then return recorded.UseContainerItem(unpack(arg,1,arg.n)) end
@@ -535,17 +636,23 @@ function UseContainerItem(...)
   local i=itemAt(bag,slot)
   if i and WB.merchant then __WBMerchantSell(i)
   elseif i and WB.lootSession and WB.lootCanDeposit then __WBLootDeposit(i)
-  elseif i and not WB.cursor then WB.host(i.use and IsAltKeyDown() and "bagUseEffect" or "bagUse",i.key) end
+  elseif i and not WB.cursor then
+    local effect=i.use and (IsAltKeyDown() or i.wow and i.wow.InventoryType==12 and (i.bagEquipped or (i.equippedCount or 0)>0))
+    WB.host(effect and "bagUseEffect" or "bagUse",i.key)
+  end
 end
--- What she can do with it, in the client's own hint style (green, as ITEM_OPENABLE "<Right Click to Open>"); the
+-- What the player can do with it, in the client's own hint style (green, as ITEM_OPENABLE "<Right Click to Open>"); the
 -- user: "the tooltips for each item in the bag show both the item information and the options and hotkeys".
 local function hints(t,i)
   local use
-  if i.kind=="Weapon" or i.kind=="Armor" or i.kind=="Ammo" then use=i.bagEquipped and "Unequip" or "Equip"
+  if i.teaches then use="Use"
+  elseif i.kind=="Weapon" or i.kind=="Armor" or i.kind=="Ammo" then use=i.bagEquipped and "Unequip" or "Equip"
   elseif i.kind=="Food" then use="Eat"
   elseif i.kind=="Potion" then use=i.potion=="poison" and "Apply to Your Weapon" or "Drink" end
   if WB.merchant then use="Sell"
   elseif WB.lootSession and WB.lootCanDeposit then use="Store" end
+  if i.use and i.wow and i.wow.InventoryType==12 and (i.equippedCount or 0)>0 and
+     not WB.merchant and not (WB.lootSession and WB.lootCanDeposit) then use="Use" end
   if use then t:AddLine("<Right Click to "..use..">",0,1,0) end
   if i.use and not WB.merchant then
     local spell=WB.spellInfo(i.use.spell)
@@ -574,8 +681,10 @@ local function tooltip(t,i,showHints)
     t:AddLine(i.name,c.r,c.g,c.b)
 
     t:AddDoubleLine(i.slotName or i.kind or "Miscellaneous",i.typeName or "",1,1,1,1,1,1)
-    if i.armor then t:AddLine(string.format("%g Armor",i.armor),1,1,1) end
-    if i.damage then t:AddLine(string.format("%g Damage",i.damage),1,1,1) end
+    -- Whole points, as the WoW items' lines round the same GetArmorValue/GetDamage (skill and perks make them
+    -- fractional: "9.36 Armor").
+    if i.armor then t:AddLine(string.format("%d Armor",math.floor(i.armor+0.5)),1,1,1) end
+    if i.damage then t:AddLine(string.format("%d Damage",math.floor(i.damage+0.5)),1,1,1) end
     t:AddLine(string.format("Weight: %g",i.weight or 0),1,1,1)
     t:AddLine(string.format("Value: %d",i.value or 0),1,1,1)
     for _,effect in ipairs(i.effects or {}) do t:AddLine(effect,0,1,0,1) end
@@ -660,5 +769,5 @@ end
 
 -- Leave the original closures untouched until a live snapshot, including their error stack levels.
 for name,fn in pairs(recorded) do live[name]=_G[name] _G[name]=fn end
--- __WBLogin: after a ReloadUI her inventory is back (in __WB) before the next publish.
+-- __WBLogin: after a ReloadUI their inventory is back (in __WB) before the next publish.
 WB.installBags = function() for name, fn in pairs(live) do _G[name] = fn end end

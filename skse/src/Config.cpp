@@ -25,6 +25,7 @@ namespace Config
 		g_values.autorun = ini.GetBoolValue("Test", "autorun", g_values.autorun);
 		g_values.testCell = ini.GetValue("Test", "cell", g_values.testCell.c_str());
 		g_values.testOnly = ini.GetValue("Test", "only", "");
+		g_values.testSteamOverlay = ini.GetBoolValue("Test", "steamOverlay", false);
 		g_values.wowRoot = ini.GetValue("WoW", "root", g_values.wowRoot.c_str());
 		g_values.wowClient = ini.GetValue("WoW", "client", "");
 		g_values.wowUi = ini.GetBoolValue("WoW", "interface", g_values.wowUi);

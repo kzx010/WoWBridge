@@ -30,6 +30,24 @@ namespace AuraPersistence
         return nullptr;
     }
 
+    // Helpful periodic dispels pause with the aura, including the delay to
+    // the next tick; do not restart Abolish's two-second timer on login.
+    template <class Aura>
+    nlohmann::json SaveDispel(const Aura& aura, double now)
+    {
+        return {{"type", aura.dispel}, {"count", aura.dispelCount},
+                {"every", aura.dispelEvery}, {"next", aura.nextDispel - now}};
+    }
+
+    template <class Aura>
+    void LoadDispel(Aura& aura, const nlohmann::json& saved, double now)
+    {
+        aura.dispel = saved.value("type", "");
+        aura.dispelCount = saved.value("count", 0);
+        aura.dispelEvery = saved.value("every", 0.0);
+        aura.nextDispel = now + saved.value("next", 0.0);
+    }
+
     template <class Changes>
     nlohmann::json SaveChanges(const Changes& changes)
     {

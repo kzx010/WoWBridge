@@ -1,4 +1,4 @@
--- Skyrim's native training offer and her class's next automatic spell ranks,
+-- Skyrim's native training offer and their class's next automatic spell ranks,
 -- over Blizzard's unchanged 1.12 ClassTrainerFrame. Until the first snapshot,
 -- leave the recorded trainer closures (including error locations) untouched.
 local WB = __WB

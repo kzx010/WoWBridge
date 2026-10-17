@@ -35,12 +35,66 @@ TEST_CASE("Skyrim loot uses the client frame, stable slots, shared item art and 
       local ok,msg=pcall(GetLootSlotInfo)
       assert(not ok and string.find(msg,'Usage: GetLootSlotInfo(slot)',1,true))
       __WBLogin() __WBSkyrimMenus()
+      assert(GetBindingAction('R')=='' and GetBindingAction('SHIFT-R')=='') -- Skyrim's outside the loot window
+      assert(GetBindingKey('WBLOOTALL')=='R' and GetBindingKey('WBTOGGLEAUTOLOOT')=='Y')
+      local n=GetNumBindings()
+      assert(GetBinding(n-2)=='HEADER_WOWBRIDGE' and GetBinding(n-1)=='WBLOOTALL' and GetBinding(n)=='WBTOGGLEAUTOLOOT')
+      assert(BINDING_HEADER_WOWBRIDGE=='WoWBridge' and BINDING_NAME_WBLOOTALL=='Loot All' and
+        BINDING_NAME_WBTOGGLEAUTOLOOT=='Toggle Auto Loot')
+      KeyBindingFrame_LoadUI() ShowUIPanel(KeyBindingFrame)
+      KeyBindingFrameScrollFrame.offset=n-3 KeyBindingFrame_Update()
+      assert(KeyBindingFrameBinding1Header:GetText()=='WoWBridge')
+      assert(KeyBindingFrameBinding2Description:GetText()=='Loot All' and
+        KeyBindingFrameBinding3Description:GetText()=='Toggle Auto Loot')
+      KeyBindingFrameBinding2Key1Button:Click('LeftButton')
+      arg1='C' KeyBindingFrame_OnKeyDown() arg1=nil
+      assert(GetBindingKey('WBLOOTALL')=='C' and GetBindingAction('C')=='TOGGLECHARACTER0')
+      KeyBindingFrameBinding2Key1Button:Click('LeftButton')
+      KeyBindingFrameUnbindButton:Click('LeftButton')
+      assert(not GetBindingKey('WBLOOTALL') and GetBindingAction('C')=='TOGGLECHARACTER0')
+      HideUIPanel(KeyBindingFrame)
+      -- A save from before these commands gives them their defaults; one that left them unbound, or took Y, keeps that.
+      -- Its Reply line (a row no longer listed) is ignored: R stays Skyrim's outside the loot window.
+      __WBLoadBindings(1, "bind R REPLY\nbind C TOGGLECHARACTER0\n")
+      assert(GetBindingKey('WBLOOTALL')=='R' and GetBindingKey('WBTOGGLEAUTOLOOT')=='Y' and GetBindingAction('R')=='')
+      __WBLoadBindings(1, "bind R REPLY\nbind Y TOGGLECHARACTER0\nbind NONE WBLOOTALL\n")
+      assert(not GetBindingKey('WBLOOTALL') and not GetBindingKey('WBTOGGLEAUTOLOOT') and GetBindingAction('Y')=='TOGGLECHARACTER0')
+      __WBDefaultBindings()
+      SetBinding('R','TOGGLEFPS')   -- the panel giving R to another command keeps Loot All's
+      local _,second=GetBindingKey('TOGGLEFPS')
+      assert(GetBindingKey('WBLOOTALL')=='R' and second=='R')
+      SetBinding('R','WBLOOTALL')
+      local fps=ToggleFramerate local toggles=0
+      ToggleFramerate=function() toggles=toggles+1 end
+      RunBinding(GetBindingAction('R')) assert(toggles==1)
+      ToggleFramerate=fps
       calls={} __WB.host=function(...)
         if arg[1]=='lootTake' or arg[1]=='lootClose' or arg[1]=='lootDeposit' then tinsert(calls,arg) end
       end
       __WBLootFixture(false)
     )");
     ui->frame(0.1f);
+    run(R"(
+      assert(GetBindingAction('R')=='WBLOOTALL' and GetBindingAction('SHIFT-R')=='')
+      RunBinding(GetBindingAction('R'),'up') assert(table.getn(calls)==0)
+      RunBinding(GetBindingAction('R')) RunBinding(GetBindingAction('R'))
+      assert(table.getn(calls)==6) -- gold, owned items and other pages, with pending suppression
+      for slot,c in ipairs(calls) do
+        local item=__WB.lootItems[slot] assert(c[1]=='lootTake' and c[2]==101 and c[3]==item.key and c[4]==item.count)
+      end
+      __WBLootClosed(101)
+      assert(GetBindingAction('R')=='TOGGLEFPS')
+      __WBLootFixture(false) calls={}
+      LootFrame:Hide() assert(GetBindingAction('R')=='TOGGLEFPS') LootFrame:Show()
+      -- Unbind the overlay without losing R's other command; rebind onto a stock key without losing its closed-window action.
+      SetBinding('R') assert(not GetBindingKey('WBLOOTALL') and GetBindingAction('R')=='TOGGLEFPS')
+      SetBinding('C','WBLOOTALL') assert(GetBindingAction('C')=='WBLOOTALL')
+      RunBinding(GetBindingAction('C')) assert(table.getn(calls)==6)
+      __WBLootClosed(101) assert(GetBindingAction('C')=='TOGGLECHARACTER0')
+      SetBinding('C') assert(GetBindingAction('C')=='TOGGLECHARACTER0')
+      SetBinding('R','WBLOOTALL')
+      __WBLootFixture(false) calls={}
+    )");
     run(R"(
       assert(LootFrame:IsShown() and GetNumLootItems()==6)
       assert(GetLootSlotLink(1)==nil and LootSlotIsCoin(1)==1 and not LootSlotIsItem(1))
@@ -136,18 +190,38 @@ TEST_CASE("Skyrim loot uses the client frame, stable slots, shared item art and 
       assert(table.getn(calls)==0) -- corpses are take-only
       ClearCursor() __WBLootClosed(104)
       calls={} __WBLootDeposit({key='stale',count=1}) assert(table.getn(calls)==0)
-      -- Exercise the real options load/save for this addition. The portable API has no
-      -- ShowingCloak/ShowingHelm implementation for the unrelated appearance options.
-      local buttons,sliders=UIOptionsFrameCheckButtons,UIOptionsFrameSliders
-      UIOptionsFrameCheckButtons={WB_AUTO_LOOT_TEXT=buttons.WB_AUTO_LOOT_TEXT}
-      UIOptionsFrameSliders={}
+      -- Exercise the real options load/save for this addition, with the panel's other options.
       this=UIOptionsFrame UIOptionsFrame_Load()
       assert(UIOptionsFrameCheckButton70:GetChecked()==nil)
       UIOptionsFrameCheckButton70:SetChecked(1) UIOptionsFrame_Save()
       this=nil assert(GetCVar('autoLootDefault')=='1')
-      UIOptionsFrameCheckButtons,UIOptionsFrameSliders=buttons,sliders
       SetCVar('autoLootDefault',0)
+      -- Toggle through the stock binding runner and observe the real checkbox and system-message colour.
+      UIOptionsFrame:Show()
+      local add=UIErrorsFrame.AddMessage local messages={}
+      UIErrorsFrame.AddMessage=function(self,...) tinsert(messages,arg) return add(self,unpack(arg)) end
+      local host=__WBHost local writes={}
+      __WBHost=function(...) if arg[1]=='cvar' or arg[1]=='saveBindings' then tinsert(writes,arg) end end
+      RunBinding(GetBindingAction('Y'),'up') assert(GetCVar('autoLootDefault')=='0')
+      RunBinding(GetBindingAction('Y'))
+      assert(GetCVar('autoLootDefault')=='1' and UIOptionsFrameCheckButton70:GetChecked()==1)
+      assert(messages[1][1]=='Auto Loot enabled.' and messages[1][2]==ChatTypeInfo.SYSTEM.r and
+        messages[1][3]==ChatTypeInfo.SYSTEM.g and messages[1][4]==ChatTypeInfo.SYSTEM.b)
+      RunBinding(GetBindingAction('Y'))
+      assert(GetCVar('autoLootDefault')=='0' and not UIOptionsFrameCheckButton70:GetChecked())
+      assert(messages[2][1]=='Auto Loot disabled.' and writes[1][1]=='cvar' and writes[1][2]=='autoLootDefault' and
+        writes[1][3]=='1' and writes[2][3]=='0')
+      SetBinding('Y') SetBinding('F7','WBTOGGLEAUTOLOOT')
+      SetBinding('R') SetBinding('C','WBLOOTALL') SaveBindings(2)
+      assert(writes[3][1]=='saveBindings' and writes[3][2]==2)
+      savedKeys=writes[3][3]
+      SetBinding('C') SetBinding('F7') LoadBindings(2)
+      assert(GetBindingKey('WBLOOTALL')=='C' and GetBindingKey('WBTOGGLEAUTOLOOT')=='F7')
+      assert(GetBindingAction('C')=='TOGGLECHARACTER0' and GetBindingAction('R')=='TOGGLEFPS')
+      UIErrorsFrame.AddMessage=add __WBHost=host UIOptionsFrame:Hide()
       __WBLootFixture(false) calls={}
+      RunBinding('WBTOGGLEAUTOLOOT') -- persist enabled without retroactively taking this open loot
+      assert(GetCVar('autoLootDefault')=='1' and table.getn(calls)==0)
       reload=__WBReloadStateText()
       assert(not string.find(reload,'lootInstalled',1,true))
     )");
@@ -167,7 +241,20 @@ TEST_CASE("Skyrim loot uses the client frame, stable slots, shared item art and 
       end
       __WBInstallLoot()
       assert(LootFrame:IsShown() and GetNumLootItems()==6 and table.getn(calls)==0)
+      assert(GetCVar('autoLootDefault')=='1')
+      __WBLoadBindings(2,__WB.savedBindings)
+      assert(GetBindingKey('WBLOOTALL')=='C' and GetBindingKey('WBTOGGLEAUTOLOOT')=='F7')
+      assert(GetBindingAction('C')=='WBLOOTALL' and GetBindingAction('R')=='TOGGLEFPS')
+      RunBinding(GetBindingAction('C')) assert(table.getn(calls)==6)
       assert(GetLootSlotLink(3) and GetLootSlotInfo(2))
       __WBLootClosed(101) assert(not LootFrame:IsShown())
+      assert(GetBindingAction('C')=='TOGGLECHARACTER0')
+      RunBinding(GetBindingAction('F7')) assert(GetCVar('autoLootDefault')=='0')
+      SetBinding('C') SetBinding('F7') SaveBindings(2)
+      __WBDefaultBindings() __WBLoadBindings(2,__WB.savedBindings)
+      assert(not GetBindingKey('WBLOOTALL') and not GetBindingKey('WBTOGGLEAUTOLOOT'))
+      assert(GetBindingAction('C')=='TOGGLECHARACTER0' and GetBindingAction('R')=='TOGGLEFPS')
+      LoadBindings(0)
+      assert(GetBindingKey('WBLOOTALL')=='R' and GetBindingKey('WBTOGGLEAUTOLOOT')=='Y')
     )");
 }

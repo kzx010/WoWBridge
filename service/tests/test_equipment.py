@@ -50,8 +50,9 @@ class Equipment(unittest.TestCase):
     def test_all_imported_equipment_has_full_stats_and_effects_at_level_two(self):
         service = Service(self.cat, None)
         naked = service.char({'items': [], 'level': 2})
-        self.assertEqual(len(self.cat.items), 95)
-        for entry, item in self.cat.items.items():
+        imported = {entry: item for entry, item in self.cat.items.items() if entry not in self.cat.armory}
+        self.assertEqual(len(imported), 95)   # WoWBridge.esp's; test_armory covers the Armory's
+        for entry, item in imported.items():
             with self.subTest(entry=entry):
                 self.assertEqual(item['RequiredLevel'], 0)
                 ch = service.char({'items': [entry], 'level': 2})

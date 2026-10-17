@@ -182,6 +182,7 @@ namespace GroundItems
 			const auto entry = Gear::EntryOf(ref->GetBaseObject());
 			const auto asset = ItemPreview::AssetFor(entry);
 			if (!asset) {
+				ItemPreview::Want(entry);   // an Armory item's, the first time one lies near the player
 				Restore(t); return false;
 			}
 			if (t.root.get() != root || t.asset != asset || t.geometry.empty()) {

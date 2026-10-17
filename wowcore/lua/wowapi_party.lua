@@ -22,7 +22,7 @@ function GetPartyMember(...)
 end
 function GetPartyLeaderIndex()
   if not WB.liveParty then return recordedLeader() end
-  return 0 -- she leads her Skyrim followers
+  return 0 -- the player leads their Skyrim followers
 end
 function IsPartyLeader()
   if not WB.liveParty then return recordedIsLeader() end

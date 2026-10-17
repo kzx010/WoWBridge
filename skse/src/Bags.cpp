@@ -1,9 +1,11 @@
 #include "Bags.h"
 #include "NativeText.h"
 
+#include "Armory.h"
 #include "Frame.h"
 #include "Character.h"
 #include "Gear.h"
+#include "Learning.h"
 #include "LuaText.h"
 #include "ui/WowUi.h"
 #include "wowcore/bags.hpp"
@@ -118,7 +120,7 @@ namespace Bags
 			const auto* poison = extra ? extra->GetByType<RE::ExtraPoison>() : nullptr;
 			// Worn/favourite/charge flags do not change stack identity. Equivalent Skyrim instances stay one stack;
 			// customised names, enchantments, tempering and soul contents distinguish otherwise identical forms.
-			const char* rawName=entry.GetDisplayName();
+			const char* rawName=Named(form,extra) ? entry.GetDisplayName() : nullptr;   // never "<Missing Name>"
 			if (!rawName || !*rawName) rawName=form->GetName();
 			const std::string name=rawName && *rawName ? rawName : std::format("{} {:08X}",Kind(form),form->GetFormID());
 			json identity = { {"form",form->GetFormID()}, {"enchant",enchant ? enchant->GetFormID() : 0},
@@ -147,6 +149,8 @@ namespace Bags
 			if (auto* weapon=form->As<RE::TESObjectWEAP>()) {
 				i["weapon"]=static_cast<int>(weapon->GetWeaponType());
 				i["damage"]=player->GetDamage(&entry);
+				RE::InventoryEntryData plain(form,1);
+				i["plainDamage"]=player->GetDamage(&plain);   // untempered: this copy's tempering is damage / plainDamage
 				i["baseDamage"]=weapon->attackDamage;
 				const char* names[]={"Weapon","Sword","Dagger","Axe","Mace","Greatsword","Battleaxe","Bow","Staff","Crossbow"};
 				const auto type=static_cast<unsigned>(weapon->GetWeaponType());
@@ -210,17 +214,22 @@ namespace Bags
 				if (at != std::string::npos && tempered.back() == ')') i["temper"] = tempered.substr(at + 1, tempered.size() - at - 2);
 			}
 			i["temperFactor"] = health ? health->health : 1.f;
-			if (const auto entryId=Gear::EntryOf(form); entryId) {
+			if (const auto entryId=Gear::EntryOf(form) ? Gear::EntryOf(form) : Learning::EntryOf(form); entryId) {
 				i["entry"]=entryId;
-				if (const auto it=g_wow.find(entryId); it!=g_wow.end()) {
-					i["display"]=it->second.value("displayid",0);
-					if (it->second.contains("quality")) i["quality"]=it->second["quality"];
-					if (it->second.contains("wow")) i["wow"]=it->second["wow"];
-					if (it->second.contains("set")) i["set"]=it->second["set"];
-					if (it->second.contains("use")) i["use"]=it->second["use"];
-					if (entry.IsWorn() && it->second.contains("InventoryType")) {
+				const auto it=g_wow.find(entryId);
+				const json armory=it==g_wow.end() ? Armory::Row(entryId) : json();   // WoWBridgeArmory.esp's, as gear.json's
+				if (const auto& row=it!=g_wow.end() ? it->second : armory; row.is_object()) {
+					i["display"]=row.value("displayid",0);
+					if (row.contains("quality")) i["quality"]=row["quality"];
+					if (row.contains("wow")) i["wow"]=row["wow"];
+					if (row.contains("teaches")) i["teaches"]=row["teaches"];   // a book's rank, a mount item's mount
+					if (row.contains("icon")) i["texture"]=row["icon"];   // an icon no 1.12 item display has
+					if (row.contains("set")) i["set"]=row["set"];
+					if (row.contains("skyrim")) i["skyrim"]=row["skyrim"];   // its converted armour/damage
+					if (row.contains("use")) i["use"]=row["use"];
+					if (entry.IsWorn() && row.contains("InventoryType")) {
 						if (!form->As<RE::TESObjectWEAP>()) {
-							const auto slot=Character::SlotOf(it->second["InventoryType"]);
+							const auto slot=Character::SlotOf(row["InventoryType"]);
 							i["inventorySlots"]=slot<19 ? json::array({slot+1}) : json::array();
 						}
 					}
@@ -235,10 +244,10 @@ namespace Bags
 			auto* player=RE::PlayerCharacter::GetSingleton();
 			if (!player) return {};
 			for (const auto& [form,data] : player->GetInventory()) {
-				if (!form || data.first<=0 || form->GetFormID()==0xF) continue;   // septims are her money (GetMoney), not a stack
+				if (!form || data.first<=0 || form->GetFormID()==0xF) continue;   // septims are their money (GetMoney), not a stack
 				int remaining=data.first;
 				auto add=[&](RE::ExtraDataList* extra,int count) {
-					if (count<=0) return;
+					if (count<=0 || !Listed(form,extra)) return;
 					auto s=Describe(form,extra,count);
 					auto [it,inserted]=grouped.try_emplace(s.key,std::move(s));
 					if (!inserted) {
@@ -478,6 +487,18 @@ namespace Bags
 		} g_sink;
 	}
 
+	bool Named(RE::TESBoundObject* form, RE::ExtraDataList* extra)
+	{
+		if (const char* name=form ? form->GetName() : nullptr; name && *name) return true;
+		const auto* text=extra ? extra->GetByType<RE::ExtraTextDisplayData>() : nullptr;
+		return text && !text->displayName.empty();
+	}
+
+	bool Listed(RE::TESBoundObject* form, RE::ExtraDataList* extra)
+	{
+		return form && form->GetPlayable() && Named(form,extra);
+	}
+
 	nlohmann::json DescribeItem(RE::TESBoundObject* form, RE::ExtraDataList* extra, int count)
 	{
 		return Describe(form,extra,count).item;
@@ -506,9 +527,10 @@ namespace Bags
 			std::ifstream file("Data/SKSE/Plugins/WoWBridge/gear.json");
 			if (file) {
 				const auto data=json::parse(file);
-				for (const auto* section : {"items","reagents"}) for (const auto& [key,item] : data.value(section,json::object()).items()) {
+				for (const auto* section : {"items","reagents","books","mounts"}) for (const auto& [key,item] : data.value(section,json::object()).items()) {
 					auto row = item;
-					if (row.contains("wow")) row["wow"]["RequiredLevel"] = 0; // Skyrim gear policy, including old packages.
+					// Skyrim gear policy, including old packages; books and mount items keep their Skyrim level.
+					if (row.contains("wow") && !row.contains("teaches")) row["wow"]["RequiredLevel"] = 0;
 					g_wow[item.at("entry").get<std::uint32_t>()] = std::move(row);
 				}
 			}
@@ -581,7 +603,10 @@ namespace Bags
 			const auto it=spare==parts.end() ? parts.begin() : spare;
 			auto* player=RE::PlayerCharacter::GetSingleton();
 			auto* form=it->form;
-			if (effect) { Gear::UseEffect(form,it->extra); g_dirty=true; return; }
+			if (effect) {
+				if (!Gear::UseEffect(form,it->extra)) WowUi::Run("__WBFire('UI_ERROR_MESSAGE', SPELL_FAILED_SPELL_UNAVAILABLE)");
+				g_dirty=true; return;
+			}
 			auto* manager=RE::ActorEquipManager::GetSingleton();
 			if (form->As<RE::AlchemyItem>() || form->As<RE::TESObjectWEAP>() || form->As<RE::TESObjectARMO>() || form->As<RE::TESAmmo>()) {
 				const auto* left=it->extra && it->extra->HasType<RE::ExtraWornLeft>() ?
@@ -592,6 +617,9 @@ namespace Bags
                     if (!form->As<RE::AlchemyItem>()) RememberEquipmentSwap(key);
 					manager->EquipObject(player,form,it->extra,1,nullptr,false,false,false);
 				}
+			} else if (Learning::EntryOf(form)) {   // a book or mount item: learned and used up, or the client's refusal
+				g_uses[it->key]={key,Frame::Now()+2.0};
+				Learning::Use(form,it->extra);
 			} else {
 				WowUi::Run("__WBFire('UI_ERROR_MESSAGE', 'This item cannot be used from a bag.')");
 			}

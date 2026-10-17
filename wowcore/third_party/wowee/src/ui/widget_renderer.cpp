@@ -321,7 +321,8 @@ void WidgetRenderer::sizeFontStringWidget(Widget* w, ImFont* font) {
     const float size = interfaceFontSize(w->fontHeight);
     const float stylePadding = interfaceFontStylePadding(w->fontOutline, w->hasShadow, w->shadowX);
     const auto measureRun = [&](const std::string& piece) {
-        return interfaceStyleTextWidth(interfaceMeasure(runFont, size, piece), w->fontOutline, w->hasShadow, w->shadowX);
+        return interfaceStyleTextWidth(interfaceMeasure(runFont, size, piece, interfaceFontStyleAdvance(w->fontOutline)),
+                                       w->fontOutline, w->hasShadow, w->shadowX);
     };
 
     // Already the right size for this text, measured the way it would be
@@ -3066,8 +3067,9 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
             // parses the runs and draws only the visible ones, in their
             // colours. It was the width the placement is computed from.
             const std::string measured = strippedText(w->text);
+            const float styleAdvance = interfaceFontStyleAdvance(w->fontOutline);
             ImVec2 extent =
-                font ? ImVec2(interfaceTextPx(font, size, measured.c_str()),   // WoWBridge: the client's text metrics
+                font ? ImVec2(interfaceTextPx(font, size, measured.c_str(), styleAdvance),   // WoWBridge: the client's text metrics
                             font->CalcTextSizeA(size, FLT_MAX, 0.0f, measured.c_str()).y)
                      : ImGui::CalcTextSize(measured.c_str());
             // Counted even when nothing wraps: |n is a line break at any

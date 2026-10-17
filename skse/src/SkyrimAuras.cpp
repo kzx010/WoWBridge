@@ -5,6 +5,7 @@
 
 #include "Frame.h"
 #include "LuaText.h"
+#include "NativeText.h"
 #include "ui/WowUi.h"
 
 namespace SkyrimAuras
@@ -101,7 +102,9 @@ namespace SkyrimAuras
 			put("<mag>", std::to_string(static_cast<int>(std::lround(a_magnitude))));
 			put("<dur>", std::to_string(static_cast<int>(std::lround(a_duration))));
 			std::erase(text, '\r');
-			return text;
+			// Scaleform markup and Survival clauses, as Bags.cpp cleans an item's effects (a plain-text tooltip).
+			const auto* survival = RE::TESDataHandler::GetSingleton()->LookupForm<RE::TESGlobal>(0x314A, "Update.esm");   // Survival_ModeEnabledShared
+			return NativeText::ItemDescription(text, survival && survival->value > 0);
 		}
 
 		bool Shows(const RE::ActiveEffect* a_effect)
@@ -118,12 +121,43 @@ namespace SkyrimAuras
 			if (type == RE::MagicSystem::SpellType::kDisease) {
 				return true;
 			}
-			// What lasts a while: not her gear's enchantments, not her race's or a perk's constant abilities.
+			// What lasts a while: not their gear's enchantments, not their race's or a perk's constant abilities.
 			return a_effect->duration > 0.0f && type != RE::MagicSystem::SpellType::kEnchantment && !base->data.flags.any(RE::EffectSetting::EffectSettingData::Flag::kHideInUI);
 		}
 	}
 
-	// The same visibility rules and Skyrim words apply to her followers.
+	bool Visible(const RE::ActiveEffect* a_effect)
+	{
+		return Shows(a_effect);
+	}
+
+	std::string DispelType(const RE::ActiveEffect* a_effect)
+	{
+		using Type = RE::MagicSystem::SpellType;
+		const auto* spell = a_effect ? a_effect->spell : nullptr;
+		const auto* base = a_effect ? a_effect->GetBaseObject() : nullptr;
+		if (!spell || !base) {
+			return {};
+		}
+		switch (spell->GetSpellType()) {
+		case Type::kDisease:
+			return "Disease";
+		case Type::kPoison:
+			return "Poison";
+		case Type::kSpell:
+		case Type::kScroll:
+		case Type::kStaffEnchantment:
+		case Type::kLeveledSpell:
+		case Type::kPower:
+		case Type::kLesserPower:
+		case Type::kVoicePower:
+			return base->data.resistVariable == RE::ActorValue::kPoisonResist ? "Poison" : "Magic";
+		default:
+			return base->data.resistVariable == RE::ActorValue::kPoisonResist ? "Poison" : "";
+		}
+	}
+
+	// The same visibility rules and Skyrim words apply to their followers.
 	static std::map<RE::FormID, Shown> Gather(RE::Actor* a_actor)
 	{
 		auto* effects = a_actor ? a_actor->GetActiveEffectList() : nullptr;
@@ -144,10 +178,8 @@ namespace SkyrimAuras
 				s.text += (s.text.empty() ? "" : "\n") + words;
 			}
 			s.harmful = s.harmful || base->IsDetrimental() || e->spell->GetSpellType() == RE::MagicSystem::SpellType::kDisease;
-			if (e->spell->GetSpellType() == RE::MagicSystem::SpellType::kDisease) {
-				s.dispel = "Disease";
-			} else if (e->spell->GetSpellType() == RE::MagicSystem::SpellType::kPoison || base->data.resistVariable == RE::ActorValue::kPoisonResist) {
-				s.dispel = "Poison";
+			if (const auto type = DispelType(e); !type.empty() && s.dispel != "Disease" && s.dispel != "Poison") {
+				s.dispel = type;   // a disease's or a poison's type wins over a magic effect of the same spell
 			}
 			if (e->spell->GetSpellType() != RE::MagicSystem::SpellType::kDisease) {
 				s.until = std::max(s.until, Frame::Now() + std::max(0.0f, e->duration - e->elapsedSeconds));

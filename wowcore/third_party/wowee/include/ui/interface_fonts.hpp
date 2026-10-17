@@ -35,11 +35,12 @@ ImFont* interfaceFace(const std::string& pathOrName);
 ///
 /// `fontFace` is the widget's own, `fontHeight` its own point size; zero for
 /// either means the default, which is what the renderer falls back to too.
+float interfaceFontStyleAdvance(const std::string& outline);   // extra pixels per glyph advance (THICKOUTLINE)
 float interfaceFontStylePadding(const std::string& outline, bool shadow, float shadowX);
 float interfaceStyleTextWidth(float measured, const std::string& outline, bool shadow, float shadowX);
 
 float interfaceTextWidth(const std::string& text, const std::string& fontFace,
-                         float fontHeight);
+                         float fontHeight, float advancePx = 0.0f);
 
 /// How many lines a piece of text takes when it is drawn.
 ///
@@ -62,11 +63,11 @@ void setInterfacePixelScale(float scale);
 float interfacePixelScale();
 float interfaceLineHeight(float fontHeight);
 float interfaceLineFromEm(float emPixels);
-float interfaceMeasure(ImFont* font, float size, const std::string& text);
+float interfaceMeasure(ImFont* font, float size, const std::string& text, float advancePx = 0.0f);
 // WoWBridge: the client's text metrics (interface_fonts.cpp). Sizes and results in pixels; each falls back to ImGui's own
 // measure for a face whose metrics were not registered.
 void registerInterfaceFaceMetrics(ImFont* font, const void* ttf, size_t bytes);
-float interfaceTextPx(ImFont* font, float emPx, const char* text);   // a string's width
+float interfaceTextPx(ImFont* font, float emPx, const char* text, float advancePx = 0.0f);   // a string's width
 float interfacePenPx(ImFont* font, float emPx, const char* text);    // where the pen ends after it (a caret)
 // Draws one run of plain text with the client's advances at (x, y) and returns the pen's advance.
 float interfaceDrawText(ImDrawList* dl, ImFont* font, float emPx, float x, float y, unsigned int col, const std::string& text);

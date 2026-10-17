@@ -108,8 +108,8 @@ float interfacePixelScale() { return gPixelScale; }
 static float linePixels(float fontHeight) { return std::max(1.0f, std::floor(fontHeight * gPixelScale + 0.5f)); }
 float interfaceLineHeight(float fontHeight) { return linePixels(fontHeight) / gPixelScale; }
 float interfaceLineFromEm(float emPixels) { return std::floor(emPixels * kAscender + 0.001f); }
-float interfaceMeasure(ImFont* font, float size, const std::string& text) {
-    return interfaceTextPx(font, size * gPixelScale, text.c_str()) / gPixelScale;
+float interfaceMeasure(ImFont* font, float size, const std::string& text, float advancePx) {
+    return interfaceTextPx(font, size * gPixelScale, text.c_str(), advancePx) / gPixelScale;
 }
 
 // WoWBridge: the client's text metrics, recovered from the 1.12 client's own numbers (evidence/fontref: 282 glyph advances and 22
@@ -153,20 +153,28 @@ FaceMetrics* metricsOf(ImFont* font) {
     auto it = faceMetrics().find(font);
     return it == faceMetrics().end() ? nullptr : &it->second;
 }
-// Pen advance and (wide) the width of the widest line, over UTF-8 text; a newline starts a line.
-float measureLines(FaceMetrics& m, float emPx, const char* text, bool wide) {
+// Pen advance and (wide) the width of the widest line, over UTF-8 text; a newline starts a line. advancePx widens
+// every glyph advance (interfaceFontStyleAdvance): all of them for the pen, all but the last glyph's for a width.
+float measureLines(FaceMetrics& m, float emPx, const char* text, bool wide, float advancePx) {
     const double P = interfaceLineFromEm(emPx);
-    int pen = 0, best = 0;
+    int pen = 0, glyphs = 0;
+    double best = 0.0;
     uint32_t last = 0;
+    const auto line = [&] {
+        const bool own = wide && last;
+        const double drawn = own ? pen - penOf(m, P, last) + ownWidthOf(m, P, last) : pen;
+        return drawn + double(advancePx) * (own ? glyphs - 1 : glyphs);
+    };
     const char* end = text + std::strlen(text);
     for (const char* s = text; s < end;) {
         unsigned int c = 0;
         s += ImTextCharFromUtf8(&c, s, end);
-        if (c == '\n') { best = std::max(best, wide && last ? pen - penOf(m, P, last) + ownWidthOf(m, P, last) : pen); pen = 0; last = 0; continue; }
+        if (c == '\n') { best = std::max(best, line()); pen = 0; glyphs = 0; last = 0; continue; }
         pen += penOf(m, P, c);
+        ++glyphs;
         last = c;
     }
-    best = std::max(best, wide && last ? pen - penOf(m, P, last) + ownWidthOf(m, P, last) : pen);
+    best = std::max(best, line());
     return static_cast<float>(best);
 }
 }  // namespace
@@ -180,13 +188,13 @@ void registerInterfaceFaceMetrics(ImFont* font, const void* ttf, size_t bytes) {
     faceMetrics()[font] = FaceMetrics{face, face->units_per_EM ? double(face->units_per_EM) : 1000.0, {}};
 }
 
-float interfaceTextPx(ImFont* font, float emPx, const char* text) {
-    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, true);
+float interfaceTextPx(ImFont* font, float emPx, const char* text, float advancePx) {
+    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, true, advancePx);
     return font->CalcTextSizeA(emPx, FLT_MAX, 0.0f, text).x;
 }
 
 float interfacePenPx(ImFont* font, float emPx, const char* text) {
-    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, false);
+    if (FaceMetrics* m = metricsOf(font)) return measureLines(*m, emPx, text, false, 0.0f);
     return font->CalcTextSizeA(emPx, FLT_MAX, 0.0f, text).x;
 }
 
@@ -223,6 +231,10 @@ float interfaceFontSize(float fontHeight) {
 // The legacy face measure includes the standard one-pixel shadow. Native plain
 // strings omit it; OUTLINE/THICKOUTLINE add4/8pixels, and positive shadow X adds
 // its rounded physical extent. Negative X does not extend GetStringWidth.
+// THICKOUTLINE also widens every glyph advance by one physical pixel: "45", "1000"
+// and "Elunara" measure 1, 3 and 6 px wider than the padding alone, in both faces
+// at every captured height; OUTLINE advances are unchanged.
+float interfaceFontStyleAdvance(const std::string& outline) { return outline == "THICK" ? 1.0f : 0.0f; }
 float interfaceFontStylePadding(const std::string& outline, bool shadow, float shadowX) {
     float padding = -1.0f;
     if (!outline.empty()) padding += outline == "THICK" ? 8.0f : 4.0f;
@@ -235,11 +247,11 @@ float interfaceStyleTextWidth(float measured, const std::string& outline, bool s
 }
 
 float interfaceTextWidth(const std::string& text, const std::string& fontFace,
-                         float fontHeight) {
+                         float fontHeight, float advancePx) {
     if (text.empty()) return 0.0f;
     const float size = interfaceFontSize(fontHeight);
     if (ImFont* font = interfaceFaceOrDefault(fontFace)) {
-        return interfaceMeasure(font, size, text);
+        return interfaceMeasure(font, size, text, advancePx);
     }
     // No context yet - during the FrameXML load there may be no frame in
     // flight to ask. An estimate is far better than nothing: the alternative

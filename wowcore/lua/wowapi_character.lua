@@ -154,7 +154,10 @@ function PickupInventoryItem(slot)
 end
 function UseInventoryItem(slot)
   if not WB.liveInventory then return recorded.UseInventoryItem(slot) end
-  if WB.bagHeld then ClearCursor() else __WBBagEquipment("unequip",slot) end
+  local item=WB.equipment[slot]
+  if WB.bagHeld then ClearCursor()
+  elseif item and item.use then WB.host("bagUseEffect",item.key)
+  else __WBBagEquipment("unequip",slot) end
 end
 function AutoEquipCursorItem()
   if not WB.liveInventory then return recorded.AutoEquipCursorItem() end
@@ -169,6 +172,25 @@ end
 function __WBCharacterLook(appearance,worn)
   if __WBPlayerLook then __WBPlayerLook(appearance,worn) end
   if CharacterModelFrame then CharacterModelFrame:SetUnit("player") end
+end
+
+-- Show Helm and Show Cloak (Interface Options), theirs as the realm keeps the client's: with their character's saved
+-- variables (1 shown, 0 hidden; never set, shown). The host leaves a hidden one off their model and paper doll
+-- (Character::SetShown); it is told at each change and once in game (__WBSkyrimMenus).
+WB.saveForCharacter("WBShowHelm") WB.saveForCharacter("WBShowCloak")
+local function checked(v) return v and v ~= 0 and v ~= "0" end   -- the panel passes "1" or "0"
+function ShowingHelm() return WBShowHelm ~= 0 and 1 or nil end
+function ShowingCloak() return WBShowCloak ~= 0 and 1 or nil end
+function __WBShowGear() WB.host("showGear", ShowingHelm() and 1 or 0, ShowingCloak() and 1 or 0) end
+function ShowHelm(show)
+  local was = ShowingHelm()
+  WBShowHelm = checked(show) and 1 or 0
+  if ShowingHelm() ~= was then __WBShowGear() end
+end
+function ShowCloak(show)
+  local was = ShowingCloak()
+  WBShowCloak = checked(show) and 1 or 0
+  if ShowingCloak() ~= was then __WBShowGear() end
 end
 
 function UnitHasRelicSlot(unit)

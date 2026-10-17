@@ -41,9 +41,9 @@ namespace RenderState
 		ID3D11Predicate*         predicate = nullptr;
 		BOOL                     predicateValue = FALSE;
 		ID3D11Buffer*            vsCb[3]{};
-		ID3D11Buffer*            psCb[3]{};
-		ID3D11ShaderResourceView* psSrv[2]{};
-		ID3D11SamplerState*      psSampler = nullptr;
+		ID3D11Buffer*            psCb[4]{};
+		ID3D11ShaderResourceView* psSrv[4]{};
+		ID3D11SamplerState*      psSampler[2]{};
 
 		void Save(ID3D11DeviceContext* c)
 		{
@@ -64,9 +64,9 @@ namespace RenderState
 			c->HSGetShader(&hs, hsClasses, &hsCount);
 			c->DSGetShader(&ds, dsClasses, &dsCount);
 			c->VSGetConstantBuffers(0, 3, vsCb);
-			c->PSGetConstantBuffers(0, 3, psCb);
-			c->PSGetShaderResources(0, 2, psSrv);
-			c->PSGetSamplers(0, 1, &psSampler);
+			c->PSGetConstantBuffers(0, 4, psCb);
+			c->PSGetShaderResources(0, 4, psSrv);
+			c->PSGetSamplers(0, 2, psSampler);
 		}
 
 		void Restore(ID3D11DeviceContext* c)
@@ -88,14 +88,15 @@ namespace RenderState
 			c->HSSetShader(hs, hsClasses, hsCount);
 			c->DSSetShader(ds, dsClasses, dsCount);
 			c->VSSetConstantBuffers(0, 3, vsCb);
-			c->PSSetConstantBuffers(0, 3, psCb);
-			c->PSSetShaderResources(0, 2, psSrv);
-			c->PSSetSamplers(0, 1, &psSampler);
+			c->PSSetConstantBuffers(0, 4, psCb);
+			c->PSSetShaderResources(0, 4, psSrv);
+			c->PSSetSamplers(0, 2, psSampler);
 			for (auto*& srv : psSrv) { Release(srv); }
 			for (auto* instances : { vsClasses, psClasses, gsClasses, hsClasses, dsClasses }) {
 				for (UINT i = 0; i < 256; ++i) { Release(instances[i]); }
 			}
-			Release(gs), Release(hs), Release(ds), Release(predicate), Release(psSampler);
+			Release(gs), Release(hs), Release(ds), Release(predicate);
+			for (auto*& sampler : psSampler) { Release(sampler); }
 			for (auto*& r : rtv) {
 				Release(r);
 			}

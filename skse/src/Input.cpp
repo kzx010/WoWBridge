@@ -119,7 +119,7 @@ namespace Input
 		std::map<std::uint32_t, Held> g_held;
 
 		// A turning key let go while the game did not hear it (focus away, Wine re-acquiring the keyboard) never sends
-		// its release, and a second press of it would count twice: she spun on (the user's playtest). Turning is what is
+		// its release, and a second press of it would count twice: the player spun on (the user's playtest). Turning is what is
 		// held now, and each frame a turning key no longer down is dropped, as SyncModifiers does.
 		void SyncTurning()
 		{
@@ -308,12 +308,35 @@ namespace Input
 			}
 			return true;
 		}
+		// The WoW loot window rides on Skyrim's invisible ContainerMenu, which holds menu input. Only Loot All's key
+		// (R by default: Skyrim's own Take All) is the interface's there; Esc, Tab and the rest stay the menu's.
+		bool LootAllKey(RE::InputEvent* a_event)
+		{
+			auto* button = a_event->AsButtonEvent();
+			auto* ui = RE::UI::GetSingleton();
+			if (!button || button->GetDevice() != RE::INPUT_DEVICE::kKeyboard || !ui || !ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME) ||
+				ui->IsMenuOpen(RE::Console::MENU_NAME)) {   // typing in the console over the loot window loots nothing
+				return false;
+			}
+			const std::string bare(KeyName(button->GetIDCode()));
+			const auto        command = bare.empty() ? std::string() : WowUi::Route(bare, bare).command;
+			if (button->IsDown()) logger::info("input: {} in the loot window is {}", bare, command.empty() ? "unbound" : command);
+			if (command != "WBLOOTALL") {   // only while their loot window shows
+				return false;
+			}
+			if (button->IsDown()) {
+				WowUi::Key(WowUi::KeyRoute::To::Binding, "WBLOOTALL", true);
+				WowUi::Key(WowUi::KeyRoute::To::Binding, "WBLOOTALL", false);
+			}
+			return true;   // the hidden menu's own Take All must not race it
+		}
+
 		std::atomic<std::uint64_t> g_captureEpoch = 0;
 		std::atomic<bool> g_active = false;   // cursor mode in play (read by the interface's render)
 		float             g_rmbTravel = 0;    // mouse travel while the right button is held: a drag steers
 		std::atomic<bool> g_leftLook = false; // the left button went down on the world (render thread): its drags turn the camera
 		float             g_lmbTravel = 0;
-		bool              g_autoMoveOn = false;   // both buttons held: she runs, as in WoW (Skyrim's auto-move set by us)
+		bool              g_autoMoveOn = false;   // both buttons held: the player runs, as in WoW (Skyrim's auto-move set by us)
 
 		std::pair<float, float> ScreenSize()
 		{
@@ -379,6 +402,19 @@ namespace Input
 		Update();
 		SyncModifiers();
 		PollShiftTab();
+		// Loot All's key, in or out of cursor mode, before anything else may take it.
+		if (Integration::Active()) {
+			RE::InputEvent* prev = nullptr;
+			for (auto* event = *a_head; event;) {
+				auto* next = event->next;
+				if (LootAllKey(event)) {
+					(prev ? prev->next : *a_head) = next;
+				} else {
+					prev = event;
+				}
+				event = next;
+			}
+		}
 		if (!GameplayHasFocus() || !g_cursorMode) {
 			g_rmbHeld = false;
 			g_leftLook = false;
@@ -417,6 +453,13 @@ namespace Input
 	void Update()
 	{
 		const bool active = g_cursorMode && GameplayHasFocus();
+		// A button-up a native menu or focus change swallowed would leave the button "held" for the session, and a
+		// held left makes every world right-click "both buttons" (ignored). Only ever toward up: the OS knows.
+		if (active) {
+			if (g_buttons.left && !(GetAsyncKeyState(0x01) & 0x8000)) { g_buttons.left = false; ++g_stats.buttonsReconciled; }
+			if (g_buttons.right && !(GetAsyncKeyState(0x02) & 0x8000)) { g_buttons.right = false; g_rmbHeld = false; ++g_stats.buttonsReconciled; }
+			if (g_buttons.middle && !(GetAsyncKeyState(0x04) & 0x8000)) { g_buttons.middle = false; ++g_stats.buttonsReconciled; }
+		}
 		if (g_active && !active) {
 			++g_captureEpoch;
 			g_rmbHeld = false;

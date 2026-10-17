@@ -4,6 +4,7 @@
 #include "Hooks.h"
 #include "Integration.h"
 #include "render/WowModels.h"
+#include "render/Shadows.h"
 
 #include <d3d11.h>
 
@@ -132,6 +133,38 @@ namespace WorldPass
 			return s ? -v : v;
 		}
 
+		// R11G11B10_FLOAT's unsigned channels: a 5-bit exponent over a_mantBits of mantissa.
+		float Small(std::uint32_t v, int a_mantBits)
+		{
+			const std::uint32_t e = (v >> a_mantBits) & 0x1F, m = v & ((1u << a_mantBits) - 1);
+			return e == 0 ? std::ldexp(static_cast<float>(m), -14 - a_mantBits) : e == 31 ? INFINITY : std::ldexp(static_cast<float>(m | (1u << a_mantBits)), static_cast<int>(e) - 15 - a_mantBits);
+		}
+
+		// One pixel of the scene target in its own format: DXVK gave Skyrim's main target R16G16B16A16_FLOAT, native D3D11
+		// R11G11B10_FLOAT; an undecoded format leaves the sample black, so it is reported once.
+		void Decode(DXGI_FORMAT a_format, const void* a_px, float* a_rgba)
+		{
+			switch (a_format) {
+			case DXGI_FORMAT_R16G16B16A16_FLOAT:
+				for (int k = 0; k < 4; ++k) a_rgba[k] = Half(static_cast<const std::uint16_t*>(a_px)[k]);
+				return;
+			case DXGI_FORMAT_R11G11B10_FLOAT: {
+				const auto v = *static_cast<const std::uint32_t*>(a_px);
+				a_rgba[0] = Small(v & 0x7FF, 6); a_rgba[1] = Small((v >> 11) & 0x7FF, 6); a_rgba[2] = Small(v >> 22, 5); a_rgba[3] = 1.f;
+				return;
+			}
+			case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
+				const auto* b = static_cast<const std::uint8_t*>(a_px);
+				const bool  bgr = a_format == DXGI_FORMAT_B8G8R8A8_UNORM || a_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+				a_rgba[0] = b[bgr ? 2 : 0] / 255.f; a_rgba[1] = b[1] / 255.f; a_rgba[2] = b[bgr ? 0 : 2] / 255.f; a_rgba[3] = b[3] / 255.f;
+				return;
+			}
+			default:
+				static bool reported = false;
+				if (!reported) { reported = true; logger::warn("world pass: scene format {} not decoded for samples", static_cast<int>(a_format)); }
+			}
+		}
+
 		// Projects a world point with the same camera-relative matrix the shader uses.
 		bool Project(const FrameCB& a_fc, const RE::NiPoint3& a_rel, int a_w, int a_h, int& a_x, int& a_y)
 		{
@@ -253,6 +286,8 @@ namespace WorldPass
 				}
 				context->DrawIndexed(36, 0, 0);
 			}
+			Shadows::DrawBlobs({ device, context, cam, &fc.viewProj[0][0],
+				reinterpret_cast<ID3D11ShaderResourceView*>(depth.depthSRV), sdesc.Width, sdesc.Height }, rtv);
 			backup.Restore(context);
 			g_lastFrame = fc;
 			g_lastCam = cam;
@@ -281,12 +316,7 @@ namespace WorldPass
 					continue;
 				}
 				if (context->Map(s.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == S_OK) {
-					if (sdesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-						const auto* h = static_cast<const std::uint16_t*>(m.pData);
-						for (int k = 0; k < 4; ++k) {
-							s.result.rgba[k] = Half(h[k]);
-						}
-					}
+					Decode(sdesc.Format, m.pData, s.result.rgba);
 					context->Unmap(s.staging, 0);
 					Release(s.staging);
 					s.result.done = true;
@@ -339,7 +369,16 @@ namespace WorldPass
 		WowModels::Frame frame{ a_device, a_context, g_frameCb, g_depthState, g_info.reversedZ, g_lastCam,
 			reinterpret_cast<ID3D11ShaderResourceView*>(depth.depthSRV) };
 		std::memcpy(frame.viewProj, fc.viewProj, sizeof(frame.viewProj));
+		// The depth the shadow passes read is kMAIN's: its own size (the UI target can differ under a render scale).
+		UINT depthW = desc.Width, depthH = desc.Height;
+		if (auto* dsrv = reinterpret_cast<ID3D11ShaderResourceView*>(frame.depth)) {
+			ID3D11Resource* dres = nullptr; dsrv->GetResource(&dres);
+			if (dres) { D3D11_TEXTURE2D_DESC dd{}; static_cast<ID3D11Texture2D*>(dres)->GetDesc(&dd); depthW = dd.Width; depthH = dd.Height; dres->Release(); }
+		}
+		const Shadows::Frame shadows{ a_device, a_context, frame.cam, frame.viewProj, frame.depth, depthW, depthH };
+		Shadows::BeginLate(shadows);
 		WowModels::Draw(frame);
+		Shadows::DrawMask(shadows);
 		backup.Restore(a_context);
 		Release(target);
 	}

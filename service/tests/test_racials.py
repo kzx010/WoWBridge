@@ -96,6 +96,29 @@ class Racials(unittest.TestCase):
         geared = character.build(self.cat, [16897])
         self.assertEqual(geared.resistance(3), 10 + self.cat.item(16897).get('nature_res', 0))
 
+    def test_mark_and_gift_of_the_wild_do_not_stack(self):
+        # SpellStacking.cpp: one player family (7) with identical family flags (0x40000), both positive.
+        from service import spells
+        mark, gift = (spells.stack_group(self.cat.spell(sid)) for sid in (9885, 21850))
+        self.assertEqual((mark, gift), ('7:40000', '7:40000'))
+        self.assertEqual(spells.stack_group(self.cat.spell(9910)), '7:100')   # Thorns stacks with both
+        one = character.build(self.cat, [], auras=[21850])
+        both = character.build(self.cat, [], auras=[9885, 21850, 9910])
+        self.assertEqual((both.resistance(3), [a['spell'] for a in both.auras if a['spell'] in (9885, 21850)][:1]),
+                         (one.resistance(3), [21850]))
+
+    def test_stack_groups_need_a_similar_aura_effect_and_keep_the_stronger(self):
+        # IsStackableAuraEffect only reaches the multirank rule for similar effects (effect, aura, sign):
+        # Shadowform (36/79/87) and Fear Ward (77) share family flags but no effect, so both stay.
+        both = character.build(self.cat, [], auras=[15473, 6346], cls=5)
+        self.assertEqual(sorted({a['spell'] for a in both.auras if a['spell'] in (15473, 6346)}), [6346, 15473])
+        # IsSimilarExistingAuraStronger: Mark rank 7 (285 armor) outlasts Gift rank 1 (240) on an old save.
+        kept = character.build(self.cat, [], auras=[21849, 9885])
+        self.assertEqual(sorted({a['spell'] for a in kept.auras if a['spell'] in (21849, 9885)}), [9885])
+        out = self.svc.handle({'op': 'resolve', 'spell': 21849, 'seed': 1, 'target': {'kind': 'self'},
+                               'caster': {'level': 60, 'talents': {}, 'reagents': {'17021': 1}}})
+        self.assertEqual(out['stack_amounts'], {'6:22:+': 240, '6:29:+': 10, '6:143:+': 15})
+
     def test_incoming_resist_roll_uses_her_nature_resistance(self):
         req = {'op': 'damage_taken', 'damage': 400, 'victim_level': 60, 'school': 3, 'attacker_level': 60}
         # Pick a seeded partial resistance, then check the port's exact roll and unchanged health conservation.

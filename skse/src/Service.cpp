@@ -146,10 +146,35 @@ namespace Service
 			if (auto it = g_pending.find(id); it != g_pending.end()) {
 				auto fn = std::move(it->second);
 				g_pending.erase(it);
-				fn(reply);
+				try {
+					fn(reply);
+				} catch (const std::exception& e) {
+					logger::error("service: reply callback {} threw: {}", id, e.what());
+				} catch (...) {
+					logger::error("service: reply callback {} threw an unknown exception", id);
+				}
 			}
 		}
 	}
 
 	bool Connected() { return g_connected; }
+
+	bool CallbackIsolationForTesting()
+	{
+		// Put three local replies in one real Pump batch, without touching the socket or other pending requests.
+		int delivered = 0;
+		const auto first = g_nextId++, second = g_nextId++, last = g_nextId++;
+		g_pending.emplace(first, [](const json&) { throw std::runtime_error("explicit Paladin callback probe"); });
+		g_pending.emplace(second, [](const json&) { throw 1; });
+		g_pending.emplace(last, [&](const json&) { ++delivered; });
+		{ std::lock_guard lock(g_lock);
+			for (const auto id : {first, second, last}) g_inbox.emplace_back(id, json::object());
+		}
+		bool isolated = true;
+		try { Pump(); } catch (...) { isolated = false; }
+		const bool pass = isolated && delivered == 1 && !g_pending.contains(first) && !g_pending.contains(second) && !g_pending.contains(last);
+		// A regression must fail the probe without leaving a callback referring to its local counter.
+		for (const auto id : {first, second, last}) g_pending.erase(id);
+		return pass;
+	}
 }

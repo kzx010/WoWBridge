@@ -8,8 +8,11 @@
 #include "Cast.h"
 #include "Carriers.h"
 #include "Character.h"
+#include "Surrogate.h"
 #include "Console.h"
+#include "Distribution.h"
 #include "Gear.h"
+#include "Learning.h"
 #include "Bags.h"
 #include "Merchant.h"
 #include "Loot.h"
@@ -26,16 +29,22 @@
 #include "ui/WowUi.h"
 #include "Config.h"
 #include "Frame.h"
+#include "Hang.h"
 #include "Hooks.h"
 #include "render/WorldPass.h"
 #include "render/ItemPreview.h"
 #include "render/GroundItems.h"
+#include "render/NpcShoulders.h"
+#include "render/NpcWeapons.h"
+#include "render/NpcHelms.h"
+#include "render/PlayerWeapons.h"
+#include "render/Shadows.h"
 #include "ui/UiPass.h"
 #include "SelfTest.h"
 
 namespace
 {
-	// What the save keeps of her WoW state: each module writes its own record and reads it back by its type.
+	// What the save keeps of their WoW state: each module writes its own record and reads it back by its type.
 	void OnSave(SKSE::SerializationInterface* a_intfc)
 	{
         Carriers::Save(a_intfc);
@@ -43,6 +52,7 @@ namespace
 		Gear::Save(a_intfc);
 		Bags::Save(a_intfc);
 		Progression::Save(a_intfc);
+		Mounts::Save(a_intfc);
 		SkyrimSpells::Save(a_intfc);
 		Character::Save(a_intfc);
 		Integration::Save(a_intfc);
@@ -53,7 +63,9 @@ namespace
 	{
 		std::uint32_t type = 0, version = 0, length = 0;
 		while (a_intfc->GetNextRecordInfo(type, version, length)) {
-            if (type==Carriers::kRecord) {
+            if (type == Surrogate::kSizeRecord) {
+                Surrogate::LoadSize(a_intfc, length, version);
+            } else if (type==Carriers::kRecord) {
                 Carriers::Load(a_intfc,length,version);
             } else if (type == WowUi::kProfileRecord) {
                 WowUi::LoadProfile(a_intfc, length, version);
@@ -69,14 +81,20 @@ namespace
 				Progression::Load(a_intfc, length);
 			} else if (type == Progression::kTalentRecord && version == Progression::kTalentRecordVersion) {
 				Progression::LoadTalents(a_intfc, length);
+			} else if (type == Progression::kBookRecord && version == Progression::kBookRecordVersion) {
+				Progression::LoadBooks(a_intfc, length);
+			} else if (type == Mounts::kRecord && version == Mounts::kRecordVersion) {
+				Mounts::Load(a_intfc, length);
 			} else if (type == SkyrimSpells::kRecord && version == SkyrimSpells::kRecordVersion) {
 				SkyrimSpells::Load(a_intfc, length);
-			} else if (type == Character::kRecord && version == Character::kRecordVersion) {
-				Character::LoadSex(a_intfc, length);
+			} else if (type == Character::kRecord && (version == 1 || version == 3 || version == Character::kRecordVersion)) {
+				// Records are applied in file order: the full LOOK overrides the preceding v1 compatibility record.
+				Character::LoadLooks(a_intfc, length, version);
 			} else {
 				logger::warn("save: a record {:08X} v{} this build does not read", type, version);
 			}
 		}
+		Mounts::Migrate(Gear::Given());   // a save from before learned mounts keeps them all
 	}
 
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg)
@@ -93,14 +111,17 @@ namespace
 			Merchant::Init(); // native barter; ItemPreview retains its independent menu hook
 			Loot::Init();
 			Trainers::Init();
+			Progression::Init();   // a Shrine of Kynareth's talent wipe
 			Cast::Init();
 			Avatar::Init(Forms::kDisplays);
 			Mounts::Init();
+			Learning::Init();   // their spell books and mount items, used from their bags or read
+			Distribution::Init();   // ...found in treasure and sold by tome sellers, stables and caravans
 			WorldLog::Init();
 			SpellVisuals::Init();
-			Frame::Until([] {
+			Frame::Until("gameplay", [] {
 				Integration::Tick();
-				if (!Integration::Active()) return false;
+				if (!Integration::Active()) { NpcWeapons::Reset(); NpcHelms::Reset(); PlayerWeapons::Reset(); return false; }
 				Bridge::Tick();
 				Gear::Tick();
 				Bags::Tick();
@@ -108,14 +129,26 @@ namespace
 				Trainers::Tick();
 				Taxi::Tick();
 				GroundItems::Tick();
+				NpcShoulders::Tick();
+				Frame::Checkpoint("gameplay:NpcWeapons");
+				NpcWeapons::Tick();
+				NpcHelms::Tick();
+				Frame::Checkpoint("gameplay:PlayerWeapons");
+				PlayerWeapons::Tick();
+				Frame::Checkpoint("gameplay");
+				Shadows::Tick();
 				SkyrimAuras::Tick();
-				Progression::Tick();
+				// Their class's book and talents, profile, regeneration and racials: the Druid's and the Paladin's (a Paladin
+				// has no forms; Forms::Tick's form rules wait on a form the player never takes).
+				const bool playable = Character::Get().classId == 11 || Character::Get().classId == 2;
+				if (playable) Progression::Tick();
 				WorldLog::Tick();
 				Quests::Tick();
-				Forms::Tick();
+				if (playable) Forms::Tick();
 				SkyrimSpells::Tick();
 				return false;  // every frame
 			});
+			Hang::Start();
 			break;
 		case SKSE::MessagingInterface::kPreLoadGame:
             Carriers::PrepareLoad();
@@ -124,25 +157,32 @@ namespace
 			Bridge::ForgetNameplates();
 			CompassLocations::Reset();
 			GroundItems::Reset();
+			NpcShoulders::Reset();
+			NpcWeapons::Reset();
+			NpcHelms::Reset();
+			PlayerWeapons::Reset();
 			Character::PrepareLoad();
 			Console::CancelPending();
 			ItemPreview::Reset();
 			Merchant::Reset();
 			Taxi::Reset();
 			Mounts::Reset();
+			Mounts::PrepareLoad();
 			Bags::Reset();
 			Loot::Reset();
 			Trainers::Reset();
 			Gear::Reset();   // a save without its record has not been given the kit
 			Progression::Reset();
-			Quests::Reset();   // a save without its record starts from her skills, not the last game's book
+			Quests::Reset();   // a save without its record starts from their skills, not the last game's book
 			break;
 		case SKSE::MessagingInterface::kPostLoadGame:
 			Mounts::Reset();
 			logger::info("kPostLoadGame ok={}", a_msg->data != nullptr);
+			if (a_msg->data != nullptr) { Character::RestoreIdentity(); Distribution::SetClass(Character::Get().classId); }
 			if (a_msg->data != nullptr) { WowUi::OnGameLoaded(); Integration::OnGameLoaded(); }
             if (a_msg->data!=nullptr) Carriers::OnGameLoaded();
 			// Integration applies the saved preset/kit after Skyrim restores gameplay controls.
+			Melee::Reset();   // before Cast restores their saved Reckoning swings
 			Cast::Reset();
 			SkyrimAuras::Reset();
 			Forms::Reset();
@@ -150,8 +190,7 @@ namespace
 			Progression::Reset();
 			Quests::Reset();
 			Bridge::ForgetLevel();
-			Melee::Reset();
-			Avatar::SetWeaponsDrawn(false);   // a login starts with her weapon sheathed
+			Avatar::SetWeaponsDrawn(false);   // a login starts with their weapon sheathed
 			Bridge::SetTarget(nullptr);
 			break;
 		case SKSE::MessagingInterface::kSaveGame:
@@ -164,17 +203,24 @@ namespace
 			Bridge::ForgetNameplates();
 			CompassLocations::Reset();
 			GroundItems::Reset();
+			NpcShoulders::Reset();
+			NpcWeapons::Reset();
+			NpcHelms::Reset();
+			PlayerWeapons::Reset();
 			logger::info("kNewGame");
 			Character::ResetSex();
+			Distribution::SetClass(Character::Get().classId);   // the catalog's class until creation chooses
 			Console::CancelPending();
 			Merchant::Reset();
 			Taxi::Reset();
 			Mounts::Reset();
+			Mounts::PrepareLoad();   // a new game has no mounts
 			Bags::Reset();
 			Loot::Reset();
 			Trainers::Reset();
 			Gear::Reset();
 			Gear::OnGameLoaded();
+			Melee::Reset();   // before Cast restores their saved Reckoning swings
 			Cast::Reset();
 			SkyrimAuras::Reset();
 			Forms::Reset();
@@ -182,8 +228,7 @@ namespace
 			Progression::Reset();
 			Quests::Reset();
 			Bridge::ForgetLevel();
-			Melee::Reset();
-			Avatar::SetWeaponsDrawn(false);   // a login starts with her weapon sheathed
+			Avatar::SetWeaponsDrawn(false);   // a login starts with their weapon sheathed
 			Bridge::SetTarget(nullptr);
 			break;
 		default:
@@ -240,9 +285,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 		logger::info("runtime {}", REL::Module::get().version().string());
 		AddVectoredExceptionHandler(1, OnFault);
 		Config::Load();  // needed before the first UI frame (main menu)
-		Console::Install();   // testing commands: without them she still plays
+		Console::Install();   // testing commands: without them the player still plays
 		SKSE::AllocTrampoline(1 << 10);
-		if (!Hooks::Install() || !WorldPass::Install() || !UiPass::Install()) {
+		if (!Hooks::Install() || !WorldPass::Install() || !Shadows::Install() || !UiPass::Install()) {
 			logger::critical("hook installation failed; plugin inactive");
 			return false;
 		}

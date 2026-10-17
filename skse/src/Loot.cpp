@@ -49,7 +49,15 @@ namespace Loot
 			if (source->GetParentCell()->IsInteriorCell() || player->GetParentCell()->IsInteriorCell()) {
 				if (source->GetParentCell() != player->GetParentCell()) return false;
 			} else if (source->GetWorldspace() != player->GetWorldspace()) return false;
-			return source->GetPosition().GetDistance(player->GetPosition()) <= 320.f;
+			float reach = 320.f;
+			if (auto* actor = source->As<RE::Actor>()) {
+				if (!actor->Is3DLoaded()) return false;
+				// Large corpses can be activated beside the player's body, well away from
+				// the origin. Keep the same five-yard allowance outside that radius.
+				const float radius = actor->GetBoundRadius();
+				if (std::isfinite(radius) && radius > 0) reach += radius;
+			}
+			return source->GetPosition().GetDistance(player->GetPosition()) <= reach;
 		}
 
 		struct Part
@@ -66,7 +74,7 @@ namespace Loot
 				if (!form || !form->GetPlayable() || data.first <= 0) continue;
 				int remaining = data.first;
 				auto add = [&](RE::ExtraDataList* extra, int count) {
-					if (count <= 0) return;
+					if (count <= 0 || !Bags::Listed(form, extra)) return;
 					RE::InventoryEntryData entry(form, count);
 					if (extra) entry.AddExtraList(extra);
 					auto* owner = entry.GetOwner();
@@ -145,9 +153,12 @@ namespace Loot
 					const auto source = ref ? ref->CreateRefHandle() : RE::ObjectRefHandle{};
 					const auto session = g_session.load();
 					const bool shift = Input::ShiftHeld();
-					SKSE::GetTaskInterface()->AddTask([source, session, shift] {
-						if (session != g_session || !g_backend) return;
-						g_source = source; g_active = session; g_closing = false; g_slots.clear(); g_last.clear();
+					// Its own menu, not a stale session number: a previous container's queued hide bumps g_session
+					// between this capture and the task (a right-click a second after a loot window closed published
+					// nothing in three suites, October 16), and this menu is still the backend.
+					SKSE::GetTaskInterface()->AddTask([source, session, shift, menu] {
+						if (g_backend != menu) return;
+						g_source = source; g_active = std::max(session, g_session.load()); g_closing = false; g_slots.clear(); g_last.clear();
 						Publish(true, shift);
 					});
 				} else if (message.type == T::kHide || message.type == T::kForceHide) {

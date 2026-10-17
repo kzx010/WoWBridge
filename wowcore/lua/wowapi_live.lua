@@ -3,13 +3,14 @@
 --
 -- __WBApplyLive(s) takes a snapshot table; any part left out is left as it was:
 --   s.player = { level, levelUp = {level, gains}, xp, xpMax, health, healthMax, power, powerMax, powerType, combat, skyrim } (skyrim = { Destruction, Restoration, Alteration }:
---              her skills; with it her mana is magicka and costs are a fifth)
+--              their skills; with it their mana is magicka and costs are a fifth)
 --   s.target = { guid, name, level, health, healthMax, reaction, attackable, isPlayer, classification,
 --                creatureType, distance, dead, sex, class, classToken, powerType } | "player" (yourself) | false (none)
 --   s.mouseover = a unit as s.target | { object, locked, steal } (a thing in the world) | false (nothing)
 --   s.party = ordered list of up to four units, with power/powerMax/connected and known Skyrim auras
 --   s.nameplates = { epoch, units = { { guid, name, level, health, healthMax, reaction, classification,
---                    attackable, x/y = normalized screen position from top left, distance = yards }, ... } }
+--                    attackable, x/y = normalized screen position from top left, distance = yards,
+--                    bx/by = the same for its chat bubble's point, 0.7 yards over it }, ... } }
 --   s.world  = { zone, subzone, hour, minute }
 --   s.minimap = { worldspace = terrain editor ID, x/y = yards east/north, heading = radians clockwise, trackingMask = creature mask,
 --                 blips = { {guid, x/y = yards east/north, reaction = 1..8}, ... } } | false
@@ -160,10 +161,11 @@ local function applyPlayer(s)
   end
 end
 
--- Opt in to her learned forms. The bar keeps the original Bear slot when Dire Bear replaces it at level 40:
+-- Opt in to their learned forms. The bar keeps the original Bear slot when Dire Bear replaces it at level 40:
 -- Bear/Dire Bear, Aquatic, Cat, Travel. Names and icons come from Spell/SpellIcon, not a second icon table.
--- count: the forms she knows, in the order a druid learns them (Bear 10, Aquatic 16, Cat 20, Travel 30); default all.
+-- count: the forms the player knows, in the order a druid learns them (Bear 10, Aquatic 16, Cat 20, Travel 30); default all.
 function __WBDruidForms(bearSpell, count, moonkin)
+  if WB.classId and WB.classId ~= 11 then WB.forms = {} WB.formIndex = 0 return end
   bearSpell = bearSpell or 9634
   assert(bearSpell == 5487 or bearSpell == 9634, "expected Bear or Dire Bear spell")
   local active = WB.forms and WB.forms[WB.formIndex or 0]
@@ -194,6 +196,7 @@ end
 -- Call only while constructing a new action layout, never after loading the player's
 -- saved actions. A partially populated realm page is also a player-owned layout.
 function __WBDefaultFormActions()
+  if WB.classId and WB.classId ~= 11 then return end
   WB.actions = WB.actions or {}
   local pages = {
     { 73, 9850, 9830, 9904, 9896, 31018, 9846, 9821, 9892, 17392, 9913 },
@@ -212,6 +215,7 @@ function __WBDefaultFormActions()
 end
 
 function __WBForm(index, powerType, prowling, activeSpell)
+  if WB.classId and WB.classId ~= 11 then index, powerType, prowling, activeSpell = 0, 0, false, 0 end
   if not WB.forms then __WBDruidForms() end
   assert(index == 0 or WB.forms[index], "invalid shapeshift bar index")
   local form = WB.forms[index]
@@ -241,6 +245,46 @@ function __WBForm(index, powerType, prowling, activeSpell)
   if changed then fire("UPDATE_SHAPESHIFT_FORMS") fire("PLAYER_AURAS_CHANGED") end
   if pageChanged then fire("UPDATE_BONUS_ACTIONBAR") fire("ACTIONBAR_PAGE_CHANGED") end
   if changed or pageChanged then fire("ACTIONBAR_UPDATE_STATE") fire("ACTIONBAR_UPDATE_USABLE") end
+  if WB.classId == 2 then __WBPaladinAuras() end   -- their bar holds their auras, not forms
+end
+
+-- A Paladin's auras ride the stance bar: the 1.12 client lists spells with AttributesEx2's
+-- SPELL_ATTR_EX2_USE_SHAPESHIFT_BAR (0x10) there, the highest rank of each in their book's order; the aura on the player is
+-- the active button, and clicking one casts it (the host's shapeshift command casts any spell the player knows).
+function __WBPaladinAuras()
+  if WB.classId ~= 2 then return end
+  local forms, byName = {}, {}
+  for _, id in ipairs(WB.spellbook or {}) do
+    local info = type(id) == "number" and id > 0 and WB.spellInfo(id)
+    if info and math.floor((info.attributesExB or 0) / 16) - math.floor((info.attributesExB or 0) / 32) * 2 == 1 then
+      local f = byName[info.name]
+      if not f then
+        f = { spell = id, icon = info.icon, name = info.name, castable = true, active = false }
+        byName[info.name] = f
+        table.insert(forms, f)
+      elseif (info.spellLevel or 0) > ((WB.spellInfo(f.spell) or {}).spellLevel or 0) then
+        f.spell, f.icon = id, info.icon
+      end
+    end
+  end
+  local player = WB.units and WB.units[WB.tokens.player]
+  local index = 0
+  for i, f in ipairs(forms) do
+    for _, a in ipairs(player and player.buffs or {}) do
+      local info = WB.spellInfo(a.spell)
+      if info and info.name == f.name then f.active = true index = i end
+    end
+  end
+  local before = WB.forms
+  local changed = not before or table.getn(before) ~= table.getn(forms) or (WB.formIndex or 0) ~= index
+  if not changed then
+    for i, f in ipairs(forms) do if before[i].spell ~= f.spell then changed = true end end
+  end
+  WB.forms, WB.formIndex = forms, index
+  if changed then
+    fire("UPDATE_SHAPESHIFT_FORMS")
+    if UIParent_ManageFramePositions then UIParent_ManageFramePositions() end
+  end
 end
 
 -- Active form is independent of learned slots: console previews can enter an
@@ -355,7 +399,7 @@ local function applyWorld(w)
     GameTimeFrame_Update()
     this = previous
   end
-  if w.money and set(W, "money", w.money) then fire("PLAYER_MONEY") end   -- her septims (Bridge.cpp)
+  if w.money and set(W, "money", w.money) then fire("PLAYER_MONEY") end   -- their septims (Bridge.cpp)
   if zone then fire("ZONE_CHANGED_NEW_AREA") elseif sub then fire("ZONE_CHANGED") end
   if zone or sub then fire("MINIMAP_ZONE_CHANGED") end
 end
@@ -376,6 +420,7 @@ function __WBApplyLive(s)
     if old ~= (WB.minimap and WB.minimap.worldspace) then fire("MINIMAP_UPDATE_ZOOM") end
   end
   if s.worldmap ~= nil then WB.worldmap = s.worldmap or nil end
+  if s.head ~= nil then WB.playerHead = s.head or nil end
 end
 
 ------------------------------------------------------------------------------------------------- casting and combat
@@ -397,9 +442,11 @@ function __WBUiError(key)
 end
 
 -- What a person or creature says, as the client shows a creature's speech in chat ("Faendal says: ..."; General
--- carries CREATURE). The host passes Skyrim's subtitles.
-function __WBSay(speaker, text)
+-- carries CREATURE) and, with its unit (the actor's form ID, yards from the player), over its head (wowapi_bubbles.lua).
+-- The host passes Skyrim's subtitles and the people's answers to their emotes.
+function __WBSay(speaker, text, guid, yards)
   __WBFire("CHAT_MSG_MONSTER_SAY", text, speaker, "", "", "", "", 0, 0, "")
+  if guid then __WBChatBubble(guid, text, "MONSTER_SAY", yards) end
 end
 
 -- A combat log line: the chat event and the GlobalStrings format it is written with. The client gives every chat
@@ -549,6 +596,9 @@ local function installTalentApi()
     return unpack(args, 1, args.n)
   end
   UnitCharacterPoints = function(unit)
+    -- Another class has no points; a Paladin's come with their talent snapshot (none before it arrives).
+    if WB.classId and WB.classId ~= 11 and UnitIsUnit(unit,"player") and
+       (WB.classId ~= 2 or table.getn((WB.talents or {}).trees or {}) == 0) then return 0,0 end
     if UnitIsUnit(unit, "player") then
       local spent = WB.talents.points_spent or (math.max(0, WB.talents.level - 9) - WB.talents.points_available)
       return math.max(0, UnitLevel("player") - 9 - spent), 0
@@ -564,7 +614,51 @@ local function installTalentApi()
     end
   end
 end
-WB.installTalentApi = installTalentApi   -- __WBLogin: after a ReloadUI her talents are back before any reply
+WB.installTalentApi = installTalentApi   -- __WBLogin: after a ReloadUI their talents are back before any reply
+
+-- P1 has identity and a body; no class kit until its progression is implemented.
+function __WBEmptyClass()
+  -- Another class's kit goes (a Druid's forms, spells, bars, talents). Their own class's book and talents, which
+  -- Progression published for their class (a Paladin's), stay through later identity publications.
+  local own = WB.classReply and WB.classReply.class_id == WB.classId
+  local ownRows = own and WB.classRows or {}
+  WB.forms, WB.formIndex, WB.activeFormSpell = {}, 0, 0
+  WB.comboPoints, WB.prowling, WB.manaSnapshot = 0, false, nil
+  if not own then WB.classRows, WB.classLines, WB.classTabs, WB.classReply = {}, {}, {}, nil end
+  local keep, book = {[6603]=true}, {6603}
+  for id in pairs(ownRows) do keep[id] = true end
+  for _, mount in ipairs(WB.mountCatalog or {}) do
+    if mount.spell then keep[mount.spell] = mount.learned and true or false end
+  end
+  local function retained(id)
+    if id < 0 then return true end -- native Skyrim spells, powers and shouts are not class spells
+    if keep[id] ~= nil then return keep[id] end
+    local info = WB.spellInfo(id)
+    -- Start restores actions before the mount catalog (including its synthetic spells) arrives.
+    if not info or info.mountKey then return true end
+    for _, e in ipairs(info.effects or {}) do if e.aura == 78 then return true end end -- SPELL_AURA_MOUNTED
+    return false
+  end
+  local seen = {[6603]=true}
+  for _, id in ipairs(WB.spellbook or {}) do
+    if retained(id) and not seen[id] then tinsert(book,id) seen[id]=true end
+  end
+  for _, mount in ipairs(WB.mountCatalog or {}) do
+    if mount.spell and mount.learned and not seen[mount.spell] then tinsert(book,mount.spell) seen[mount.spell]=true end
+  end
+  WB.unlearned, WB.spellbook, WB.spellbookDirty = own and WB.unlearned or {}, book, true
+  for slot, action in pairs(WB.actions or {}) do
+    if action.spell and not retained(action.spell) then WB.actions[slot] = nil end
+  end
+  if not (WB.talents and WB.talents.class_id and WB.talents.class_id == WB.classId) then
+    WB.talents = {trees={},talents={},points_available=0,points_spent=0}
+  end
+  if not __WBTalentApi then installTalentApi() end
+  local p = WB.units and WB.units[WB.tokens.player]
+  if p then p.powerType = 0 end
+  fire("UPDATE_SHAPESHIFT_FORMS") fire("CHARACTER_POINTS_CHANGED",0,0)
+  if WB.classId == 2 then __WBPaladinAuras() end
+end
 
 function __WBInstallTalents()
   -- Older caches omit this command. Restore its default only when neither
@@ -588,6 +682,7 @@ end
 -- Bridge wording for the pinned enUS client; locales may override this string.
 WB_ERR_NO_TALENT_POINTS=WB_ERR_NO_TALENT_POINTS or "Not enough talent points."
 function __WBTalents(reply)
+  if WB.classId and WB.classId ~= 11 and WB.classId ~= 2 then return false end   -- the Druid's and the Paladin's trees
   if reply.ok == false then
     local message=reply.error or "Talent could not be learned"
     if string.find(message,"no_points",1,true) then message=WB_ERR_NO_TALENT_POINTS end
@@ -601,6 +696,21 @@ function __WBTalents(reply)
   -- 1.12 supplies both talent and skill point deltas. ChatFrame reads arg2 numerically.
   fire("CHARACTER_POINTS_CHANGED", reply.points_available - (old and old.points_available or 0), 0)
   return true
+end
+
+-- A Shrine of Kynareth is their talent master (docs/talents.md): the host fires the client's own CONFIRM_TALENT_WIPE with
+-- the wipe's price in copper and the unchanged StaticPopup asks. Accept sends the offer's session and the price shown;
+-- the host pays and unlearns, or answers ERR_NOT_ENOUGH_MONEY. CheckTalentMasterDist holds while the player is within reach of
+-- the shrine the player prayed at (the host's nil ends it), so the popup's OnUpdate hides it as the player walks away. The recorded
+-- answers remain until the first offer.
+function __WBTalentWipe(session, cost)
+  WB.talentWipe = session and { session = session, cost = cost } or nil
+  CheckTalentMasterDist = function() return WB.talentWipe and 1 or nil end
+  ConfirmTalentWipe = function()
+    local w = WB.talentWipe
+    if w then WB.host("talentWipe", w.session, w.cost) end
+  end
+  if session then fire("CONFIRM_TALENT_WIPE", cost * 10000) end
 end
 
 -- Opt-in book refresh from the service's known_spells response. This is deliberately quiet on login/load;
@@ -630,6 +740,7 @@ local function hookClassBook()
 end
 
 function __WBClassSpells(reply)
+  if WB.classId and WB.classId ~= 11 and WB.classId ~= 2 then return end   -- the Druid's and the Paladin's books
   local previousRows = WB.classRows or {}
   local rows, unlearned, tabs, lines, ids, seen = {}, {}, {}, {}, {}, {}
   for key, line in pairs(reply.lines) do
@@ -682,8 +793,10 @@ function __WBClassSpells(reply)
     return best and known[best] and best or nil
   end
   for slot, action in pairs(WB.actions or {}) do
-    local id = reconcile(action.spell)
-    if id then action.spell = id else WB.actions[slot] = nil end
+    if not action.item then
+      local id = reconcile(action.spell)
+      if id then action.spell = id else WB.actions[slot] = nil end
+    end
   end
   if WB.cursor and WB.cursor.spell then
     local id = reconcile(WB.cursor.spell)
@@ -701,7 +814,15 @@ function __WBClassSpells(reply)
   WB.classReply = reply   -- reinstall the class book's FrameXML hooks after ReloadUI
   WB.unlearned, WB.unlearnedSpells = unlearned, reply.unlearned_spells
   WB.spellbook, WB.spellbookDirty = ids, true
-  if reply.spell_tooltips then __WBSpellTooltips(reply.spell_tooltips) end
+  -- The book's answer carries the profiles of the spells it lists; the costs answer (op skyrim_costs) carries every
+  -- class spell's and item use's. Add these to those: replacing them left the rest (an unlearned rank, a Use: line)
+  -- on the client's own guess at Skyrim's numbers until the next costs answer.
+  if reply.spell_tooltips then
+    local merged = {}
+    for id, profile in pairs(WB.spellTooltips or {}) do merged[id] = profile end
+    for id, profile in pairs(reply.spell_tooltips) do merged[tonumber(id)] = profile end
+    __WBSpellTooltips(merged)
+  end
   fire("SPELLS_CHANGED")
   fire("ACTIONBAR_SLOT_CHANGED", 0)
 end
@@ -770,7 +891,7 @@ function __WBLevelUp(level, gains, delayed)
   fire("PLAYER_LEVEL_UP", level, health, magicka, 0, gain("strength"), gain("agility"), gain("wow_stamina"), gain("intellect"), gain("spirit"))
   ChatFrame_OnEvent = original
   if gain("stamina") > 0 then __WBLog("CHAT_MSG_SYSTEM", format(LEVEL_UP_STAT, SPELL_STAT2_NAME, gain("stamina"))) end
-  WB.host("levelUp", level) -- host draws ClientDb::levelUpEffect() at her feet
+  WB.host("levelUp", level) -- host draws ClientDb::levelUpEffect() at the player's feet
   PlaySound("LEVELUPSOUND")
   return true
 end
@@ -840,6 +961,7 @@ end
 
 function __WBGcd(seconds)
   WB.gcd = { GetTime(), seconds }
+  fire("BAG_UPDATE_COOLDOWN")   -- a use spell's GCD sweeps bag and character slots too
   fire("ACTIONBAR_UPDATE_COOLDOWN")
   fire("SPELL_UPDATE_COOLDOWN")
 end
@@ -849,8 +971,8 @@ function __WBRefreshCooldowns()
   for id in pairs(WB.cooldowns) do if id>0 then WB.cooldowns[id]=nil end end
   fire("BAG_UPDATE_COOLDOWN") fire("ACTIONBAR_UPDATE_COOLDOWN") fire("SPELL_UPDATE_COOLDOWN")
 end
-function __WBCooldown(spell, seconds)
-  WB.cooldowns[spell] = { GetTime(), seconds }
+function __WBCooldown(spell, seconds, held)   -- held: waits for an aura to fade (SPELL_ATTR_COOLDOWN_ON_EVENT)
+  WB.cooldowns[spell] = { GetTime(), seconds, held = held and true or nil }
   fire("BAG_UPDATE_COOLDOWN")
   fire("ACTIONBAR_UPDATE_COOLDOWN")
   fire("SPELL_UPDATE_COOLDOWN")
@@ -875,9 +997,10 @@ function __WBAuraAdd(who, spell, harmful, seconds, tooltip)
                           expires = seconds and seconds > 0 and GetTime() + seconds or nil,
                           untilCancelled = not seconds or seconds <= 0 })
   __WBUnitAuraChanged(who)
+  if who == "player" and WB.classId == 2 then __WBPaladinAuras() end
 end
 
--- The Skyrim spells she knows (SkyrimSpells), as spells of her book: each by -(its Skyrim form id), with what the
+-- The Skyrim spells the player knows (SkyrimSpells), as spells of their book: each by -(its Skyrim form id), with what the
 -- interface asks of a spell (name, icon, cost in magicka, cast time, range, targetsUnit, harmful, description).
 local function skyrimBookChanged()
   WB.skyrimSpells = {}
@@ -1014,7 +1137,7 @@ function __WBSkyrimPowerUsed(id, seconds)
   __WBSkyrimPowerCooldown(id, seconds or s.cooldownSeconds)
 end
 
--- Skyrim's own magic on her (SkyrimAuras): a potion, a blessing, a disease, a Skyrim spell - an aura with Skyrim's name
+-- Skyrim's own magic on the player (SkyrimAuras): a potion, a blessing, a disease, a Skyrim spell - an aura with Skyrim's name
 -- and words. key: its Skyrim spell's form id; seconds 0: until cured or cancelled.
 function __WBSkyrimAura(key, name, icon, harmful, seconds, text, dispel)
   local u = WB.units[WB.tokens.player]
@@ -1052,6 +1175,7 @@ function __WBAuraRemove(who, spell)
     end
   end
   __WBUnitAuraChanged(who)
+  if who == "player" and WB.classId == 2 then __WBPaladinAuras() end
 end
 
 -- A save loaded or a new game: nothing cast, placed or applied carries over (the host's aura table is cleared too).
@@ -1077,20 +1201,105 @@ function __WBResetCombat()
 end
 
 ------------------------------------------------------------------------------------------------------ Skyrim's menus
+-- Interface Options as the client lays them out, less what has nothing behind it in single-player Skyrim: the mouse
+-- and camera are Skyrim's; no click-to-move, assist, AFK, trades, profanity or spam filter, unit names, quest dialog
+-- or tracker, loading screen tips, guild, pets, raid frames or floating combat text; Auto Self Cast and Sticky
+-- Targeting are not honoured; WoW's tutorials (the user: remove the toggle) are cleared, Show Tutorials and Reset
+-- Tutorials gone. Whole boxes go (Camera, Raid & Party, Combat Text); in the rest the options left close up in the
+-- client's columns and each box is as tall as its rows. Hidden ones leave the panel's table, so Okay and Defaults
+-- leave their settings alone. Added: Area Spells Hit Friendly and Skyrim Minimap Icons (Controls).
+local HIDDEN_OPTIONS = { 1, 3, 5, 6, 13, 14, 16, 21, 22, 23, 28, 30, 38, 42, 44, 45, 46, 51, 61, 62, 66, 67, 68 }
+
+local function minimapNativeArtOption()
+  if UIOptionsFrameCheckButton72 or not BasicOptionsGeneral then return end
+  local option = CreateFrame("CheckButton", "UIOptionsFrameCheckButton72", BasicOptionsGeneral, "UIOptionsCheckButtonTemplate")
+  WB_MINIMAP_NATIVE_ART_TEXT = "Skyrim Minimap Icons"
+  getglobal(option:GetName() .. "Text"):SetText(WB_MINIMAP_NATIVE_ART_TEXT)
+  OPTION_TOOLTIP_WB_MINIMAP_NATIVE_ART = "Show Skyrim's compass icons on the minimap rim. Uncheck to show WoW icons at known positions; unmatched markers keep their Skyrim icons on the rim."
+  option.tooltipText = OPTION_TOOLTIP_WB_MINIMAP_NATIVE_ART
+  UIOptionsFrameCheckButtons.WB_MINIMAP_NATIVE_ART_TEXT = { index = 72, cvar = "wbMinimapNativeArt" }
+end
+
+-- WoW's area spells spare friendly people; ticked, theirs strike everyone caught in them, as Skyrim's do (each struck
+-- friend an assault). The host hears the setting whenever it changes and when their interface starts.
+function __WBAreaFriendly() WB.host("areaFriendly", GetCVar("wbAreaFriendly") == "1" and 1 or 0) end
+local function areaFriendlyOption()
+  if UIOptionsFrameCheckButton71 or not BasicOptionsGeneral then return end
+  WB.cvarDefaults.wbAreaFriendly = "0"
+  RegisterCVar("wbAreaFriendly", 0)
+  local setCVar = SetCVar
+  SetCVar = function(name, ...)
+    local result = setCVar(name, ...)
+    if name == "wbAreaFriendly" then __WBAreaFriendly() end
+    return result
+  end
+  local option = CreateFrame("CheckButton", "UIOptionsFrameCheckButton71", BasicOptionsGeneral, "UIOptionsCheckButtonTemplate")
+  WB_AREA_FRIENDLY_TEXT = "Area Spells Hit Friendly"
+  getglobal(option:GetName() .. "Text"):SetText(WB_AREA_FRIENDLY_TEXT)
+  OPTION_TOOLTIP_WB_AREA_FRIENDLY = "Your area spells also strike friendly people caught in them, as Skyrim's spells do. Each one struck is an assault."
+  option.tooltipText = OPTION_TOOLTIP_WB_AREA_FRIENDLY
+  UIOptionsFrameCheckButtons.WB_AREA_FRIENDLY_TEXT = { index = 71, cvar = "wbAreaFriendly" }
+  __WBAreaFriendly()
+end
+local function interfaceOptions(keepHidden)
+  local boxes = { BasicOptionsCamera, AdvancedOptionsRaid, AdvancedOptionsCombatText }
+  for _, box in ipairs(boxes) do keepHidden(box) end
+  areaFriendlyOption()
+  minimapNativeArtOption()
+  keepHidden(UIOptionsFrameResetTutorials)
+  if ClearTutorials then ClearTutorials() end
+  keepHidden(UIOptionsFrameSlider1) keepHidden(UIOptionsFrameClickCameraDropDown)
+  local hidden = {}
+  for _, n in ipairs(HIDDEN_OPTIONS) do hidden[n] = true keepHidden(getglobal("UIOptionsFrameCheckButton" .. n)) end
+  for key, info in pairs(UIOptionsFrameCheckButtons) do
+    local parent = getglobal("UIOptionsFrameCheckButton" .. info.index):GetParent()
+    if hidden[info.index] or parent == boxes[1] or parent == boxes[2] or parent == boxes[3] then
+      UIOptionsFrameCheckButtons[key] = nil
+    end
+  end
+  UIOptionsFrameSliders = {}   -- the mouse's and the camera's
+  local function rows(box, n) box:SetHeight(16 + 26 * n) end
+  local function place(n, point, to, toPoint, x, y)
+    local b = getglobal("UIOptionsFrameCheckButton" .. n)
+    if b then b:ClearAllPoints() b:SetPoint(point, to, toPoint, x, y) end
+  end
+  -- Controls: Auto Loot (wowapi_loot.lua). Display: tooltips and status text | cloak, helm | buffs, party background.
+  place(70, "TOPLEFT", BasicOptionsGeneral, "TOPLEFT", 10, -8)
+  place(71, "TOPLEFT", BasicOptionsGeneral, "TOP", -80, -8)
+  place(72, "TOPLEFT", BasicOptionsGeneral, "TOPRIGHT", -220, -8) rows(BasicOptionsGeneral, 1)
+  place(31, "TOPLEFT", BasicOptionsDisplay, "TOP", -80, -8)
+  place(39, "TOPLEFT", BasicOptionsDisplay, "TOPRIGHT", -220, -8)
+  place(43, "TOP", UIOptionsFrameCheckButton39, "BOTTOM", 0, 0) rows(BasicOptionsDisplay, 2)
+  BasicOptionsHelp:ClearAllPoints()
+  BasicOptionsHelp:SetPoint("TOPLEFT", BasicOptionsDisplay, "BOTTOMLEFT", 0, -20)
+  BasicOptionsHelp:SetPoint("TOPRIGHT", BasicOptionsDisplay, "BOTTOMRIGHT", 0, -20) rows(BasicOptionsHelp, 1)
+  place(29, "TOPLEFT", BasicOptionsHelp, "TOPLEFT", 10, -8)   -- Show Detailed Tooltips, alone now
+  -- Chat, the width of Action Bars above it, in its columns: simple chat, lock | hover delay, bubbles.
+  AdvancedOptionsChat:ClearAllPoints()
+  AdvancedOptionsChat:SetPoint("TOPLEFT", AdvancedOptionsActionBars, "BOTTOMLEFT", 0, -20)
+  AdvancedOptionsChat:SetPoint("TOPRIGHT", AdvancedOptionsActionBars, "BOTTOMRIGHT", 0, -20)
+  place(18, "TOP", AdvancedOptionsChat, "TOP", -80, -8) rows(AdvancedOptionsChat, 2)
+end
+
 -- In Skyrim the panels with nothing behind them here open Skyrim's own menu for the same purpose (docs: the plan's
--- micro menu mapping): Character, Skills and Reputation stay in the client;
--- world map -> map; the game menu's video and sound options, logout and exit -> Skyrim's journal (its system page).
--- Social opens the testing tools; help stays inert. The spellbook, key bindings and interface options stay WoW's. Run once the interface
--- is loaded, in game only: the reference renders keep the client's own panels.
+-- micro menu mapping): Character and Skills stay in the client; world map -> map. The main menu keeps the client's
+-- look with the rows that do something here: Skyrim Options (in place of video and sound options) and Exit Game open
+-- Skyrim's system page, where its settings and Quit are; Macros (nothing runs them) and Logout (Skyrim has none) go.
+-- Social opens the testing tools; Help, with nothing behind it, is hidden. The spellbook, key bindings (less the
+-- rows Skyrim has no use for: __WBSkyrimKeys) and interface options stay WoW's. Run once the interface is loaded,
+-- in game only: the reference renders keep the client's own panels.
 function __WBSkyrimMenus()
   local function open(menu) WB.host("menu", menu) end
   local function system() HideUIPanel(GameMenuFrame) open("System") end   -- Skyrim's Esc menu
+  local function keepHidden(f) if f then f:Hide() f.Show = function() end end end
+  __WBSkyrimKeys() -- before the bags' own adjustment to the bindings
   __WBInstallCharacter() -- C and the micro button use the client's CharacterFrame
   __WBInstallTalents()
   __WBInstallBags() __WBInstallMerchant() -- B and the bag buttons keep the client's ContainerFrames
   __WBInstallWorldMap() -- M and the world-map micro button open Skyrim's MapMenu
   __WBInstallLoot() -- native corpses/containers keep Skyrim's transfer and crime lifecycle
-  -- Skyrim has one coin: her septims show as gold alone (1 septim = 1 gold; the user: "You don't need to show
+  __WBInstallChatBubble() -- their own SAY/YELL over their head
+  -- Skyrim has one coin: their septims show as gold alone (1 septim = 1 gold; the user: "You don't need to show
   -- copper or silver in the bags since there's only one denomination in Skyrim"), none as "0" gold.
   local player = MoneyTypeInfo and MoneyTypeInfo["PLAYER"]
   if player and not player.wbGoldOnly then
@@ -1106,22 +1315,30 @@ function __WBSkyrimMenus()
       update(frameName, money)
     end
   end
-  -- The quest log is the client's (her Skyrim quests, Quests.cpp); Skyrim's journal stays on its own key.
+  -- The quest log is the client's (their Skyrim quests, Quests.cpp); Skyrim's journal stays on its own key.
   __WBInstallQuestLog() -- also restore the count format after ReloadUI
   QuestLogFrameAbandonButton:Disable()   -- Skyrim's quests cannot be abandoned: its button stays disabled
   QuestLogFrameAbandonButton.Enable = function() end
   ToggleFriendsFrame = function() __WBTestPanelToggle() end
-  SocialsMicroButton.tooltipText = "Testing tools"
+  -- Its tooltip names it as its binding does, with the key as the client shows one (and again when bindings change).
+  BINDING_NAME_TOGGLESOCIAL = "Testing Tools"
+  local function socials() SocialsMicroButton.tooltipText = MicroButtonTooltipText(BINDING_NAME_TOGGLESOCIAL, "TOGGLESOCIAL") end
+  socials() SocialsMicroButton:SetScript("OnEvent", socials)
   SocialsMicroButton.newbieText = "Open WoWBridge character, skills, gear, spells, travel and spawn tools."
   ToggleHelpFrame = function() end
+  keepHidden(HelpMicroButton)
   Logout = function() WB.host("logout") system() end
   Quit = function() WB.host("quit") system() end
-  for _, name in ipairs({ "GameMenuButtonOptions", "GameMenuButtonSoundOptions" }) do
-    getglobal(name):SetScript("OnClick", function() PlaySound("igMainMenuOption") system() end)
-  end
+  GameMenuButtonOptions:SetText("Skyrim Options")
+  GameMenuButtonOptions:SetScript("OnClick", function() PlaySound("igMainMenuOption") system() end)
+  keepHidden(GameMenuButtonSoundOptions) keepHidden(GameMenuButtonMacros) keepHidden(GameMenuButtonLogout)
+  GameMenuButtonUIOptions:ClearAllPoints() GameMenuButtonUIOptions:SetPoint("TOP", GameMenuButtonOptions, "BOTTOM", 0, -1)
+  GameMenuButtonQuit:ClearAllPoints() GameMenuButtonQuit:SetPoint("TOP", GameMenuButtonKeybindings, "BOTTOM", 0, -1)
+  GameMenuFrame:SetHeight(180)   -- the client's 246, three 22-pixel rows fewer
+  interfaceOptions(keepHidden)
+  __WBShowGear()   -- their Show Helm and Show Cloak, for their model
   -- Chat is shown (the user's choice: the combat log lives there), less its menu button (the speech bubble: the
   -- user's choice). WB.hideChat = true before this runs keeps its frames, tabs and buttons from showing too.
-  local function keepHidden(f) if f then f:Hide() f.Show = function() end end end
   keepHidden(ChatFrameMenuButton)
   if WB.hideChat then
     for i = 1, NUM_CHAT_WINDOWS or 7 do
@@ -1176,7 +1393,7 @@ function __WBSkyrimMenus()
   end
 end
 
--- Her and her target's frames, locked or unlocked from their right-click menu (the user's request, as later clients
+-- The player's and their target's frames, locked or unlocked from their right-click menu (the user's request, as later clients
 -- offer it: 1.12's unit frames never move, WoWee lets these two drag). Locked to begin with; the unlocked ones are
 -- kept between sessions (WBUnlockedFrames: their names).
 WBUnlockedFrames = ""
@@ -1325,6 +1542,7 @@ function __WBEscapeHasWork()
     if f and f:IsVisible() then return 1 end
   end
   if (OptionsFrame and OptionsFrame:IsVisible()) or (GameMenuFrame and GameMenuFrame:IsVisible()) then return 1 end
+  if WBCustomizeFrame and WBCustomizeFrame:IsVisible() then return 1 end   -- Escape is its Cancel
   for i = 1, UIDROPDOWNMENU_MAXLEVELS or 2 do
     local f = getglobal("DropDownList" .. i)
     if f and f:IsVisible() then return 1 end

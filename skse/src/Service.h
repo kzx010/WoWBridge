@@ -15,4 +15,5 @@ namespace Service
 	void Request(json a_request, Reply a_onReply);  // main thread
 	void Pump();                                     // main thread: deliver replies
 	bool Connected();
+	bool CallbackIsolationForTesting(); // explicit-only: throwing replies followed by a good reply in one Pump batch
 }

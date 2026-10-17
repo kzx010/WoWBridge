@@ -1,5 +1,8 @@
 -- Skyrim corpses/containers in the client's actual 1.12 LootFrame. Recorded answers stay intact until live loot.
 local WB, MT = __WB, __WoweeFrameMT
+BINDING_HEADER_WOWBRIDGE = "WoWBridge"
+BINDING_NAME_WBLOOTALL = "Loot All"
+BINDING_NAME_WBTOGGLEAUTOLOOT = "Toggle Auto Loot"
 local recorded, live = {}, {}
 for _, name in ipairs({"GetNumLootItems", "GetLootSlotInfo", "GetLootSlotLink", "LootSlotIsCoin", "LootSlotIsItem",
   "LootSlot", "CloseLoot", "IsFishingLoot"}) do recorded[name] = _G[name] end
@@ -23,7 +26,7 @@ function __WBLoot(session, list, opening, shift, canDeposit)
   WB.liveLoot, WB.lootSession, WB.lootItems, WB.lootSlots = true, session, {}, 0
   for _, item in ipairs(list) do
     __WBBagPrepareItem(item)
-    if item.form==15 then item.coin=true end -- septims are gold alone, exactly as in her backpack
+    if item.form==15 then item.coin=true end -- septims are gold alone, exactly as in their backpack
     WB.lootItems[item.slot] = item
     WB.lootSlots = math.max(WB.lootSlots,item.slot)
   end
@@ -88,6 +91,15 @@ end
 function __WBLootAll()
   for slot=1,WB.lootSlots or 0 do LootSlot(slot) end
 end
+function __WBToggleAutoLoot()
+  local enabled=GetCVar("autoLootDefault")~="1"
+  SetCVar("autoLootDefault",enabled and 1 or 0)
+  if UIOptionsFrameCheckButton70 then UIOptionsFrameCheckButton70:SetChecked(enabled and 1 or nil) end
+  if UIErrorsFrame then
+    local color=ChatTypeInfo.SYSTEM
+    UIErrorsFrame:AddMessage(enabled and "Auto Loot enabled." or "Auto Loot disabled.",color.r,color.g,color.b)
+  end
+end
 function CloseLoot()
   if not WB.lootSession or WB.lootClosing then return end
   WB.lootClosing=true
@@ -102,6 +114,10 @@ end
 function __WBInstallLoot()
   if WB.lootInstalled or not LootFrame then return end
   WB.lootInstalled=true
+  __WoweeBindingScripts.WBLOOTALL=function()
+    if WB.lootSession and LootFrame:IsShown() then __WBLootAll() end
+  end
+  __WoweeBindingScripts.WBTOGGLEAUTOLOOT=__WBToggleAutoLoot
   WB.cvarDefaults.autoLootDefault="0"
   RegisterCVar("autoLootDefault",0)
   if BasicOptionsGeneral then

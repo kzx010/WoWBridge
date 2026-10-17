@@ -53,7 +53,7 @@ std::set<uint16_t> itemBodyGeosets(uint32_t inventoryType, const std::array<uint
 // Clip to the selected UV rectangles/geosets, baking Stand t=0 before creating boundary vertices.
 // Only referenced geometry survives. Invalid geometry or an empty selection returns false, without mutation.
 bool isolateItemBody(Model& model, const ItemBodySelection& selection);
-// Only this item's textures and geometry on her race/sex body: no skin, hair, outfit or attachments.
+// Only this item's textures and geometry on their race/sex body: no skin, hair, outfit or attachments.
 // Owned batch bindings; missing assets and empty geometry return failure without partial parts.
 ItemPreview loadArmorItemPreview(const Mpq& mpq, uint32_t entry, const ItemDisplayCatalog& catalog,
                                  const Appearance& who);

@@ -1,5 +1,9 @@
 #include "render/WowModels.h"
 #include "render/GroundItems.h"
+#include "render/NpcShoulders.h"
+#include "render/NpcWeapons.h"
+#include "render/NpcHelms.h"
+#include "render/Shadows.h"
 
 #include "Avatar.h"
 #include "../../../wowcore/include/wowcore/model_layers.hpp"
@@ -23,6 +27,13 @@ namespace WowModels
 {
 	namespace
 	{
+		std::mutex g_attachmentLock;
+		AttachmentPose g_attachments;
+		struct AttachmentRecord
+		{
+			AttachmentPose pose;
+			~AttachmentRecord() { std::lock_guard lock(g_attachmentLock); g_attachments = std::move(pose); }
+		};
 		template <class T>
 		void Release(T*& a_p)
 		{
@@ -53,6 +64,7 @@ namespace WowModels
 			float tint[4];
 			float uvRow0[4];
 			float uvRow1[4];
+			float shadowFeet[4];
 		};
 		struct QuadVertex
 		{
@@ -78,7 +90,7 @@ namespace WowModels
 		};
 		struct GpuPart
 		{
-			const Avatar::Part* part = nullptr;   // her parts
+			const Avatar::Part* part = nullptr;   // their parts
 			ID3D11Buffer*       vb = nullptr;
 			ID3D11Buffer*       ib = nullptr;
 			std::vector<Batch>  batches;
@@ -145,7 +157,7 @@ namespace WowModels
 				D3D11_BLEND_DESC d{};
 				d.IndependentBlendEnable = TRUE;
 				auto& rt = d.RenderTarget[0];
-				// Colour only: a texture's alpha is not coverage (the opaque ones carry anything there), and her portrait
+				// Colour only: a texture's alpha is not coverage (the opaque ones carry anything there), and their portrait
 				// is composited by its target's alpha.
 				rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
 				rt.BlendOp = rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
@@ -300,10 +312,10 @@ namespace WowModels
 		// glm is column-major; the shader's row_major matrices want the transpose in memory.
 		void Store(float* a_out, const glm::mat4& a_m) { std::memcpy(a_out, glm::value_ptr(glm::transpose(a_m)), 64); }
 
-		// Skyrim's light where she stands: the sun (direction and colour) and the ambient from above.
-		// How bright Skyrim made the ground around her this moment, against a clear day's: she is drawn after Skyrim's
-		// tonemapping (her colours as the client's), so its exposure - night, a dark interior, a torch beside her - is
-		// matched here. Eight points on a ring at her feet are read from the frame before she is drawn, three frames
+		// Skyrim's light where the player stands: the sun (direction and colour) and the ambient from above.
+		// How bright Skyrim made the ground around their this moment, against a clear day's: the player is drawn after Skyrim's
+		// tonemapping (their colours as the client's), so its exposure - night, a dark interior, a torch beside their - is
+		// matched here. Eight points on a ring at the player's feet are read from the frame before the player is drawn, three frames
 		// late (no stall), their mean luminance followed smoothly.
 		float g_exposure = 1.0f;
 		float g_ground = 0.0f;   // the last reading (logged)
@@ -377,6 +389,12 @@ namespace WowModels
 			Release(target);
 		}
 
+		void ShadowFeet(ObjectCB& cb, const Frame& frame, const RE::NiPoint3& feet)
+		{
+			const auto p = feet - frame.cam;
+			cb.shadowFeet[0] = p.x; cb.shadowFeet[1] = p.y; cb.shadowFeet[2] = p.z; cb.shadowFeet[3] = Shadows::Receiving() ? 1.0f : 0.0f;
+		}
+
 		void Light(ObjectCB& a_cb)
 		{
 			glm::vec3 toLight(0.3f, -0.4f, 0.85f), color(1.0f), ambient(0.45f);
@@ -434,7 +452,7 @@ namespace WowModels
 			bool menu = false;
 		};
 
-		// Her parts as they are; an effect model (a_look) with each batch's colour and texture animation at its time.
+		// Their parts as they are; an effect model (a_look) with each batch's colour and texture animation at its time.
 		bool DrawPart(ID3D11DeviceContext* a_context, const GpuPart& a_part, const std::vector<glm::mat4>& a_bones, ObjectCB& a_cb,
 			const glm::mat4& a_world, const glm::mat4& a_prevWorld, const std::set<std::uint16_t>* a_geosets, int a_pass,
 			ID3D11DepthStencilState* a_depthWrite, std::uint32_t& a_drawn, const wowcore::Model* a_look = nullptr, float a_timeMs = 0,
@@ -459,7 +477,7 @@ namespace WowModels
 				}
 				a_cb.material[0] = b.blend == 1 ? 0.878f : 0.0f;   // alpha key at the client's 224/255
 				a_cb.material[1] = (b.flags & 0x1) ? 1.0f : 0.0f;  // unlit
-				const bool fadedOpaque = a_cb.material[2] > 0.0f && b.blend <= 1;   // her stealth: the opaque ones blended
+				const bool fadedOpaque = a_cb.material[2] > 0.0f && b.blend <= 1;   // their stealth: the opaque ones blended
 				a_cb.material[3] = resources.menu ? (b.blend >= 2 ? 24.0f : 8.0f) : fadedOpaque ? 4.0f : 0.0f;
 				wowcore::BatchLook look;
 				if (a_look && b.index < a_look->batches.size()) {
@@ -484,7 +502,7 @@ namespace WowModels
 
 	namespace
 	{
-		// Separate ownership from avatar uploads: redressing her must not release dropped-item textures.
+		// Separate ownership from avatar uploads: redressing the player must not release dropped-item textures.
 		struct GroundGpu
 		{
 			std::vector<GpuPart> parts;
@@ -503,11 +521,11 @@ namespace WowModels
 		std::mutex g_groundLock;
 		std::map<ItemPtr, std::chrono::steady_clock::time_point, std::owner_less<ItemPtr>> g_groundReady;
 
-		GroundGpu& GroundUpload(ID3D11DeviceContext* context, const ItemPtr& item)
+		GroundGpu& GroundUpload(ID3D11DeviceContext* context, const ItemPtr& item, bool allParts = false)
 		{
 			if (const auto it = g_groundGpu.find(item); it != g_groundGpu.end()) { return *it->second; }
 			auto gpu = std::make_unique<GroundGpu>();
-			const auto count = item->armorOnly ? item->parts.size() : 1;
+			const auto count = allParts || item->armorOnly ? item->parts.size() : 1;
 			gpu->parts.resize(count); gpu->bones.resize(count); gpu->sequences.resize(count);
 			bool ready = count > 0;
 			for (std::size_t i = 0; i < count && ready; ++i) {
@@ -524,7 +542,7 @@ namespace WowModels
 				ready = ready && gpu->bones[i].size() <= kMaxBones;
 			}
 			gpu->ready = ready;
-			logger::info("ground items: upload display={} parts={} ready={}", item->displayId, count, ready);
+			logger::info("{}: upload display={} parts={} ready={}", allParts ? "NPC equipment" : "ground items", item->displayId, count, ready);
 			return *g_groundGpu.emplace(item, std::move(gpu)).first->second;
 		}
 
@@ -556,6 +574,8 @@ namespace WowModels
 					if (!gpu.ready) { ready[item] = false; continue; }
 					ready.try_emplace(item, true);  // the main thread can hide it on the next frame
 					if (!instance.hidden) { continue; }
+					const glm::vec3 centre(instance.world * glm::vec4(instance.asset->centre, 1));
+					ShadowFeet(cb, frame, { centre.x, centre.y, centre.z });
 					for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
 						const auto& part = item->parts[i];
 						const glm::mat4 world = toCamera * instance.world * part.modelToPreview;
@@ -570,6 +590,8 @@ namespace WowModels
 				const auto& instance = instances[n];
 				if (deviceOk && ok[n] && batches[n]) {
 					draws.push_back({ instance.ref, instance.entry, instance.asset->item->displayId, batches[n], instance.world });
+					const glm::vec3 centre(instance.world * glm::vec4(instance.asset->centre, 1));
+					Shadows::AddBlob({ centre.x, centre.y, centre.z }, instance.asset->radius * glm::length(glm::vec3(instance.world[0])));
 				}
 			}
 			{
@@ -582,8 +604,187 @@ namespace WowModels
 			GroundItems::RecordDraws(std::move(draws));
 		}
 
-		// Her face, drawn once into a 128 x 128 texture through the model's portrait camera: the body (stand, first
-		// frame) and what hangs on her head and shoulders, lit from the camera at the level measured off the client's
+		void DrawNpcShoulders(const Frame& frame)
+		{
+			static std::uint64_t serial = 0;
+			const auto number = ++serial;
+			const auto instances = NpcShoulders::Current();
+			std::vector<NpcShoulders::DrawInfo> draws;
+			if (!NpcShoulders::Enabled() || instances.empty()) { NpcShoulders::RecordDraws({}); return; }
+			auto* c = frame.context;
+			c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			c->IASetInputLayout(g_layout);
+			c->VSSetShader(g_vs, nullptr, 0); c->PSSetShader(g_ps, nullptr, 0);
+			ID3D11Buffer* cbs[] = { frame.frameCb, g_objectCb, g_bonesCb };
+			c->VSSetConstantBuffers(0, 3, cbs); c->PSSetConstantBuffers(0, 3, cbs);
+			c->PSSetSamplers(0, 1, &g_sampler); c->RSSetState(g_raster);
+			ObjectCB cb{};
+			Light(cb);
+			const auto toCamera = glm::translate(glm::mat4(1), glm::vec3(-frame.cam.x, -frame.cam.y, -frame.cam.z));
+			static const auto start = std::chrono::steady_clock::now();
+			const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+			std::set<const wowcore::ItemPreview*> posed;
+			std::vector<std::array<std::uint32_t, 2>> batches(instances.size());
+			std::vector<bool> ok(instances.size(), true);
+			// Like ground items, independent world resources survive their redresses. Upload every shoulder part;
+			// a standalone item's ground preview otherwise uploads only its first model.
+			for (int pass = 0; pass < 2; ++pass) {
+				for (std::size_t n = 0; n < instances.size(); ++n) {
+					const auto& instance = instances[n];
+					if (!instance.asset) { ok[n] = false; continue; }
+					RE::NiPoint3 feet;
+					cb.shadowFeet[3] = 0;
+					if (Shadows::NpcFeet(instance.ref, feet)) ShadowFeet(cb, frame, feet);
+					const auto& item = instance.asset->item;
+					auto& gpu = GroundUpload(c, item, true);
+					if (!gpu.ready) { ok[n] = false; continue; }
+					if (posed.insert(item.get()).second) {
+						for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
+							const auto& model = item->parts[i].model;
+							wowcore::poseBones(model, gpu.sequences[i], TimeIn(model, gpu.sequences[i], ms, true), ms, gpu.bones[i]);
+						}
+					}
+					for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
+						const auto side = instance.asset->sides[i];
+						const auto& part = item->parts[i];
+						const glm::mat4 world = toCamera * instance.world[side];
+						ok[n] = DrawPart(c, gpu.parts[i], gpu.bones[i], cb, world, world, nullptr, pass, frame.depthWrite,
+							batches[n][side], &part.model, TimeIn(part.model, gpu.sequences[i], ms, true), gpu.sequences[i]) && ok[n];
+					}
+				}
+			}
+			if (SUCCEEDED(frame.device->GetDeviceRemovedReason())) {
+				const auto at = std::chrono::steady_clock::now();
+				for (std::size_t n = 0; n < instances.size(); ++n) {
+					if (ok[n] && (batches[n][0] || batches[n][1])) { draws.push_back({ instances[n], batches[n], number, at }); }
+				}
+			}
+			NpcShoulders::RecordDraws(std::move(draws));
+		}
+
+		void DrawNpcWeapons(const Frame& frame)
+		{
+			static std::uint64_t serial = 0;
+			const auto number = ++serial;
+			const auto instances = NpcWeapons::Current();
+			std::vector<NpcWeapons::DrawInfo> draws;
+			if (!NpcWeapons::Enabled() || instances.empty()) { NpcWeapons::RecordDraws({});
+			NpcHelms::RecordDraws({}); return; }
+			auto* c = frame.context;
+			c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			c->IASetInputLayout(g_layout);
+			c->VSSetShader(g_vs, nullptr, 0); c->PSSetShader(g_ps, nullptr, 0);
+			ID3D11Buffer* cbs[] = { frame.frameCb, g_objectCb, g_bonesCb };
+			c->VSSetConstantBuffers(0, 3, cbs); c->PSSetConstantBuffers(0, 3, cbs);
+			c->PSSetSamplers(0, 1, &g_sampler); c->RSSetState(g_raster);
+			ObjectCB cb{};
+			Light(cb);
+			const auto toCamera = glm::translate(glm::mat4(1), glm::vec3(-frame.cam.x, -frame.cam.y, -frame.cam.z));
+			static const auto start = std::chrono::steady_clock::now();
+			const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+			std::set<const wowcore::ItemPreview*> posed;
+			std::vector<std::uint32_t> batches(instances.size());
+			std::vector<bool> ok(instances.size(), true);
+			// Independent world resources survive their redresses. Upload first; the main thread hides only
+			// this equipped mesh once it sees successful upload, retaining the native look on failure.
+			for (int pass = 0; pass < 2; ++pass) {
+				for (std::size_t n = 0; n < instances.size(); ++n) {
+					const auto& instance = instances[n];
+					if (!instance.asset) { ok[n] = false; continue; }
+					const auto& item = instance.asset;
+					auto& gpu = GroundUpload(c, item, true);
+					if (!gpu.ready) { NpcWeapons::RecordReady(item, false); ok[n] = false; continue; }
+					if (posed.insert(item.get()).second) {
+						for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
+							const auto& model = item->parts[i].model;
+							wowcore::poseBones(model, gpu.sequences[i], TimeIn(model, gpu.sequences[i], ms, true), ms, gpu.bones[i]);
+						}
+					}
+					if (!instance.hidden) continue;
+					{ RE::NiPoint3 feet; cb.shadowFeet[3] = 0; if (Shadows::NpcFeet(instance.ref, feet)) ShadowFeet(cb, frame, feet); }
+					for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
+						const auto& part = item->parts[i];
+						const glm::mat4 world = toCamera * instance.world;
+						ok[n] = DrawPart(c, gpu.parts[i], gpu.bones[i], cb, world, world, nullptr, pass, frame.depthWrite,
+							batches[n], &part.model, TimeIn(part.model, gpu.sequences[i], ms, true), gpu.sequences[i]) && ok[n];
+					}
+				}
+			}
+			const bool deviceOk = SUCCEEDED(frame.device->GetDeviceRemovedReason());
+			for (std::size_t n = 0; n < instances.size(); ++n) {
+				if (instances[n].asset) NpcWeapons::RecordReady(instances[n].asset, deviceOk && ok[n]);
+			}
+			if (deviceOk) {
+				const auto at = std::chrono::steady_clock::now();
+				for (std::size_t n = 0; n < instances.size(); ++n) {
+					if (ok[n] && batches[n]) { draws.push_back({ instances[n], batches[n], number, at }); }
+				}
+			}
+			NpcWeapons::RecordDraws(std::move(draws));
+		}
+
+		void DrawNpcHelms(const Frame& frame)
+		{
+			static std::uint64_t serial = 0;
+			const auto number = ++serial;
+			const auto instances = NpcHelms::Current();
+			std::vector<NpcHelms::DrawInfo> draws;
+			if (!NpcHelms::Enabled() || instances.empty()) { NpcHelms::RecordDraws({}); return; }
+			auto* c = frame.context;
+			c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			c->IASetInputLayout(g_layout);
+			c->VSSetShader(g_vs, nullptr, 0); c->PSSetShader(g_ps, nullptr, 0);
+			ID3D11Buffer* cbs[] = { frame.frameCb, g_objectCb, g_bonesCb };
+			c->VSSetConstantBuffers(0, 3, cbs); c->PSSetConstantBuffers(0, 3, cbs);
+			c->PSSetSamplers(0, 1, &g_sampler); c->RSSetState(g_raster);
+			ObjectCB cb{};
+			Light(cb);
+			const auto toCamera = glm::translate(glm::mat4(1), glm::vec3(-frame.cam.x, -frame.cam.y, -frame.cam.z));
+			static const auto start = std::chrono::steady_clock::now();
+			const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+			std::set<const wowcore::ItemPreview*> posed;
+			std::vector<std::uint32_t> batches(instances.size());
+			std::vector<bool> ok(instances.size(), true);
+			// Independent world resources survive their redresses. Upload first; the main thread hides only
+			// this equipped mesh once it sees successful upload, retaining the native look on failure.
+			for (int pass = 0; pass < 2; ++pass) {
+				for (std::size_t n = 0; n < instances.size(); ++n) {
+					const auto& instance = instances[n];
+					if (!instance.asset) { ok[n] = false; continue; }
+					const auto& item = instance.asset->item;
+					auto& gpu = GroundUpload(c, item, true);
+					if (!gpu.ready) { NpcHelms::RecordReady(instance.asset, false); ok[n] = false; continue; }
+					if (posed.insert(item.get()).second) {
+						for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
+							const auto& model = item->parts[i].model;
+							wowcore::poseBones(model, gpu.sequences[i], TimeIn(model, gpu.sequences[i], ms, true), ms, gpu.bones[i]);
+						}
+					}
+					if (!instance.hidden) continue;
+					{ RE::NiPoint3 feet; cb.shadowFeet[3] = 0; if (Shadows::NpcFeet(instance.ref, feet)) ShadowFeet(cb, frame, feet); }
+					for (std::size_t i = 0; i < gpu.parts.size(); ++i) {
+						const auto& part = item->parts[i];
+						const glm::mat4 world = toCamera * instance.world;
+						ok[n] = DrawPart(c, gpu.parts[i], gpu.bones[i], cb, world, world, nullptr, pass, frame.depthWrite,
+							batches[n], &part.model, TimeIn(part.model, gpu.sequences[i], ms, true), gpu.sequences[i]) && ok[n];
+					}
+				}
+			}
+			const bool deviceOk = SUCCEEDED(frame.device->GetDeviceRemovedReason());
+			for (std::size_t n = 0; n < instances.size(); ++n) {
+				if (instances[n].asset) NpcHelms::RecordReady(instances[n].asset, deviceOk && ok[n]);
+			}
+			if (deviceOk) {
+				const auto at = std::chrono::steady_clock::now();
+				for (std::size_t n = 0; n < instances.size(); ++n) {
+					if (ok[n] && batches[n]) { draws.push_back({ instances[n], batches[n], number, at }); }
+				}
+			}
+			NpcHelms::RecordDraws(std::move(draws));
+		}
+
+		// Their face, drawn once into a 128 x 128 texture through the model's portrait camera: the body (stand, first
+		// frame) and what hangs on their head and shoulders, lit from the camera at the level measured off the client's
 		// (evidence/charref/portrait_client_vs_skyrim.png: the hood within a few percent).
 		void DrawPortrait(const Frame& a_frame, const Avatar::Loaded& a_data)
 		{
@@ -651,7 +852,7 @@ namespace WowModels
 			}
 			Release(rtv), Release(dsv), Release(less);
 			g_portrait = srv;
-			logger::info("wow models: her portrait drawn ({} batches)", drawn);
+			logger::info("wow models: their portrait drawn ({} batches)", drawn);
 		}
 
 		ID3D11ShaderResourceView* SkyrimTexture(const RE::NiPointer<RE::NiSourceTexture>& a_texture)
@@ -766,7 +967,7 @@ namespace WowModels
 			a_face.drawn = a_head.serial;
 		}
 
-		// A ground decal laid on Skyrim's depth before she is drawn (so she stands over it): the target's selection circle,
+		// A ground decal laid on Skyrim's depth before the player is drawn (so the player stands over it): the target's selection circle,
 		// turned to face the camera in its reaction's colour, or a ground spell's area in its own (world-aligned).
 		void DrawDecal(const Frame& a_frame, const RE::NiPoint3& a_at, float a_radius, const std::array<float, 3>& a_color,
 			const wowcore::Image& a_image, bool a_area)
@@ -1122,13 +1323,21 @@ namespace WowModels
 		return SUCCEEDED(f.device->GetDeviceRemovedReason());
 	}
 
+	AttachmentPose LastAttachments() { std::lock_guard lock(g_attachmentLock); return g_attachments; }
+	glm::mat4 PlacementAbsolute(const RE::NiPoint3& a_position, float a_facing) { return Placement(a_position, a_facing, RE::NiPoint3{ 0, 0, 0 }); }
+
 	void Draw(const Frame& a_frame)
 	{
+		AttachmentRecord attachments;  // every early exit invalidates the last draw
+		Shadows::ClearBlobs();
 		const auto* data = Avatar::Data();
 		const auto  pose = Avatar::Current();
 		if (g_failed) {
 			g_havePrev = false;
 			GroundItems::RecordDraws({});
+			NpcShoulders::RecordDraws({});
+			NpcWeapons::RecordDraws({});
+			NpcHelms::RecordDraws({});
 			return;
 		}
 		auto* context = a_frame.context;
@@ -1137,15 +1346,21 @@ namespace WowModels
 			if (!CreateStates(g_device)) {
 				logger::error("wow models: D3D11 resources failed");
 				g_failed = true;
+				NpcShoulders::RecordDraws({});
+				NpcWeapons::RecordDraws({});
+				NpcHelms::RecordDraws({});
 				return;
 			}
 		}
 		EnsureDepthRead(a_frame.reversedZ);
 		if (data) { Expose(a_frame, pose.position); }
-		DrawGround(a_frame);  // independent of her visibility, shapeshift, menu previews and portrait redraws
+		DrawGround(a_frame);  // independent of their visibility, shapeshift, menu previews and portrait redraws
+		DrawNpcShoulders(a_frame);
+		DrawNpcWeapons(a_frame);
+		DrawNpcHelms(a_frame);
 		if (!data) { g_havePrev = false; return; }
 		if (g_uploaded != data) {
-			// Dressed again: her buffers go, and every texture with them (they are found by image address, and the old
+			// Dressed again: their buffers go, and every texture with them (they are found by image address, and the old
 			// images' memory may hold the new ones), and so the effect models' batches that point at them.
 			for (auto& part : g_parts) {
 				Release(part.vb), Release(part.ib);
@@ -1156,7 +1371,7 @@ namespace WowModels
 			for (auto& [image, srv] : g_textures) {
 				Release(srv);
 			}
-			if (g_uploaded) {   // a new look (a form, other gear): her portrait is drawn again from it
+			if (g_uploaded) {   // a new look (a form, other gear): their portrait is drawn again from it
 				auto* portrait = g_portrait.exchange(nullptr);
 				Release(portrait);
 			}
@@ -1201,17 +1416,17 @@ namespace WowModels
 			context->OMSetRenderTargets(1, &target, targetDepth);
 			context->RSSetViewports(1, &viewport);
 			Release(target), Release(targetDepth);
-			return;   // the frame's view was overwritten; she is drawn from the next frame
+			return;   // the frame's view was overwritten; the player is drawn from the next frame
 		}
 
-		// Her pose: the body's bones for the animation, then each attached model where it hangs.
+		// Their pose: the body's bones for the animation, then each attached model where it hangs.
 		const auto& body = data->body.model;
 		const int   seq = SequenceFor(body, pose.animation);
 		static const auto start = std::chrono::steady_clock::now();
 		const float globalMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
 		std::vector<glm::mat4> bones;
-		// WoW eases her from one animation into the next over the entered one's blend time (wowcore::blendDurationMs);
-		// the one she left keeps its clock meanwhile.
+		// WoW eases the player from one animation into the next over the entered one's blend time (wowcore::blendDurationMs);
+		// the one the player left keeps its clock meanwhile.
 		static int   lastSeq = -1, fromSeq = -1;
 		static float lastTime = 0, fromTime = 0, switchAt = 0, blendMs = 0;
 		static bool  lastLoop = true, fromLoop = true;
@@ -1277,10 +1492,11 @@ namespace WowModels
 			context->PSSetSamplers(0, 1, &g_sampler);
 			context->RSSetState(g_raster);
 			DrawTargetPortrait(a_frame, *head, g_unitFaces[slot]);
-			return;   // the frame's view was overwritten; she is drawn from the next frame
+			return;   // the frame's view was overwritten; the player is drawn from the next frame
 		}
 		ObjectCB cb{};
 		Light(cb);
+		ShadowFeet(cb, a_frame, pose.position);
 		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		context->IASetInputLayout(g_layout);
 		context->VSSetShader(g_vs, nullptr, 0);
@@ -1291,13 +1507,17 @@ namespace WowModels
 		context->PSSetSamplers(0, 1, &g_sampler);
 		context->RSSetState(g_raster);
 
-		std::uint32_t drawn = 0, mountBatches = 0;
-		cb.material[2] = 1.0f - pose.alpha;   // her fade (the shader's), not her spells' effects'
+		std::uint32_t drawn = 0, mountBatches = 0, bodyBatches = 0;
+		cb.material[2] = 1.0f - pose.alpha;   // their fade (the shader's), not their spells' effects'
 		for (int pass = 0; pass < 2 && pose.visible; ++pass) {   // opaque and alpha-keyed, then the blended
 			if (mount) { const auto before=drawn; DrawPart(context,g_mountGpu,mountBones,cb,mountWorld,mountWorld,&mount->look.geosets,pass,a_frame.depthWrite,drawn); mountBatches+=drawn-before; }
-            DrawPart(context, g_parts[0], bones, cb, world, prevWorld, &data->look.geosets, pass, a_frame.depthWrite, drawn);
+			const auto beforeBody = drawn;
+			DrawPart(context, g_parts[0], bones, cb, world, prevWorld, &data->look.geosets, pass, a_frame.depthWrite, drawn);
+			bodyBatches += drawn - beforeBody;
 			for (std::size_t i = 1; i < g_parts.size(); ++i) {
 				const auto& part = *g_parts[i].part;
+				// Legacy native-gear display mappings are proxies. Their native clone supplies these weapon slots.
+				if (part.attached->slot < 32 && (pose.nativeWeaponSlots & (1u << part.attached->slot))) continue;
 				const auto  place = wowcore::placeAttached(body, bones, *part.attached, pose.weaponsDrawn);
 				if (!place) {
 					continue;
@@ -1308,8 +1528,21 @@ namespace WowModels
 				DrawPart(context, g_parts[i], itemBones, cb, world * *place, prevWorld * *place, nullptr, pass, a_frame.depthWrite, drawn);
 			}
 		}
+		if (pose.visible && bodyBatches && !data->display) {
+			static std::uint64_t serial = 0;
+			attachments.pose.body = data;
+			attachments.pose.drawn = pose.weaponsDrawn;
+			attachments.pose.frame = ++serial;
+			attachments.pose.at = std::chrono::steady_clock::now();
+			const auto absolute = glm::translate(glm::mat4(1), glm::vec3(a_frame.cam.x, a_frame.cam.y, a_frame.cam.z)) * world;
+			const glm::mat4 herFrame = glm::scale(saddle, glm::vec3(data->look.scale));
+			for (const auto point : { 1u, 2u, 26u, 27u, 28u, 32u, 33u })
+				if (const auto at = wowcore::attachmentMatrix(body, bones, point)) { attachments.pose.points[point] = absolute * *at; attachments.pose.local[point] = herFrame * *at; }
+		}
+		if (pose.visible && drawn) Shadows::AddBlob(pose.position, 36.0f * data->look.scale, true);
+		cb.shadowFeet[3] = 0;  // spell visuals retain their own lighting
 		cb.material[2] = 0.0f;
-		// Her spells' effects: stepped on (in absolute world), their models drawn as they look now, then their particles
+		// Their spells' effects: stepped on (in absolute world), their models drawn as they look now, then their particles
 		// and ribbons.
 		static auto last = std::chrono::steady_clock::now();
 		const auto  now = std::chrono::steady_clock::now();

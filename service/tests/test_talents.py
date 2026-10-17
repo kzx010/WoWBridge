@@ -85,10 +85,11 @@ class TalentRules(unittest.TestCase):
                     self.assertAlmostEqual(native['armor'][0]['magnitude'], 384 * 40 / 285)
                     self.assertAlmostEqual(native['stat'][0]['magnitude'], 16 * 20 / 12)
                     profile = self.svc.handle({'op': 'skyrim_costs', 'caster': caster})['spell_tooltips']['9885']
+                    self.assertEqual(profile.pop('skill'), 'Alteration')   # the profile's own: her Skyrim skill for it
                     self.assertEqual(profile, out['tooltip'])
                     book = self.svc.handle({'op': 'known_spells', 'class': 'druid',
                                            'caster': {**caster, 'skyrim': {'alteration': 100}}})
-                    self.assertEqual(book['spell_tooltips']['9885'], profile)
+                    self.assertEqual(book['spell_tooltips']['9885'], {**profile, 'skill': 'Alteration'})
         plain = self.svc.char({'level': 60, 'talents': {}, 'auras': [9885]})
         improved = self.svc.char({'level': 60, 'talents': {821: 5}, 'auras': [9885]})
         self.assertEqual(improved.stats['sta'] - plain.stats['sta'], 4)

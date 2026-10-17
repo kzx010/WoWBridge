@@ -8,7 +8,7 @@ namespace ItemPreview
 	bool Install();  // optional, verified AE 1.7.104 hooks; false leaves the plugin's other features working
 	void Init();     // kDataLoaded: preload catalog assets off the render thread
 	void Reset();
-	void Redress();  // Avatar::Redress: refresh body items if her race/sex changes
+	void Redress();  // Avatar::Redress: refresh body items if their race/sex changes
 
 	// Shared immutable CPU assets for menu and ground draws. Display/type/race/sex identify the cache;
 	// bounds cover the same Stand t=0 geometry that the menu displays (one standalone shoulder).
@@ -22,6 +22,7 @@ namespace ItemPreview
 		std::uint32_t inventoryType = 0;
 	};
 	std::shared_ptr<const Asset> AssetFor(std::uint32_t a_entry);
+	void Want(std::uint32_t a_entry);   // an Armory item shown: load its assets in the background (AssetFor has it after)
 
 	struct Info
 	{

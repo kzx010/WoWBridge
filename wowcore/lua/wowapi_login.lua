@@ -152,6 +152,10 @@ local LOGIN = {
 }
 -- A tutorial the account has read is not raised again (__WBTutorialFlagged: the server's flags).
 function __WBLogin()
+  if __WB.appearance and __WB.appearance.classId ~= 11 then
+    local a = __WB.appearance
+    __WBAppearance(a.current,a.defaults,a.classId,a.classes,a.chooseClass)
+  end
   local plateEnemies,plateFriends=__WB.plateEnemies,__WB.plateFriends
   local p = __WB.resolve("player")
   if p and p.skyrimXP then __WBInstallExperience() end

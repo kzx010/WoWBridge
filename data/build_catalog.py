@@ -32,8 +32,20 @@ SLICE_SPELLS = {  # max ranks for a level-60 druid (verified against spell_templ
     'prowl': 9913, 'pounce': 9827, 'ravage': 9867, 'tigers_fury': 9846, 'dash': 9821, 'cower': 9892,
     'faerie_fire_feral': 17392,
 }
-# General-tab racials are separate from the class-rank/balance slice.
-RACIAL_SPELLS = {'shadowmeld': 20580, 'quickness': 20582, 'nature_resistance': 20583, 'wisp_spirit': 20585}
+# General-tab racials are separate from the class-rank/balance slice: Night Elf, Tauren, then the Paladin's Human and
+# Dwarf (SkillLineAbility lines 754 and 101; data/build_racial_data.py exports how the service would treat each).
+RACIAL_SPELLS = {'shadowmeld': 20580, 'quickness': 20582, 'nature_resistance': 20583, 'wisp_spirit': 20585,
+                 'war_stomp': 20549, 'endurance': 20550, 'tauren_nature_resistance': 20551, 'cultivation': 20552,
+                 'perception': 20600, 'diplomacy': 20599, 'the_human_spirit': 20598, 'sword_specialization': 20597,
+                 'mace_specialization': 20864, 'stoneform': 20594, 'frost_resistance': 20596,
+                 'gun_specialization': 20595, 'find_treasure': 2481}
+# SpellAuraHolder::HandleSpellSpecificBoosts (SpellAuras.cpp): Stoneform's code-linked boost (bleed and disease
+# immunity), not a trigger.
+RACIAL_LINKED_SPELLS = [20612]
+# Every playable class and its races (ChrClasses / ChrRaces ids): Player::InitStatsForLevel reads
+# ObjectMgr::GetPlayerLevelInfo(race, class, level) and GetPlayerClassLevelInfo(class, level), which
+# ObjectMgr::LoadPlayerInfo fills from player_levelstats and player_classlevelstats.
+PLAYABLE = {11: (4, 6), 2: (1, 3)}                       # druid: Night Elf, Tauren; paladin: Human, Dwarf
 # Spells the core links to others in code, not by trigger (Aura::HandleShapeshiftBoosts, Spell::EffectDummy): the
 # forms' passives (Bear, Cat, Dire Bear, Aquatic, Travel), their effect spells, and the released Night Elf wisp.
 LINKED_SPELLS = [1178, 3025, 5419, 5421, 9635, 21178, 22845, 25503, 20584]
@@ -41,8 +53,12 @@ LINKED_SPELLS = [1178, 3025, 5419, 5421, 9635, 21178, 22845, 25503, 20584]
 TALENT_LINKED_SPELLS = [24905, 24932, 24900, 24899, 17099, 17057, 24867, 24864]
 # Consumable combat payloads have no trainer entry or spell trigger on their recipe.
 PLAYER_POISON_PAYLOADS = {8680, 8685, 8689, 11335, 11336, 11337, 2818, 2819, 11353, 11354, 25349}
+# Class manifests (data/build_paladin.py): every spell a class's ranks reach, code links included (seal procs and
+# judgements, Holy Light's heal, Forbearance), each link with its CMaNGOS evidence there.
+CLASS_MANIFESTS = (REPO / 'data/paladin_manifest.json',)
 EQUIPMENT = REPO / 'data/equipment.json'
 CHARACTER = {'race': 4, 'class': 11, 'level': 60}                         # night elf druid
+MAX_LEVEL = 60                                                            # player_levelstats rows a class/race has
 # What the plugin needs of each worn item (item_template): its model, where it sheathes, how it swings and sounds.
 WORN_FIELDS = ('displayid', 'InventoryType', 'class', 'subclass', 'sheath', 'Material', 'delay')
 
@@ -97,9 +113,55 @@ def equipment(path: Path, client_sets: list[dict], item_rows: dict) -> tuple[lis
     return items, sets, groups
 
 
+# z2817/z2818 moved spell_bonus_data into per-effect columns. Read those
+# columns from the core's authoritative original_data; keep the dump's
+# remaining spell fields. Missing coefficients are an input error.
+COEFFICIENTS = tuple(f'{field}{e}' for field in ('EffectBonusCoefficient', 'EffectBonusCoefficientFromAP') for e in (1, 2, 3))
+
+
+def closure(wanted, spell_rows: dict, core: dict, bonuses: dict, first=lambda sid: sid) -> dict:
+    """These spells and every spell they trigger, as the service reads them: the dump's rows with the core's
+    coefficient columns (data/build_armory.py closes its items' spells the same way)."""
+    wanted, spells = set(wanted), {}
+    while wanted - spells.keys():
+        rows = [spell_rows[sid] for sid in sorted(wanted - spells.keys()) if sid in spell_rows]
+        for r in rows:
+            s = {**r, **{k: r[k] if k in r else core[r['Id']][k] for k in COEFFICIENTS}}
+            # The original_data AP columns are zero for these chains. The old
+            # dump's spell_bonus_data retains the realm's explicit AP override,
+            # inherited by rank, including triggered chains such as Pounce bleed.
+            bonus = bonuses.get(r['Id'], bonuses.get(first(r['Id'])))
+            if bonus:
+                for e in (1, 2, 3):
+                    key = f'EffectBonusCoefficientFromAP{e}'
+                    if key not in r:
+                        periodic = s[f'EffectApplyAuraName{e}'] in (3, 8)
+                        if periodic or s[f'Effect{e}'] in (2, 10):
+                            s[key] = bonus['ap_dot_bonus' if periodic else 'ap_bonus']
+            spells[r['Id']] = s
+        missing = (wanted - spells.keys())
+        if missing and not rows:
+            raise SystemExit(f'spells missing from spell_template: {sorted(missing)}')
+        wanted |= {r[f'EffectTriggerSpell{k}'] for r in rows for k in (1, 2, 3) if r[f'EffectTriggerSpell{k}']}
+    return spells
+
+
+def spell_tables(spells: dict, dbc_dir: Path) -> dict:
+    """The client tables' rows these spells use: cast times, durations, ranges, radii and icons."""
+    def index(table: str, key: str) -> dict:
+        used = {s[key] for s in spells.values() if s.get(key)}
+        return {r['ID']: r for r in dbc.read(dbc_dir / f'{table}.dbc') if r['ID'] in used}
+
+    radii = {s[f'EffectRadiusIndex{k}'] for s in spells.values() for k in (1, 2, 3) if s[f'EffectRadiusIndex{k}']}
+    return {'cast_times': index('SpellCastTimes', 'CastingTimeIndex'), 'durations': index('SpellDuration', 'DurationIndex'),
+            'ranges': index('SpellRange', 'RangeIndex'),
+            'radii': {r['ID']: r for r in dbc.read(dbc_dir / 'SpellRadius.dbc') if r['ID'] in radii},
+            'icons': index('SpellIcon', 'SpellIconID')}
+
+
 def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
           progression: Path = REPO / 'data/progression.json', core_spells: Path = CORE_SPELLS,
-          equipment_path: Path = EQUIPMENT) -> dict:
+          equipment_path: Path = EQUIPMENT, manifests=CLASS_MANIFESTS) -> dict:
     # The progression artifact supplies chains that SQL alone misses (feral DBC
     # forward links), for every configured class and every acquisition route.
     book = json.loads(Path(progression).read_text())
@@ -110,8 +172,8 @@ def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
         'item_template', 'spell_template', 'spell_affect', 'spell_proc_event', 'spell_facing',
         'creature_template_classlevelstats', 'player_levelstats', 'player_classlevelstats', 'db_version',
         'spell_bonus_data', 'spell_chain')},
-        filters={'player_levelstats': lambda r: r['race'] == CHARACTER['race'] and r['class'] == CHARACTER['class'],
-                 'player_classlevelstats': lambda r: r['class'] == CHARACTER['class'],
+        filters={'player_levelstats': lambda r: r['race'] in PLAYABLE.get(r['class'], ()),
+                 'player_classlevelstats': lambda r: r['class'] in PLAYABLE,
                  'creature_template_classlevelstats': lambda r: r['Class'] == 1})
     creature_path = REPO / 'data/creature_reference.json'
     creatures = json.loads(creature_path.read_text())['creatures']
@@ -120,12 +182,7 @@ def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
                                      'str': r['Strength'] if 'Strength' in r else creatures[str(r['Level'])]['str']}
     item_rows = {r['entry']: r for r in sql['item_template']}
     spell_rows = {r['Id']: r for r in sql['spell_template']}
-    # z2817/z2818 moved spell_bonus_data into per-effect columns. Read those
-    # columns from the core's authoritative original_data; keep the dump's
-    # remaining spell fields. Missing coefficients are an input error.
-    coefficients = tuple(f'{field}{e}' for field in ('EffectBonusCoefficient', 'EffectBonusCoefficientFromAP')
-                         for e in (1, 2, 3))
-    core = {r['Id']: r for r in tables(core_spells, {'spell_template': ('Id',) + coefficients})['spell_template']}
+    core = {r['Id']: r for r in tables(core_spells, {'spell_template': ('Id',) + COEFFICIENTS})['spell_template']}
     bonuses = {r['entry']: r for r in sql['spell_bonus_data']}
     previous = {r['SupercededBySpell']: r['Spell'] for r in dbc.read(dbc_dir / 'SkillLineAbility.dbc')
                 if r['SupercededBySpell']}
@@ -147,35 +204,10 @@ def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
 
     # Close over triggered spells.
     talent_spells = {sid for t in dbc.read(dbc_dir / 'Talent.dbc') for sid in t['SpellRank'] if sid}
-    wanted, spells = (set(SLICE_SPELLS.values()) | set(RACIAL_SPELLS.values()) | set(ranks) |
-                      set(LINKED_SPELLS) | set(TALENT_LINKED_SPELLS) | talent_spells | item_spells | set_spells |
-                      PLAYER_POISON_PAYLOADS), {}
-    while wanted - spells.keys():
-        rows = [spell_rows[sid] for sid in sorted(wanted - spells.keys()) if sid in spell_rows]
-        for r in rows:
-            s = {**r, **{k: r[k] if k in r else core[r['Id']][k] for k in coefficients}}
-            # The original_data AP columns are zero for these chains. The old
-            # dump's spell_bonus_data retains the realm's explicit AP override,
-            # inherited by rank, including triggered chains such as Pounce bleed.
-            bonus = bonuses.get(r['Id'], bonuses.get(first(r['Id'])))
-            if bonus:
-                for e in (1, 2, 3):
-                    key = f'EffectBonusCoefficientFromAP{e}'
-                    if key not in r:
-                        periodic = s[f'EffectApplyAuraName{e}'] in (3, 8)
-                        if periodic or s[f'Effect{e}'] in (2, 10):
-                            s[key] = bonus['ap_dot_bonus' if periodic else 'ap_bonus']
-            spells[r['Id']] = s
-        missing = (wanted - spells.keys())
-        if missing and not rows:
-            raise SystemExit(f'spells missing from spell_template: {sorted(missing)}')
-        wanted |= {r[f'EffectTriggerSpell{k}'] for r in rows for k in (1, 2, 3) if r[f'EffectTriggerSpell{k}']}
-
-    def index(table: str, key: str) -> dict:
-        used = {s[key] for s in spells.values() if s.get(key)}
-        return {r['ID']: r for r in dbc.read(dbc_dir / f'{table}.dbc') if r['ID'] in used}
-
-    radii = {s[f'EffectRadiusIndex{k}'] for s in spells.values() for k in (1, 2, 3) if s[f'EffectRadiusIndex{k}']}
+    class_spells = {int(sid) for path in manifests for sid in json.loads(Path(path).read_text())['spells']}
+    spells = closure(set(SLICE_SPELLS.values()) | set(RACIAL_SPELLS.values()) | set(RACIAL_LINKED_SPELLS) | set(ranks) |
+                     set(LINKED_SPELLS) | set(TALENT_LINKED_SPELLS) | talent_spells | item_spells | set_spells |
+                     PLAYER_POISON_PAYLOADS | class_spells, spell_rows, core, bonuses, first)
     visual = dbc.by_id(dbc.read(dbc_dir / 'SpellVisual.dbc'))
     kits = dbc.by_id(dbc.read(dbc_dir / 'SpellVisualKit.dbc'))
     effect_names = dbc.by_id(dbc.read(dbc_dir / 'SpellVisualEffectName.dbc'))
@@ -200,6 +232,7 @@ def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
             'creature_reference_sha256': sha256(creature_path),
             'progression_sha256': sha256(progression),
             'equipment_sha256': sha256(equipment_path),
+            'manifest_sha256': {Path(path).name: sha256(path) for path in manifests},
             'client_build': '1.12.1.5875',
             'world_db': sql['db_version'][0]['version'],
             'dbc_sha256': {t: sha256(dbc_dir / f'{t}.dbc') for t in ('Talent', 'ItemSet', 'SkillLineAbility', 'SpellCastTimes', 'SpellDuration', 'SpellRange', 'SpellRadius', 'SpellIcon', 'SpellVisual', 'SpellVisualKit', 'SpellVisualEffectName')},
@@ -212,11 +245,7 @@ def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
         'spell_affect': [r for r in sql['spell_affect'] if r['entry'] in spells],
         'spell_proc_event': [r for r in sql['spell_proc_event'] if r['entry'] in spells],
         'spell_facing': [r for r in sql['spell_facing'] if r['entry'] in spells],
-        'cast_times': index('SpellCastTimes', 'CastingTimeIndex'),
-        'durations': index('SpellDuration', 'DurationIndex'),
-        'ranges': index('SpellRange', 'RangeIndex'),
-        'radii': {r['ID']: r for r in dbc.read(dbc_dir / 'SpellRadius.dbc') if r['ID'] in radii},
-        'icons': index('SpellIcon', 'SpellIconID'),
+        **spell_tables(spells, dbc_dir),
         'visuals': visuals,
         'items': {it['entry']: it for it in items},
         'equipment_sets': equipment_sets,
@@ -228,13 +257,34 @@ def build(dump: Path = DEFAULT_DUMP, dbc_dir: Path = DBC_DIR,
         'item_sets': {s['ID']: s for s in sets},
         # Skyrim actors are creatures of their level with CMaNGOS's class 1 (warrior, as beasts) base stats.
         'creatures': creatures,
-        'character': {
-            **CHARACTER,
-            'levelstats_by_level': {r['level']: r for r in sql['player_levelstats']},
-            'classlevelstats_by_level': {r['level']: r for r in sql['player_classlevelstats']},
-            'levelstats': next(r for r in sql['player_levelstats'] if r['level'] == CHARACTER['level']),
-            'classlevelstats': next(r for r in sql['player_classlevelstats'] if r['level'] == CHARACTER['level']),
-        },
+        'character': character_stats(sql['player_levelstats'], sql['player_classlevelstats']),
+    }
+
+
+def character_stats(levelstats: list[dict], classlevelstats: list[dict]) -> dict:
+    """The catalog's character: the Druid's keys as they always were (her Night Elf and Tauren rows, the Night Elf's
+    level 60), and the class-aware tables for every playable class (PLAYABLE): levelstats_by_class (class -> race ->
+    level -> player_levelstats row) and classlevelstats_by_class (class -> level -> player_classlevelstats row: basehp,
+    basemana). Every class and race must have each level from 1 to 60 exactly once."""
+    def complete(rows, what):
+        if sorted(r['level'] for r in rows) != list(range(1, MAX_LEVEL + 1)):
+            raise ValueError(f'{what}: levels 1-{MAX_LEVEL} incomplete or repeated')
+        return {r['level']: r for r in rows}
+    by_class = {cls: {race: complete([r for r in levelstats if r['class'] == cls and r['race'] == race],
+                                     f'player_levelstats class {cls} race {race}') for race in races}
+                for cls, races in PLAYABLE.items()}
+    class_by_class = {cls: complete([r for r in classlevelstats if r['class'] == cls], f'player_classlevelstats class {cls}')
+                      for cls in PLAYABLE}
+    own, own_class = by_class[CHARACTER['class']], class_by_class[CHARACTER['class']]
+    return {
+        **CHARACTER,
+        'levelstats_by_race': {race: own[race] for race in PLAYABLE[CHARACTER['class']]},
+        'levelstats_by_level': own[CHARACTER['race']],
+        'classlevelstats_by_level': own_class,
+        'levelstats': own[CHARACTER['race']][CHARACTER['level']],
+        'classlevelstats': own_class[CHARACTER['level']],
+        'levelstats_by_class': by_class,
+        'classlevelstats_by_class': class_by_class,
     }
 
 
@@ -243,13 +293,15 @@ if __name__ == '__main__':
     ap.add_argument('--out', default=str(REPO / 'build/catalog.json'))
     ap.add_argument('--dump', type=Path, default=DEFAULT_DUMP)
     ap.add_argument('--dbc-dir', type=Path, default=DBC_DIR)
+    ap.add_argument('--defs', type=Path, default=dbc.DEFS)
     ap.add_argument('--progression', type=Path, default=REPO / 'data/progression.json')
     ap.add_argument('--core-spells', type=Path, default=CORE_SPELLS)
     ap.add_argument('--equipment', type=Path, default=EQUIPMENT)
     ap.add_argument('--character', help='explicitly refresh character snapshot from the live realm')
     ap.add_argument('--talent-only', action='store_true', help='write code-linked talent spells missing from a progression catalog')
-    ap.add_argument('--keep-character', action='store_true', help='keep build/character.json (the realm lacks her)')
+    ap.add_argument('--keep-character', action='store_true', help='keep build/character.json (the realm lacks the player)')
     args = ap.parse_args()
+    dbc.DEFS = args.defs
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     cat = build(args.dump, args.dbc_dir, args.progression, args.core_spells, args.equipment)
@@ -261,8 +313,8 @@ if __name__ == '__main__':
         (out.parent / 'character.json').write_text(json.dumps(who, indent=1))
     if args.talent_only:
         # Progression catalogs already contain every talent rank and DBC trigger.
-        # Only the core's code links need a supplemental runtime artifact.
-        wanted = set(TALENT_LINKED_SPELLS)
+        # The runtime supplement also carries racials for older generated catalogs.
+        wanted = set(TALENT_LINKED_SPELLS) | set(RACIAL_SPELLS.values()) | set(RACIAL_LINKED_SPELLS)
         while True:
             added = {cat['spells'][sid][f'EffectTriggerSpell{e}'] for sid in wanted for e in (1, 2, 3)
                      if cat['spells'][sid][f'EffectTriggerSpell{e}']}

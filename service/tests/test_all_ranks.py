@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from data.build_catalog import build, REPO
-from service import character, feral, skyrim
+from service import character, feral, skyrim, spells
 from service.catalog import Catalog
 from service.progression import Progression
 from service.server import Service
@@ -33,7 +33,7 @@ class AllRanks(unittest.TestCase):
         # exercise every rank. The CLI and this fixture call the same builder.
         cls.raw = build()
         cls.cat = Catalog(raw=cls.raw)
-        cls.old = Catalog()
+        cls.old = Catalog(armory=False)   # the pinned build alone (data/build_armory.py adds its own items and spells)
         cls.progression = Progression()
         data = json.loads((REPO / 'data/progression.json').read_text())
         definition = data['classes']['druid']
@@ -187,12 +187,20 @@ class AllRanks(unittest.TestCase):
                     self.assertEqual(scaled['cost'], max(1, round(rule.base_cost * skyrim.cost_factor(15) * wow['cost'] / rule.wow_cost)))
                 else:
                     self.assertEqual(scaled['cost'], wow['cost'])
+                factor = rule.health_factor
+                raw = wow
+                if any(key == 'iron_sword' for key, _ in rule.health):
+                    # Native feral resolution floors the unmodified base before
+                    # armor/crit. Verify conversion of that completed outcome;
+                    # test_balance_tuning independently checks the floor itself.
+                    raw = spells.resolve(self.cat, self.svc.char(req['caster']), req)
+                    factor *= 1.075  # One-Handed 15, no external Fortify
                 for kind in ('events', 'auras'):
-                    for a, b in zip(wow[kind], scaled[kind]):
+                    for a, b in zip(raw[kind], scaled[kind]):
                         if a['type'] in ('damage', 'heal', 'damage_shield'):
                             for field in ('amount', 'per_tick'):
                                 if field in a:
-                                    self.assertEqual(b[field], max(1, round(a[field] * rule.health_factor)) if rule.minimum_health and a[field] > 0 and rule.health_factor > 0 else round(a[field] * rule.health_factor))
+                                    self.assertEqual(b[field], max(1, round(a[field] * factor)) if rule.minimum_health and a[field] > 0 and factor > 0 else round(a[field] * factor))
                         if a['type'] == 'armor' and sid not in SPELLS:
                             anchor = next((i for i in SPELLS if self.cat.chain(i) == row['chain']), None)
                             if anchor:
@@ -200,7 +208,8 @@ class AllRanks(unittest.TestCase):
                                 expected = [abs(a['amount']) * target / reference for _, target, reference in native['armor']]
                                 self.assertEqual([e['magnitude'] for e in b['skyrim']], expected)
         # These are novice-sized budgets, rather than full maximum-rank casts.
-        for sid, cost, health in ((5176, 12, 8), (5185, 14, 16), (8921, 22, 6), (774, 10, 3)):
+        # Healing Touch's floors are .25 (decision D8, October 16: a level-20 healer's main heal was a tenth of her health).
+        for sid, cost, health in ((5176, 12, 8), (5185, 30, 37), (8921, 22, 6), (774, 10, 3)):
             req = self.request(self.by_id[sid], seed=1)
             req['caster']['skyrim'] = {k: 15 for k in skyrim.SKILLS.values()}
             out = self.answer(req)
@@ -269,9 +278,15 @@ class AllRanks(unittest.TestCase):
         for chain in {row['chain'] for row in self.rows}:
             ids = [r['spell'] for r in sorted(self.rows, key=lambda r: r['rank']) if r['chain'] == chain]
             values = [books[0][str(sid)] for sid in ids]
-            self.assertEqual(values, sorted(values), chain)
+            if chain == self.cat.chain(5487):
+                # Explicit form budgets: approved Dire Bear re-entry discount
+                # makes it cheaper than Bear, while health/armor stay stronger.
+                self.assertEqual(values, [91, 86])
+            else:
+                self.assertEqual(values, sorted(values), chain)
         for first, last in ((5176, 9912), (5185, 25297), (774, 25299), (8921, 9835), (1126, 9885)):
-            self.assertLess(books[0][str(first)], books[0][str(last)] * (.4 if first in (5176, 8921) else .2))
+            # A .25 cost floor (Wrath, Moonfire; the heals since D8) puts rank 1 at up to 40% of the top rank's price.
+            self.assertLess(books[0][str(first)], books[0][str(last)] * (.4 if first in (5176, 8921, 5185) else .2))
         for sid, form in feral.FORM_SPELLS.items():
             req = self.request(self.by_id[sid])
             req['caster'].update(form=form, skyrim={'alteration': 15})

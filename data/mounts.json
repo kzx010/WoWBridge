@@ -235,6 +235,64 @@
       "speed_percent": 100,
       "cast_ms": 3000,
       "icon": "Interface\\Icons\\Ability_Mount_WhiteDireWolf"
+    },
+    {
+      "key": "swift_golden_gryphon",
+      "spell": 32235,
+      "name": "Swift Golden Gryphon",
+      "creature": 541,
+      "display": 6852,
+      "model": "Creature\\Gryphon\\Gryphon.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Hunter_Pet_Owl",
+      "flying": true,
+      "flight_speed_percent": 280,
+      "summon_sound": 1378,
+      "description": "Summons and dismisses a rideable Gryphon.  This is a very fast mount that can fly outdoors."
+    },
+    {
+      "key": "swift_green_wind_rider",
+      "spell": 32295,
+      "name": "Swift Green Wind Rider",
+      "creature": 5934,
+      "display": 11011,
+      "model": "Creature\\Wyvern\\Wyvern.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Hunter_Pet_Bat",
+      "flying": true,
+      "flight_speed_percent": 280,
+      "summon_sound": 761,
+      "description": "Summons and dismisses a rideable Wind Rider.  This is a very fast mount that can fly outdoors."
+    },
+    {
+      "key": "summon_warhorse",
+      "spell": 13819,
+      "name": "Summon Warhorse",
+      "creature": 9158,
+      "display": 8469,
+      "model": "Creature\\WarHorse\\WarHorse.mdx",
+      "speed_percent": 60,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Spell_Nature_Swiftness",
+      "class": 2,
+      "level": 40,
+      "mana": 100
+    },
+    {
+      "key": "summon_charger",
+      "spell": 23214,
+      "name": "Summon Charger",
+      "creature": 14565,
+      "display": 14584,
+      "model": "Creature\\WarHorse\\PVPWarHorse.mdx",
+      "speed_percent": 100,
+      "cast_ms": 3000,
+      "icon": "Interface\\Icons\\Ability_Mount_Charger",
+      "class": 2,
+      "level": 60,
+      "mana": 150
     }
   ]
 }

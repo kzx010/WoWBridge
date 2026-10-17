@@ -265,6 +265,45 @@ class Feral(unittest.TestCase):
             self.assertEqual(fallback['damage'], ordinary['damage'])
             self.assertIn('ERR_OUT_OF_RAGE', fallback['next_swing_error'])
 
+    def test_native_maul_facing_away_target_and_live_rage_fallback(self):
+        # Native melee uses facing for the player's arc and in_front for the
+        # target's arc. A wolf looking away must still receive a queued Maul.
+        for form in ('bear', 'dire_bear'):
+            with self.subTest(form=form):
+                req = self.req(9881, form)
+                req.update(op='melee')
+                req['caster'].update(next_swing=9881, power={'rage': 15, 'energy': 100})
+                req['target'].update(facing=True, in_front=False)
+                out = self.good(req)
+                self.assertEqual((out.get('spell'), out.get('cost')), (9881, 15))
+                self.assertNotIn('next_swing_error', out)
+                req['caster']['power']['rage'] = 0
+                fallback = self.good(req)
+                self.assertNotIn('spell', fallback)
+                self.assertEqual(fallback['next_swing_error'], 'SPELL_FAILED_NO_POWER: ERR_OUT_OF_RAGE')
+                req['target']['facing'] = False
+                rejected = self.answer(req)
+                self.assertFalse(rejected['ok'])
+                self.assertEqual(rejected['error'], 'ERR_BADATTACKFACING')
+
+    def test_native_maul_preserves_target_defense_arc(self):
+        outcomes = {}
+        for in_front in (True, False):
+            req = self.req(9881)
+            req.update(op='melee')
+            req['caster']['next_swing'] = 9881
+            req['target'].update(facing=True, in_front=in_front)
+            outcomes[in_front] = set()
+            for seed in range(100):
+                req['seed'] = seed
+                out = self.good(req)
+                self.assertEqual(out.get('spell'), 9881)
+                self.assertNotIn('next_swing_error', out)
+                outcomes[in_front].add(out['outcome'])
+        self.assertIn('parry', outcomes[True])
+        self.assertNotIn('parry', outcomes[False])
+        self.assertNotIn('block', outcomes[False])
+
     def test_swipe_three_independent_targets(self):
         req = self.req(9908)
         req['targets'] = [{**TARGET, 'id': i} for i in range(4)]
@@ -286,7 +325,8 @@ class Feral(unittest.TestCase):
         self.assertEqual(roar['area'], {'radius_yd': 10, 'hostile': True, 'channel': False})
         enrage = self.good(self.req(5229))['auras']
         self.assertEqual((enrage[0]['type'], enrage[0]['per_tick'], enrage[0]['amplitude_ms']), ('periodic_power', 2, 1000))
-        self.assertEqual((enrage[1]['type'], enrage[1]['amount']), ('armor_percent', -26))
+        self.assertEqual((enrage[1]['type'], enrage[1]['amount']), ('armor_percent', -27))   # the tooltip's Bear Form 27%
+        self.assertEqual(self.good(self.req(5229, form='dire_bear'))['auras'][1]['amount'], -16)
         self.assertEqual(enrage[2]['type'], 'interrupt_regen')
         fr = self.good(self.req(22896))['auras'][0]
         self.assertEqual((fr['type'], fr['max_rage_per_tick'], fr['health_per_rage']), ('rage_heal', 10, 20))
@@ -360,7 +400,7 @@ class Feral(unittest.TestCase):
             req['caster']['skyrim'] = {'one_handed': 80, 'alteration': 80, 'two_handed': 1}
             scaled = self.good(req)
             rule = SPELLS[sid]
-            factor = rule.health_factor
+            factor = skyrim.health_factor(rule, req['caster'])
             self.assertEqual(scaled['skill'], 'Alteration' if sid in feral.FORM_SPELLS else 'OneHanded')
             self.assertEqual(scaled['cost'], max(1, round(rule.base_cost * skyrim.cost_factor(80))) if sid in feral.FORM_SPELLS and wow['cost'] else wow['cost'])
             for a, b in zip(wow['events'] + wow.get('results', []), scaled['events'] + scaled.get('results', [])):
@@ -388,7 +428,7 @@ class Feral(unittest.TestCase):
         req['caster']['skyrim'] = {'one_handed': 80, 'two_handed': 1}
         scaled = self.good(req)
         self.assertEqual((scaled['damage'], scaled['rage_gained'], scaled['skill']),
-                         (round(wow['damage'] * 7 / 96.5), wow['rage_gained'], 'OneHanded'))
+                         (round(wow['damage'] * 7 / 96.5 * 1.4), wow['rage_gained'], 'OneHanded'))
 
     def test_malformed_state_and_request_independence(self):
         for fields in ({'form': 'moonkin'}, {'power': {'rage': -1}}, {'power': {'energy': 101}},

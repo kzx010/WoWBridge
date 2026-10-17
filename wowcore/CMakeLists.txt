@@ -54,12 +54,14 @@ set(WOWAPI_LUA ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi.lua ${CMAKE_CURRENT_SOURCE
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_recorded.lua ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_model.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_party.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_nameplates.lua
+    ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_bubbles.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_tracking.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_minimap.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_worldmap.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_quests.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/../data/bag-icons.lua ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_bags.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_character.lua
+    ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_customize.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_merchant.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_loot.lua
     ${CMAKE_CURRENT_SOURCE_DIR}/lua/wowapi_trainer.lua
@@ -136,7 +138,7 @@ if(WOWCORE_TESTS)
         ${WW}/tests/test_lua_handler_globals.cpp
         tests/test_client_data.cpp tests/test_wowapi.cpp tests/test_minimap.cpp tests/test_worldmap.cpp
         tests/test_bags.cpp tests/test_merchant.cpp tests/test_character.cpp tests/test_party.cpp tests/test_nameplates.cpp
-        tests/test_integration.cpp tests/test_ui_profiles.cpp tests/test_resources.cpp tests/test_cast_persistence.cpp tests/test_native_text.cpp tests/test_loot.cpp tests/test_trainer.cpp tests/test_selftest.cpp tests/test_taxi.cpp tests/test_testing.cpp)
+        tests/test_integration.cpp tests/test_ui_profiles.cpp tests/test_resources.cpp tests/test_cast_persistence.cpp tests/test_native_text.cpp tests/test_loot.cpp tests/test_trainer.cpp tests/test_talent_wipe.cpp tests/test_selftest.cpp tests/test_taxi.cpp tests/test_testing.cpp tests/test_menus.cpp tests/test_customize.cpp tests/test_tooltip_audit.cpp)
     target_link_libraries(wowcore_tests PRIVATE wowcore wowcore_catch2)
     # Upstream tests that read WoWee's extracted 3.3.5a interface skip when it is absent; ours is 1.12 from MPQ.
     target_compile_definitions(wowcore_tests PRIVATE WOWEE_SOURCE_DIR="${CMAKE_CURRENT_BINARY_DIR}/no-wowee-data"

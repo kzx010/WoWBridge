@@ -46,6 +46,12 @@
    "index": 173
   },
   {
+   "name": "ThirdPersonState::SetFreeRotationMode (self-test front view)",
+   "kind": "vtable",
+   "id": 205236,
+   "index": 13
+  },
+  {
    "name": "hkpWorld::CastRay(collector)",
    "kind": "function",
    "id": 61400
@@ -55,6 +61,12 @@
    "kind": "vtable",
    "id": 215885,
    "index": 5
+  },
+  {
+   "name": "BSShadowDirectionalLight::Render (SkyCraft CaptureSunShadows)",
+   "kind": "vtable",
+   "id": 255466,
+   "index": 10
   }
  ]
 }

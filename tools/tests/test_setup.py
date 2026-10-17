@@ -9,6 +9,8 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / 'tools'))
+from release import DATA as RELEASE_DATA  # noqa: E402
 
 
 class LocalSetup(unittest.TestCase):
@@ -23,12 +25,13 @@ class LocalSetup(unittest.TestCase):
             (runtime / name).mkdir(parents=True)
         for p in (REPO / 'service').glob('*.py'):
             shutil.copyfile(p, runtime / 'service' / p.name)
-        for name in ('progression', 'talents', 'perks', 'talent_catalog', 'perk_catalog'):
-            shutil.copyfile(REPO / f'data/{name}.json', runtime / f'data/{name}.json')
+        for name in RELEASE_DATA:   # exactly what the tester bundle ships, so setup's check proves the bundle complete
+            shutil.copyfile(REPO / 'data' / name, runtime / 'data' / name)
         (runtime / 'build').mkdir()
         shutil.copyfile(REPO / 'build/catalog.json', runtime / 'build/catalog.json')
         self.mod = self.bundle / 'mod'
         self.put(self.mod / 'WoWBridge.esp', b'mod esp')
+        self.put(self.mod / 'WoWBridgeArmory.esp', b'armory esp')
         self.put(self.mod / 'SKSE/Plugins/WoWBridge.dll', b'plugin fixture')
         self.put(self.mod / 'SKSE/Plugins/WoWBridge.ini', b'[WoW]\nroot=WoW\ncursor=1\n[Test]\nautorun=0\n')
         manifest = {p.relative_to(self.bundle).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -83,8 +86,9 @@ class LocalSetup(unittest.TestCase):
     def test_install_and_uninstall_restore_only_owned_game_files(self):
         self.configure()
         self.run_tool('install', '--plugins-txt', self.plugins)
-        self.assertIn('*WoWBridge.esp', self.plugins.read_text())
+        self.assertEqual(self.plugins.read_text(), '*OtherMod.esp\n*WoWBridge.esp\n*WoWBridgeArmory.esp\n')   # its master first
         self.assertTrue((self.game / 'Data/SKSE/Plugins/WoWBridge.dll').exists())
+        self.assertTrue((self.game / 'Data/WoWBridgeArmory.esp').exists())
         self.run_tool('uninstall')
         after = {p.relative_to(self.game): p.read_bytes() for p in self.game.rglob('*') if p.is_file()}
         self.assertEqual(after, self.before)
@@ -191,6 +195,182 @@ class LocalSetup(unittest.TestCase):
         path = self.source / 'src/game/Entities/Unit.cpp'
         path.write_bytes(path.read_bytes().replace(b'\n', b'\r\n'))
         self.configure()
+
+
+
+
+class InterruptedInstall(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        spec = importlib.util.spec_from_file_location('setup_upgrade_test', REPO / 'setup.py')
+        self.setup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.setup)
+        self.source = self.root / 'payload'
+        self.target = self.root / 'game' / 'Data'
+        self.manifest = self.root / 'local' / 'install.json'
+        self.source.mkdir()
+        self.old = {'nested/a.bin': b'old a', 'nested/b.bin': b'old b'}
+        self.new = {'nested/a.bin': b'new a', 'nested/b.bin': b'new b'}
+        self.payload(self.old)
+        self.setup.install_tree(self.source, self.target, self.manifest)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def payload(self, values):
+        for name, raw in values.items():
+            p = self.source / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(raw)
+
+    def interrupted_upgrade(self):
+        from unittest.mock import patch
+        self.payload(self.new)
+        write = self.setup.write
+        def disk_full(path, raw):
+            if Path(path) == self.target / 'nested/b.bin':
+                raise OSError('simulated disk full during upgrade')
+            return write(path, raw)
+        with patch.object(self.setup, 'write', side_effect=disk_full):
+            with self.assertRaisesRegex(OSError, 'simulated disk full'):
+                self.setup.install_tree(self.source, self.target, self.manifest)
+        self.assertEqual((self.target / 'nested/a.bin').read_bytes(), b'new a')
+        self.assertEqual((self.target / 'nested/b.bin').read_bytes(), b'old b')
+
+    def test_retry_after_partial_upgrade_accepts_both_written_and_unwritten_owned_files(self):
+        self.interrupted_upgrade()
+        self.setup.install_tree(self.source, self.target, self.manifest)
+        for name, raw in self.new.items():
+            self.assertEqual((self.target / name).read_bytes(), raw)
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 0)
+        self.assertFalse((self.target / 'nested').exists())
+
+    def test_uninstall_partial_upgrade_removes_owned_versions_and_preserves_user_edit(self):
+        self.interrupted_upgrade()
+        edited = self.target / 'nested/a.bin'
+        edited.write_bytes(b'user changed this file')
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 1)
+        self.assertEqual(edited.read_bytes(), b'user changed this file')
+        self.assertFalse((self.target / 'nested/b.bin').exists())
+
+    def test_user_edit_during_partial_upgrade_refuses_retry_before_any_copy(self):
+        self.interrupted_upgrade()
+        edited = self.target / 'nested/b.bin'
+        edited.write_bytes(b'user changed this file')
+        before = (self.target / 'nested/a.bin').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'modified or untracked'):
+            self.setup.install_tree(self.source, self.target, self.manifest)
+        self.assertEqual(edited.read_bytes(), b'user changed this file')
+        self.assertEqual((self.target / 'nested/a.bin').read_bytes(), before)
+
+
+    def test_completed_retry_stops_owning_prior_content_versions(self):
+        self.interrupted_upgrade()
+        self.setup.install_tree(self.source, self.target, self.manifest)
+        edited = self.target / 'nested/a.bin'
+        edited.write_bytes(self.old['nested/a.bin'])
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 1)
+        self.assertEqual(edited.read_bytes(), self.old['nested/a.bin'])
+
+    def test_another_upgrade_can_resume_an_already_interrupted_upgrade(self):
+        from unittest.mock import patch
+        self.interrupted_upgrade()
+        third = {name: raw.replace(b'new', b'third') for name, raw in self.new.items()}
+        self.payload(third)
+        write = self.setup.write
+        def interrupted_again(path, raw):
+            if Path(path) == self.target / 'nested/b.bin':
+                raise OSError('interrupted again')
+            return write(path, raw)
+        with patch.object(self.setup, 'write', side_effect=interrupted_again):
+            with self.assertRaisesRegex(OSError, 'interrupted again'):
+                self.setup.install_tree(self.source, self.target, self.manifest)
+        self.setup.install_tree(self.source, self.target, self.manifest)
+        for name, raw in third.items():
+            self.assertEqual((self.target / name).read_bytes(), raw)
+
+    def test_removed_payload_file_keeps_its_interrupted_ownership_until_uninstall(self):
+        self.interrupted_upgrade()
+        (self.source / 'nested/b.bin').unlink()
+        self.setup.install_tree(self.source, self.target, self.manifest)
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 0)
+        self.assertFalse((self.target / 'nested').exists())
+
+    def test_failed_final_manifest_write_leaves_recoverable_ownership(self):
+        from unittest.mock import patch
+        self.payload(self.new)
+        save = self.setup.save
+        saves = 0
+        def fail_commit(path, value):
+            nonlocal saves
+            saves += 1
+            if saves == 2:
+                raise OSError('final manifest write failed')
+            return save(path, value)
+        with patch.object(self.setup, 'save', side_effect=fail_commit):
+            with self.assertRaisesRegex(OSError, 'final manifest write failed'):
+                self.setup.install_tree(self.source, self.target, self.manifest)
+        self.setup.install_tree(self.source, self.target, self.manifest)
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 0)
+        self.assertFalse((self.target / 'nested').exists())
+
+
+    def interrupted_plugin_append(self, after_write=True):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.plugin_local = self.root / 'plugin-local'
+        self.plugin_game = self.root / 'plugin-game'
+        self.plugin_list = self.root / 'profile' / 'Plugins.txt'
+        self.plugin_list.parent.mkdir()
+        original = b'\xef\xbb\xbf*OtherMod.esp\r\n'
+        self.plugin_list.write_bytes(original)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(self.setup, 'LOCAL', self.plugin_local))
+        stack.enter_context(patch.object(self.setup, 'check', return_value={
+            'skyrim': str(self.plugin_game), 'mod_dir': str(self.source)}))
+        write = self.setup.write
+        def interrupted(path, raw):
+            if Path(path) == self.plugin_list:
+                if after_write:
+                    write(path, raw)
+                raise OSError('plugin append interrupted')
+            return write(path, raw)
+        with patch.object(self.setup, 'write', side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, 'plugin append interrupted'):
+                self.setup.install(SimpleNamespace(plugins_txt=self.plugin_list))
+        return original
+
+    def test_uninstall_recovers_interruption_after_plugin_entry_was_appended(self):
+        original = self.interrupted_plugin_append()
+        self.assertIn(b'*WoWBridge.esp', self.plugin_list.read_bytes())
+        self.setup.uninstall()
+        self.assertEqual(self.plugin_list.read_bytes(), original)
+
+    def test_retry_does_not_adopt_its_interrupted_plugin_entry_as_preexisting(self):
+        from types import SimpleNamespace
+        original = self.interrupted_plugin_append()
+        self.setup.install(SimpleNamespace(plugins_txt=self.plugin_list))
+        self.setup.uninstall()
+        self.assertEqual(self.plugin_list.read_bytes(), original)
+
+    def test_failed_plugin_append_preserves_existing_plugin_list(self):
+        original = self.interrupted_plugin_append(after_write=False)
+        self.setup.uninstall()
+        self.assertEqual(self.plugin_list.read_bytes(), original)
+
+
+    def test_later_uninstall_cleans_owned_directories_after_modified_file_is_restored(self):
+        changed = self.target / 'nested/a.bin'
+        changed.write_bytes(b'user edit')
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 1)
+        self.assertTrue(changed.exists())
+        changed.write_bytes(self.old['nested/a.bin'])
+        self.assertEqual(self.setup.remove_tracked(self.manifest), 0)
+        self.assertFalse((self.target / 'nested').exists())
 
 
 if __name__ == '__main__':

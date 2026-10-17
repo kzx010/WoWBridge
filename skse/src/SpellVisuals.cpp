@@ -14,9 +14,9 @@ namespace SpellVisuals
 {
 	namespace
 	{
-		// Her caster-form book (data/build_catalog.py SLICE_SPELLS): Wrath, Moonfire, Rejuvenation, Healing Touch,
+		// Their caster-form book (data/build_catalog.py SLICE_SPELLS): Wrath, Moonfire, Rejuvenation, Healing Touch,
 		// Entangling Roots, Hurricane; Starfire, Regrowth, Faerie Fire, Hibernate, Barkskin, Innervate, Mark and Gift of the
-		// Wild, Thorns, Tranquility, Rebirth, Remove Curse, Abolish Poison (and its tick), Cure Poison, Soothe Animal; her
+		// Wild, Thorns, Tranquility, Rebirth, Remove Curse, Abolish Poison (and its tick), Cure Poison, Soothe Animal; their
 		// forms (the druid's morph puff) and the feral abilities (service feral.FORM_SPELLS, ABILITIES).
 		constexpr std::uint32_t kSpells[] = { 9912, 9835, 25299, 25297, 9853, 17402, 25298, 9858, 9907, 18658, 22812, 29166, 9885,
 			21850, 9910, 9863, 20748, 2782, 2893, 3137, 8946, 9901, 5487, 9634, 768, 783, 1066, 9881, 9908, 6795, 9898, 8983, 5229,
@@ -117,9 +117,9 @@ namespace SpellVisuals
 					s.areaSize = kits.areaSize;
 				}
 			}
-			if (const auto up = db.levelUpEffect()) {   // her level up's light (a unit effect the client hardcodes)
+			if (const auto up = db.levelUpEffect()) {   // their level up's light (a unit effect the client hardcodes)
 				if (const auto* asset = LoadAsset(*lib, mpq, up->model, 1.0f)) {
-					lib->spells[kLevelUp].kits[static_cast<int>(Kit::Impact)].effects.emplace_back(2, asset);   // at her feet
+					lib->spells[kLevelUp].kits[static_cast<int>(Kit::Impact)].effects.emplace_back(2, asset);   // at the player's feet
 				}
 			}
 			std::size_t models = 0;
@@ -161,7 +161,7 @@ namespace SpellVisuals
 			Handle                             handle = 0;
 			const Asset*                       asset = nullptr;
 			int                                slot = 0;
-			RE::ActorHandle                    on;            // empty: her
+			RE::ActorHandle                    on;            // empty: the player
 			bool                               lasting = false, stopped = false, missile = false, area = false;
 			float                              areaScale = 1;   // its radius over the size it is made for
 			float                              age = 0;       // seconds
@@ -176,7 +176,7 @@ namespace SpellVisuals
 		std::vector<Running>   g_running;
 		std::atomic<std::uint32_t> g_count = 0;
 
-		// Her attachment points for a kit's slots: head, chest, base, left hand, right hand, breath, the specials, the world.
+		// Their attachment points for a kit's slots: head, chest, base, left hand, right hand, breath, the specials, the world.
 		constexpr std::uint32_t kHerPoints[] = { 11, 15, 19, 21, 22, 17, 23, 24, 25, 19 };
 
 		// A Skyrim actor's skeleton node for a slot, else a height on it.
@@ -223,7 +223,7 @@ namespace SpellVisuals
 				Running r;
 				r.handle = a_r.handle, r.asset = spell->second.missile, r.on = a_r.on, r.missile = true, r.flight = std::max(a_r.seconds, 0.05f);
 				r.emitters = std::make_unique<wowcore::Emitters>(r.asset->model, static_cast<std::uint32_t>(r.handle));
-				r.from = glm::vec3(std::numeric_limits<float>::quiet_NaN());   // her right hand, at the first step
+				r.from = glm::vec3(std::numeric_limits<float>::quiet_NaN());   // their right hand, at the first step
 				g_running.push_back(std::move(r));
 				return;
 			}
@@ -350,7 +350,7 @@ namespace SpellVisuals
 				r.stopped = true;
 			}
 			const bool looping = (r.lasting && !r.decaying && (hold < 0 || r.seq == hold)) || r.missile;
-			// Where it is: on her attachment point, on its actor's node, or along the missile's flight.
+			// Where it is: on their attachment point, on its actor's node, or along the missile's flight.
 			std::optional<glm::mat4> world;
 			const float scale = Avatar::kUnitsPerYard * r.asset->scale;
 			auto*       actor = r.on ? r.on.get().get() : nullptr;

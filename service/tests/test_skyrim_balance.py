@@ -13,14 +13,14 @@ from service.tests.test_service import FULL, HOSTILE
 
 # Independent expected magicka spent at skill 15 / 50 / 100, without perks.
 COSTS = {
-    9912: (36, 30, 24), 9835: (72, 61, 49), 25298: (117, 99, 79),
-    17402: (975, 820, 657), 9853: (241, 203, 163), 25299: (64, 54, 43),
-    9858: (91, 76, 61), 25297: (111, 93, 75), 9863: (224, 188, 151),
+    9912: (36, 30, 24), 9835: (72, 61, 49), 25298: (72, 61, 49),
+    17402: (488, 410, 328), 9853: (241, 203, 163), 25299: (64, 54, 43),
+    9858: (91, 76, 61), 25297: (111, 93, 75), 9863: (112, 94, 75),
     20748: (882, 741, 594), 18658: (172, 144, 116), 9901: (32, 27, 22),
-    9907: (91, 76, 61), 22812: (23, 19, 15), 29166: (64, 54, 43),
+    9907: (91, 76, 61), 22812: (23, 19, 15), 29166: (11, 9, 7),
     9885: (91, 76, 61), 21850: (245, 206, 165), 9910: (255, 214, 172),
     2782: (64, 54, 43), 8946: (11, 9, 7), 2893: (53, 44, 36),
-    5487: (91, 76, 61), 9634: (171, 144, 115), 768: (91, 76, 61),
+    5487: (91, 76, 61), 9634: (86, 72, 58), 768: (45, 38, 31),
     783: (34, 29, 23), 1066: (196, 165, 132),
 }
 HEALTH = {9912: 35/276, 9835: 70/611, 25298: 75/584, 17402: 240/1340,
@@ -29,6 +29,50 @@ HEALTH = {9912: 35/276, 9835: 70/611, 25298: 75/584, 17402: 240/1340,
           5487: 20/560, 9634: 40/1240, 22896: 10/200}
 WEAPON_ABILITIES = {9881, 9908, 9850, 9830, 9904, 9896, 31018, 9827, 9867, 9846}
 HEALTH.update({sid: 7/96.5 for sid in WEAPON_ABILITIES})
+OFFENSIVE = list(range(16795, 16803)) + [18842]  # Arcanist and Staff of Dominance
+
+
+def native_tooltip_fixture(cat):
+    """Native Lua consumes these real service profiles and resolved health amounts."""
+    svc = Service(cat, None)
+    cases = []
+    for sid, anchor, text in (
+            (9910, 9910, '$s1'), (9881, 9881, '$s1'), (9846, 9846, '$s1'),
+            (9835, 9835, '$s2 / $o1'), (20748, 20748, '$s1 / $q'),
+            (22896, 22896, '$s1'), (22842, 22896, '$s1'),
+            (5487, 5487, '$1178s2'), (9634, 9634, '$9635s2'),
+            (9827, 9827, '$9826o1')):
+        req = request_for(cat, anchor, seed=1)
+        req['spell'] = sid
+        req['caster'].update(talents={}, skyrim={})
+        out = svc.handle(req)
+        if sid == 9881:
+            amount = out['events'][0]['bonus_damage']
+        elif sid == 9835:
+            rolls = [svc.handle({**req, 'seed': seed}) for seed in range(128)]
+            direct = [e['amount'] for cast in rolls for e in cast['events']
+                      if e['type'] == 'damage' and not e['crit'] and not e['resisted']]
+            amount = f"{min(direct)} to {max(direct)} / {sum(t['amount'] for t in out['auras'][0]['ticks'])}"
+        elif sid == 20748:
+            amount = f"{out['events'][0]['health']} / {cat.spell(sid)['EffectMiscValue1']}"
+        elif sid in (5487, 9634):
+            amount = out['auras'][0]['skyrim_health_bonus']
+        elif sid in (22896, 22842):
+            amount = out['auras'][0]['health_per_rage']
+        elif sid == 9827:
+            amount = sum(t['amount'] for t in out['auras'][1]['ticks'])
+        else:
+            amount = out['auras'][0]['amount']
+        cases.append({'spell': sid, 'profile': out['tooltip'], 'text': text,
+                      'actual': str(amount).removesuffix('.0')})
+
+    def lua(value):
+        if isinstance(value, dict):
+            return '{' + ','.join(f'[{json.dumps(str(k))}]={lua(v)}' for k, v in value.items()) + '}'
+        if isinstance(value, list):
+            return '{' + ','.join(lua(v) for v in value) + '}'
+        return json.dumps(value)
+    return '-- Service snapshots verified by test_native_tooltip_fixture_matches_actual_service.\nreturn ' + lua(cases) + '\n'
 
 
 def request_for(cat, sid, items=(), seed=11):
@@ -59,6 +103,74 @@ class SkyrimBalance(unittest.TestCase):
         self.assertTrue(out['ok'], out)
         return out
 
+    def test_native_tooltip_fixture_matches_actual_service(self):
+        fixture = Path(__file__).parent / 'fixtures/skyrim_health_tooltips.lua'
+        self.assertEqual(fixture.read_text(), native_tooltip_fixture(self.cat))
+        # The interface's test (wowcore test_wowapi.cpp) reads its own copy: the same snapshots.
+        self.assertEqual((Path(__file__).parents[2] / 'wowcore/tests/fixtures/skyrim_health_tooltips.lua').read_text(),
+                         fixture.read_text())
+
+    def test_all_caster_ranks_advance_with_and_without_strong_gear(self):
+        # Rolls stay independent and uniform per rank; across many seeds a higher rank's
+        # noncritical range and mean must not fall below a lower rank's, nor its cost.
+        for top in (9912, 9835, 25298, 17402, 25299, 9858, 25297, 9863):
+            ids = sorted((sid for sid, row in self.cat.ranks.items() if row['chain'] == self.cat.chain(top)),
+                         key=lambda sid: self.cat.ranks[sid]['rank'])
+            self.assertGreater(len(ids), 1)
+            for items in ((), OFFENSIVE, FULL):
+                lows, highs, means, costs = [], [], [], []
+                for sid in ids:
+                    totals = []
+                    for seed in range(128):
+                        req = request_for(self.cat, top, items, seed)
+                        req['spell'] = sid
+                        req['caster']['skyrim'] = {'destruction': 50, 'restoration': 50}
+                        out = self.answer(req)
+                        if any(e.get('crit') or e.get('resisted') for e in out['events']):
+                            continue
+                        total = sum(e['amount'] for e in out['events'] if e['type'] in ('damage', 'heal'))
+                        total += sum(t['amount'] for a in out['auras'] if a['type'] in ('damage', 'heal')
+                                     for t in a.get('ticks', []))
+                        if top in (17402, 9863):
+                            tick = self.answer({'op': 'tick_area', 'spell': sid, 'seed': seed,
+                                                'caster': req['caster'],
+                                                'targets': [{'id': 1, 'level': 60, 'friendly': top == 9863}]})
+                            total = sum(e['amount'] for e in tick['results'] if e['type'] in ('damage', 'heal'))
+                            self.assertNotIn('cost', tick)
+                        totals.append(total)
+                    self.assertTrue(totals)
+                    lows.append(min(totals)); highs.append(max(totals)); means.append(sum(totals) / len(totals))
+                    costs.append(out['cost'])
+                with self.subTest(top=top, items=items):
+                    for k in range(len(ids) - 1):
+                        self.assertLessEqual(lows[k], highs[k + 1], (ids[k], ids[k + 1]))   # never wholly above
+                        self.assertLessEqual(means[k], means[k + 1] + 1e-9, (ids[k], ids[k + 1]))
+                        self.assertLessEqual(highs[k], highs[k + 1], (ids[k], ids[k + 1]))
+                    self.assertEqual(costs, sorted(costs))
+                    self.assertGreater(costs[0], 0)
+
+    def test_rank_bonus_conversion_is_shared_and_wow_cache_is_unchanged(self):
+        from service.talent_effects import tooltip
+        for top in (9912, 9835, 25298, 17402, 25299, 9858, 25297, 9863):
+            for sid, row in self.cat.ranks.items():
+                if row['chain'] != self.cat.chain(top):
+                    continue
+                rule = self.cat.balance[sid]
+                spell = self.cat.spell(sid)
+                wow = self.svc.char({'items': OFFENSIVE, 'talents': {}})
+                native = self.svc.char({'items': OFFENSIVE, 'talents': {}, 'skyrim': {}})
+                bare = self.svc.char({'talents': {}})
+                for e in (1, 2, 3):
+                    if spell[f'Effect{e}'] not in (2, 10) and spell[f'EffectApplyAuraName{e}'] not in (3, 8):
+                        continue
+                    baseline = tooltip(self.cat, bare, spell)['effects'][e-1]
+                    original = tooltip(self.cat, wow, spell)['effects'][e-1]
+                    adjusted = tooltip(self.cat, native, spell)['effects'][e-1]
+                    for b, w, n in zip(baseline, original, adjusted):
+                        self.assertAlmostEqual((n-b)*rule.health_factor, (w-b)*SPELLS[top].health_factor)
+                self.assertIs(wow, self.svc.char({'items': OFFENSIVE, 'talents': {}}))
+                self.assertFalse(wow.health_bonus_scales)
+
     def test_entire_slice_cost_health_and_wow_compatibility(self):
         self.assertEqual(set(self.cat.slice.values()), set(SPELLS))
         self.assertLessEqual({r.skill for r in SPELLS.values()}, set(skyrim.SKILLS))
@@ -82,7 +194,7 @@ class SkyrimBalance(unittest.TestCase):
                             self.assertEqual(scaled['skill'], SPELLS[sid].skill)
                             for key in wow.keys() - {'cost', 'events', 'auras', 'results'}:
                                 self.assertEqual(wow[key], scaled[key])
-                            factor = HEALTH.get(sid, 0)
+                            factor = HEALTH.get(sid, 0) * (1 + .005 * level if sid in WEAPON_ABILITIES else 1)
                             for key in ('events', 'auras', 'results'):
                                 for a, b in zip(wow.get(key, []), scaled.get(key, [])):
                                     expected = copy.deepcopy(a)
@@ -100,6 +212,7 @@ class SkyrimBalance(unittest.TestCase):
                                         expected.update(health=100, mana=75)
                                     elif a['type'] == 'shapeshift':
                                         expected['skyrim_health_bonus'] = round(a['health_bonus'] * factor)
+                                        expected['skyrim_armor_percent'] = {'bear': 50, 'dire_bear': 100}.get(a['form'], 0)
                                     elif a['type'] == 'rage_heal':
                                         expected['health_per_rage'] *= factor
                                     self.assertEqual({k: v for k, v in b.items() if k != 'skyrim'}, expected)
@@ -131,9 +244,9 @@ class SkyrimBalance(unittest.TestCase):
         # Compare actual API cost to the counterpart's cost, not merely to the
         # conversion factor. Repeated channels train once, at cast application.
         for sid, counterpart, units in (
-                (9912, 'firebolt', 1), (25298, 'fireball', 1), (17402, 'blizzard', 1),
+                (9912, 'firebolt', 1), (25298, 'firebolt', 2), (17402, 'blizzard', .5),
                 (25297, 'close_wounds', 1),
-                (25299, 'fast_healing', 1), (9863, 'grand_healing', 1),
+                (25299, 'fast_healing', 1), (9863, 'grand_healing', .5),
                 (20748, 'dead_thrall', 1), (9885, 'oakflesh', 1), (18658, 'calm', 40/30)):
             for skill in (15, 50, 100):
                 req = request_for(self.cat, sid)
@@ -169,7 +282,7 @@ class SkyrimBalance(unittest.TestCase):
                 req['caster']['skyrim'] = {'restoration': skill}
                 heals.append(self.answer(req)['events'][0]['amount'])
             self.assertGreater(heals[0], heals[1])
-        for sid in (9912, 25298, 25297, 9858, 9850, 22896):
+        for sid in (9912, 25298, 25297, 9858, 22896):
             outcomes = []
             for skill in (15, 50, 100):
                 req = request_for(self.cat, sid, seed=1)

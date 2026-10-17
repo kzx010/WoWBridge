@@ -20,6 +20,7 @@ LOCAL = ROOT / 'local'
 sys.path.insert(0, str(RUNTIME))
 
 INI = 'SKSE/Plugins/WoWBridge.ini'
+PLUGINS = ('WoWBridge.esp', 'WoWBridgeArmory.esp')   # load order: the Armory has WoWBridge.esp as a master
 ADDRESS_LIBRARY = 'versionlib-1-7-104-0.bin'
 ARCHIVES = ('dbc.MPQ', 'fonts.MPQ', 'interface.MPQ', 'misc.MPQ', 'model.MPQ',
             'sound.MPQ', 'speech.MPQ', 'terrain.MPQ', 'texture.MPQ', 'wmo.MPQ')
@@ -159,7 +160,8 @@ def install_tree(source, target, manifest_path, *, overrides=None, allow_edited=
         actual = digest(dst) if dst.exists() else None
         actuals[name] = actual
         expected = old['files'].get(name)
-        if actual is not None and actual != (expected if expected is not None else hashes[name]) and name not in allow_edited:
+        accepted = {hashes[name]} if expected is None else {expected, old.get('pending_files', {}).get(name)}
+        if actual is not None and actual not in accepted and name not in allow_edited:
             raise ValueError(f'refusing to overwrite a modified or untracked file: {name}')
         for parent in (dst.parent, *dst.parent.parents):
             if parent != target and target not in parent.parents:
@@ -170,12 +172,26 @@ def install_tree(source, target, manifest_path, *, overrides=None, allow_edited=
     for name in payload:
         if actuals[name] is None or name in owned:
             owned[name] = hashes[name]
-    result = {**old, 'target': str(target), 'files': owned, 'directories': sorted(directories)}
-    # Record ownership before writes so an interrupted copy can still be removed.
+    pending = dict(old.get('pending_files', {}))
+    for name in payload:
+        previous = pending.pop(name, None)
+        # An interrupted upgrade may leave either version on disk. Remember
+        # only a verified installer-owned version, never an allowed user edit.
+        if (name in old['files'] and actuals[name] is not None and actuals[name] != hashes[name]
+                and actuals[name] in {old['files'][name], previous}):
+            pending[name] = actuals[name]
+    result = {**old, 'target': str(target), 'files': owned, 'directories': sorted(directories), 'pending_files': pending}
+    # Journal both owned versions before writes, including files not copied yet.
     save(manifest_path, result)
     for name, src in payload.items():
         if actuals[name] != hashes[name]:
             write(target / safe_relative(name), overrides[name] if overrides and name in overrides else src.read_bytes())
+    # Once copied, an older version becomes an ordinary user modification.
+    # Retain pending ownership for files omitted from an interrupted upgrade.
+    result['pending_files'] = {name: value for name, value in pending.items() if name not in payload}
+    if not result['pending_files']:
+        result.pop('pending_files')
+    save(manifest_path, result)
     return result
 
 
@@ -211,7 +227,7 @@ def configure(args):
                                  'wow_client_windows': native_client, 'cmangos': str(cmangos),
                                  'address_library': str(address), 'mod_dir': str(mod_dir)})
     print(f'Configured mod folder: {mod_dir}')
-    print('Enable this folder and WoWBridge.esp in your mod manager, or run: python setup.py install')
+    print('Enable this folder, WoWBridge.esp and then WoWBridgeArmory.esp in your mod manager, or run: python setup.py install')
     print('Before starting Skyrim through SKSE, run: python setup.py service')
 
 
@@ -235,7 +251,7 @@ def check():
     cat = Catalog()
     Perks(cat, Progression())
     Talents()
-    need(Path(cfg['mod_dir']) / 'WoWBridge.esp', 'configured mod')
+    need(Path(cfg['mod_dir']) / PLUGINS[0], 'configured mod')
     need(Path(cfg['mod_dir']) / INI, 'configured mod INI')
     need(Path(cfg['mod_dir']) / 'SKSE/Plugins/WoWBridge.dll', 'configured plugin')
     print('Local dependencies, resistance table and gameplay data passed validation.')
@@ -254,17 +270,29 @@ def install(args):
     if old.get('plugins_path') and old['plugins_path'] != str(plugins):
         raise ValueError('uninstall before changing the tracked Plugins.txt location')
     m = install_tree(Path(cfg['mod_dir']), Path(cfg['skyrim']) / 'Data', LOCAL / 'install-manifest.json')
+    m['plugins_path'] = str(plugins)
     before = plugins.read_bytes() if plugins.exists() else b''
     lines = before.decode('utf-8-sig').splitlines()
-    if not any(line.lstrip('*').strip().lower() == 'wowbridge.esp' for line in lines):
+    listed = {line.lstrip('*').strip().lower() for line in lines}
+    shipped = [PLUGINS[0]] + [plugin for plugin in PLUGINS[1:] if (Path(cfg['mod_dir']) / plugin).is_file()]   # an older mod: none
+    missing = [plugin for plugin in shipped if plugin.lower() not in listed]   # appended in load order, after the rest
+    if missing:
         newline = b'\r\n' if b'\r\n' in before else b'\n'
-        appended = before + (newline if before and not before.endswith((b'\n', b'\r')) else b'') + b'*WoWBridge.esp' + newline
-        m.update(plugin_added=True, plugins_original_hex=before.hex(), plugins_existed=plugins.exists(),
-                 plugins_installed_sha256=hashlib.sha256(appended).hexdigest())
+        appended = before + (newline if before and not before.endswith((b'\n', b'\r')) else b'') + \
+            b''.join(b'*' + plugin.encode() + newline for plugin in missing)
+        if m.get('plugin_added'):   # an upgrade: entries an earlier install added stay ours, the file before them its original
+            m.update(plugins_added=m.get('plugins_added', ['WoWBridge.esp']) + missing,
+                     plugins_installed_sha256=hashlib.sha256(appended).hexdigest())
+        else:
+            m.update(plugin_added=True, plugins_added=missing, plugins_original_hex=before.hex(), plugins_existed=plugins.exists(),
+                     plugins_installed_sha256=hashlib.sha256(appended).hexdigest())
+        # Record the added entry before the atomic append so a crash cannot
+        # make a retry mistake our entry for a pre-existing user's entry.
+        save(LOCAL / 'install-manifest.json', m)
         write(plugins, appended)
-    elif not any(line.strip().lower() == '*wowbridge.esp' for line in lines):
-        print('WoWBridge.esp is listed but disabled. Enable it in your plugin manager.')
-    m['plugins_path'] = str(plugins)
+    for plugin in shipped:
+        if plugin.lower() in listed and not any(line.strip().lower() == '*' + plugin.lower() for line in lines):
+            print(f'{plugin} is listed but disabled. Enable it in your plugin manager.')
     save(LOCAL / 'install-manifest.json', m)
     print('Installed WoWBridge into Skyrim Data. Launch Skyrim through SKSE after starting the service.')
 
@@ -279,15 +307,20 @@ def remove_tracked(path):
         dst = target / safe_relative(name)
         if not dst.exists():
             continue
-        if any(p.is_symlink() for p in [dst, *dst.parents]) or digest(dst) != expected:
+        if (any(p.is_symlink() for p in [dst, *dst.parents]) or
+                digest(dst) not in {expected, m.get('pending_files', {}).get(name)}):
             kept[name] = expected
             print(f'Kept modified file: {name}')
             continue
         dst.unlink()
+    directories = []
     for name in sorted(m.get('directories', []), key=lambda value: len(Path(value).parts), reverse=True):
         directory = target / safe_relative(name)
-        if directory.is_dir() and not any(p.is_symlink() for p in [directory, *directory.parents]) and not any(directory.iterdir()):
-            directory.rmdir()
+        if directory.is_dir() and not any(p.is_symlink() for p in [directory, *directory.parents]):
+            if not any(directory.iterdir()):
+                directory.rmdir()
+            else:
+                directories.append(name)  # a kept file may be removed by a later uninstall
     if m.get('plugin_added'):
         plugins = Path(m['plugins_path'])
         if plugins.exists():
@@ -300,9 +333,11 @@ def remove_tracked(path):
                 raw = plugins.read_bytes()
                 prefix = b'\xef\xbb\xbf' if raw.startswith(b'\xef\xbb\xbf') else b''
                 lines = raw[len(prefix):].splitlines(keepends=True)
-                lines = [line for line in lines if line.decode('utf-8').strip().lstrip('*').lower() != 'wowbridge.esp']
+                added = {plugin.lower() for plugin in m.get('plugins_added', ['WoWBridge.esp'])}
+                lines = [line for line in lines if line.decode('utf-8').strip().lstrip('*').lower() not in added]
                 write(plugins, prefix + b''.join(lines))
-    save(path, {**m, 'files': kept, 'directories': [], 'plugin_added': False})
+    pending = {name: value for name, value in m.get('pending_files', {}).items() if name in kept}
+    save(path, {**m, 'files': kept, 'pending_files': pending, 'directories': directories, 'plugin_added': False})
     return len(kept)
 
 
@@ -312,15 +347,17 @@ def uninstall():
     print(f'WoWBridge installation removed. {kept} modified files kept. Local settings and logs kept in local/.')
 
 
-def service():
+def service(trace=False):
     check()
     with socket.socket() as probe:
         probe.settimeout(0.5)
         if probe.connect_ex(('127.0.0.1', 7878)) == 0:
             raise ValueError('port 7878 is already in use; close the existing service before starting this one')
     print('Starting the gameplay service on 127.0.0.1:7878. Keep this window open while playing.', flush=True)
-    return subprocess.call([sys.executable, '-m', 'service.server', '--resist-table', str(LOCAL / 'partial_resists.json'),
-                            '--trace', str(LOCAL / 'service_trace.jsonl')], cwd=RUNTIME)
+    command = [sys.executable, '-m', 'service.server', '--resist-table', str(LOCAL / 'partial_resists.json')]
+    if trace:
+        command += ['--trace', str(LOCAL / 'service_trace.jsonl')]
+    return subprocess.call(command, cwd=RUNTIME)
 
 
 def main():
@@ -335,7 +372,9 @@ def main():
     inst = subs.add_parser('install', help='install the staged mod directly into Skyrim Data')
     inst.add_argument('--plugins-txt', type=Path)
     for name in ('check', 'service', 'uninstall'):
-        subs.add_parser(name)
+        command = subs.add_parser(name)
+        if name == 'service':
+            command.add_argument('--trace', action='store_true', help='append detailed request/response logs in local/')
     args = ap.parse_args()
     if args.command is None:
         args = conf.parse_args([])
@@ -345,7 +384,7 @@ def main():
     elif args.command == 'install':
         install(args)
     elif args.command == 'service':
-        return service()
+        return service(trace=args.trace)
     elif args.command == 'check':
         check()
     else:

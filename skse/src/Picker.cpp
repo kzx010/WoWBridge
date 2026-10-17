@@ -7,7 +7,7 @@ namespace Picker
 	namespace
 	{
 		// Layers a cursor pick should stop at (SmoothCam's set: static, anim static, clutter, biped, trees,
-		// props, terrain, ground, char controller) plus dead bipeds, and the loose things she can take or hold:
+		// props, terrain, ground, char controller) plus dead bipeds, and the loose things the player can take or hold:
 		// weapons on the ground (5) and large clutter (29).
 		constexpr std::uint64_t kLayers = (1ull << 1) | (1ull << 2) | (1ull << 4) | (1ull << 5) | (1ull << 8) | (1ull << 9) |
 		                                  (1ull << 10) | (1ull << 13) | (1ull << 17) | (1ull << 29) | (1ull << 30) | (1ull << 32) |

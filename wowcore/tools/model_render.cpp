@@ -4,6 +4,7 @@
 // usage: model_render OUT.png [--yaw DEG] [--anim ID] [--time MS] [--size N] [--zoom F] [--atlas ATLAS.png]
 //                            [--attach 0|1] [--drawn 0|1] [--naked 0|1]
 //                            [--display ID] (CreatureDisplayInfo, e.g. Cat 892, Bear 2281)
+//                            [--mount DISPLAY [--mount-anim ID]] (rider on a mount's saddle; mount pose Run 5 by default)
 //                            [--from-anim ID --from-time MS --blend-progress F] [--global-time MS]
 //                            [--item ENTRY --item-display ID --item-type InventoryType --item-part N]
 //                            [--race ID --sex 0|1] (helm variant; defaults to Elunara)
@@ -180,7 +181,7 @@ int main(int argc, char** argv) {
     }
     float yaw = 180.0f, timeMs = 0.0f;
     uint32_t anim = 0;
-    uint32_t displayId = 0, mountDisplay = 0;
+    uint32_t displayId = 0, mountDisplay = 0, mountAnim = 5;
     std::optional<uint32_t> itemEntry, itemDisplay, itemType;
     std::vector<wowcore::Worn> selectedWorn;
     uint32_t itemPartIndex = 0;
@@ -202,6 +203,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--upper-time")) upperTimeMs = std::stof(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--anim")) anim = static_cast<uint32_t>(std::stoul(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--mount")) mountDisplay = static_cast<uint32_t>(std::stoul(argv[i + 1]));
+        else if (!std::strcmp(argv[i], "--mount-anim")) mountAnim = static_cast<uint32_t>(std::stoul(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--display")) displayId = static_cast<uint32_t>(std::stoul(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--item")) itemEntry = static_cast<uint32_t>(std::stoul(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--item-display")) itemDisplay = static_cast<uint32_t>(std::stoul(argv[i + 1]));
@@ -365,7 +367,7 @@ int main(int argc, char** argv) {
     std::vector<glm::mat4> mountBones;
     if (mountDisplay) {
         if (!mount) return 1;
-        const int mountSeq = wowcore::sequenceWithFallback(*mount, 5);
+        const int mountSeq = wowcore::sequenceWithFallback(*mount, mountAnim);
         wowcore::poseBones(*mount, mountSeq, timeMs, globalMs, mountBones);
         const auto saddle = wowcore::mountedRiderMatrix(*mount, mountBones, mountLook->scale);
         if (!saddle) return 1;

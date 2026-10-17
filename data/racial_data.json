@@ -1,0 +1,4606 @@
+{
+ "evidence": {
+  "levelstats": [
+   "src/game/Entities/Player.cpp:2820",
+   "src/game/Globals/ObjectMgr.cpp:3552"
+  ],
+  "racials": [
+   "src/game/Globals/ObjectMgr.cpp:3336"
+  ],
+  "starting_outfits": [
+   "src/game/Entities/Player.cpp:865"
+  ]
+ },
+ "levelstats_by_class": {
+  "11": {
+   "4": {
+    "1": {
+     "agi": 25,
+     "class": 11,
+     "inte": 22,
+     "level": 1,
+     "race": 4,
+     "spi": 22,
+     "sta": 19,
+     "str": 18
+    },
+    "10": {
+     "agi": 29,
+     "class": 11,
+     "inte": 30,
+     "level": 10,
+     "race": 4,
+     "spi": 31,
+     "sta": 24,
+     "str": 23
+    },
+    "11": {
+     "agi": 30,
+     "class": 11,
+     "inte": 31,
+     "level": 11,
+     "race": 4,
+     "spi": 33,
+     "sta": 25,
+     "str": 23
+    },
+    "12": {
+     "agi": 30,
+     "class": 11,
+     "inte": 32,
+     "level": 12,
+     "race": 4,
+     "spi": 34,
+     "sta": 26,
+     "str": 24
+    },
+    "13": {
+     "agi": 31,
+     "class": 11,
+     "inte": 33,
+     "level": 13,
+     "race": 4,
+     "spi": 35,
+     "sta": 26,
+     "str": 24
+    },
+    "14": {
+     "agi": 31,
+     "class": 11,
+     "inte": 34,
+     "level": 14,
+     "race": 4,
+     "spi": 36,
+     "sta": 27,
+     "str": 25
+    },
+    "15": {
+     "agi": 32,
+     "class": 11,
+     "inte": 36,
+     "level": 15,
+     "race": 4,
+     "spi": 37,
+     "sta": 28,
+     "str": 26
+    },
+    "16": {
+     "agi": 32,
+     "class": 11,
+     "inte": 37,
+     "level": 16,
+     "race": 4,
+     "spi": 38,
+     "sta": 28,
+     "str": 26
+    },
+    "17": {
+     "agi": 33,
+     "class": 11,
+     "inte": 38,
+     "level": 17,
+     "race": 4,
+     "spi": 40,
+     "sta": 29,
+     "str": 27
+    },
+    "18": {
+     "agi": 34,
+     "class": 11,
+     "inte": 39,
+     "level": 18,
+     "race": 4,
+     "spi": 41,
+     "sta": 30,
+     "str": 27
+    },
+    "19": {
+     "agi": 34,
+     "class": 11,
+     "inte": 40,
+     "level": 19,
+     "race": 4,
+     "spi": 42,
+     "sta": 30,
+     "str": 28
+    },
+    "2": {
+     "agi": 25,
+     "class": 11,
+     "inte": 23,
+     "level": 2,
+     "race": 4,
+     "spi": 23,
+     "sta": 20,
+     "str": 19
+    },
+    "20": {
+     "agi": 35,
+     "class": 11,
+     "inte": 41,
+     "level": 20,
+     "race": 4,
+     "spi": 43,
+     "sta": 31,
+     "str": 29
+    },
+    "21": {
+     "agi": 35,
+     "class": 11,
+     "inte": 42,
+     "level": 21,
+     "race": 4,
+     "spi": 45,
+     "sta": 32,
+     "str": 29
+    },
+    "22": {
+     "agi": 36,
+     "class": 11,
+     "inte": 43,
+     "level": 22,
+     "race": 4,
+     "spi": 46,
+     "sta": 33,
+     "str": 30
+    },
+    "23": {
+     "agi": 37,
+     "class": 11,
+     "inte": 44,
+     "level": 23,
+     "race": 4,
+     "spi": 47,
+     "sta": 33,
+     "str": 31
+    },
+    "24": {
+     "agi": 37,
+     "class": 11,
+     "inte": 46,
+     "level": 24,
+     "race": 4,
+     "spi": 49,
+     "sta": 34,
+     "str": 31
+    },
+    "25": {
+     "agi": 38,
+     "class": 11,
+     "inte": 47,
+     "level": 25,
+     "race": 4,
+     "spi": 50,
+     "sta": 35,
+     "str": 32
+    },
+    "26": {
+     "agi": 38,
+     "class": 11,
+     "inte": 48,
+     "level": 26,
+     "race": 4,
+     "spi": 51,
+     "sta": 36,
+     "str": 33
+    },
+    "27": {
+     "agi": 39,
+     "class": 11,
+     "inte": 49,
+     "level": 27,
+     "race": 4,
+     "spi": 53,
+     "sta": 36,
+     "str": 33
+    },
+    "28": {
+     "agi": 40,
+     "class": 11,
+     "inte": 50,
+     "level": 28,
+     "race": 4,
+     "spi": 54,
+     "sta": 37,
+     "str": 34
+    },
+    "29": {
+     "agi": 40,
+     "class": 11,
+     "inte": 52,
+     "level": 29,
+     "race": 4,
+     "spi": 56,
+     "sta": 38,
+     "str": 35
+    },
+    "3": {
+     "agi": 26,
+     "class": 11,
+     "inte": 24,
+     "level": 3,
+     "race": 4,
+     "spi": 24,
+     "sta": 20,
+     "str": 19
+    },
+    "30": {
+     "agi": 41,
+     "class": 11,
+     "inte": 53,
+     "level": 30,
+     "race": 4,
+     "spi": 57,
+     "sta": 39,
+     "str": 35
+    },
+    "31": {
+     "agi": 42,
+     "class": 11,
+     "inte": 54,
+     "level": 31,
+     "race": 4,
+     "spi": 58,
+     "sta": 40,
+     "str": 36
+    },
+    "32": {
+     "agi": 42,
+     "class": 11,
+     "inte": 56,
+     "level": 32,
+     "race": 4,
+     "spi": 60,
+     "sta": 41,
+     "str": 37
+    },
+    "33": {
+     "agi": 43,
+     "class": 11,
+     "inte": 57,
+     "level": 33,
+     "race": 4,
+     "spi": 61,
+     "sta": 41,
+     "str": 38
+    },
+    "34": {
+     "agi": 44,
+     "class": 11,
+     "inte": 58,
+     "level": 34,
+     "race": 4,
+     "spi": 63,
+     "sta": 42,
+     "str": 38
+    },
+    "35": {
+     "agi": 44,
+     "class": 11,
+     "inte": 60,
+     "level": 35,
+     "race": 4,
+     "spi": 64,
+     "sta": 43,
+     "str": 39
+    },
+    "36": {
+     "agi": 45,
+     "class": 11,
+     "inte": 61,
+     "level": 36,
+     "race": 4,
+     "spi": 66,
+     "sta": 44,
+     "str": 40
+    },
+    "37": {
+     "agi": 46,
+     "class": 11,
+     "inte": 62,
+     "level": 37,
+     "race": 4,
+     "spi": 68,
+     "sta": 45,
+     "str": 41
+    },
+    "38": {
+     "agi": 46,
+     "class": 11,
+     "inte": 64,
+     "level": 38,
+     "race": 4,
+     "spi": 69,
+     "sta": 46,
+     "str": 42
+    },
+    "39": {
+     "agi": 47,
+     "class": 11,
+     "inte": 65,
+     "level": 39,
+     "race": 4,
+     "spi": 71,
+     "sta": 47,
+     "str": 42
+    },
+    "4": {
+     "agi": 26,
+     "class": 11,
+     "inte": 25,
+     "level": 4,
+     "race": 4,
+     "spi": 25,
+     "sta": 21,
+     "str": 20
+    },
+    "40": {
+     "agi": 48,
+     "class": 11,
+     "inte": 67,
+     "level": 40,
+     "race": 4,
+     "spi": 72,
+     "sta": 48,
+     "str": 43
+    },
+    "41": {
+     "agi": 49,
+     "class": 11,
+     "inte": 68,
+     "level": 41,
+     "race": 4,
+     "spi": 74,
+     "sta": 49,
+     "str": 44
+    },
+    "42": {
+     "agi": 49,
+     "class": 11,
+     "inte": 70,
+     "level": 42,
+     "race": 4,
+     "spi": 76,
+     "sta": 50,
+     "str": 45
+    },
+    "43": {
+     "agi": 50,
+     "class": 11,
+     "inte": 71,
+     "level": 43,
+     "race": 4,
+     "spi": 77,
+     "sta": 51,
+     "str": 46
+    },
+    "44": {
+     "agi": 51,
+     "class": 11,
+     "inte": 73,
+     "level": 44,
+     "race": 4,
+     "spi": 79,
+     "sta": 51,
+     "str": 47
+    },
+    "45": {
+     "agi": 52,
+     "class": 11,
+     "inte": 74,
+     "level": 45,
+     "race": 4,
+     "spi": 81,
+     "sta": 52,
+     "str": 47
+    },
+    "46": {
+     "agi": 53,
+     "class": 11,
+     "inte": 76,
+     "level": 46,
+     "race": 4,
+     "spi": 83,
+     "sta": 53,
+     "str": 48
+    },
+    "47": {
+     "agi": 53,
+     "class": 11,
+     "inte": 77,
+     "level": 47,
+     "race": 4,
+     "spi": 84,
+     "sta": 55,
+     "str": 49
+    },
+    "48": {
+     "agi": 54,
+     "class": 11,
+     "inte": 79,
+     "level": 48,
+     "race": 4,
+     "spi": 86,
+     "sta": 56,
+     "str": 50
+    },
+    "49": {
+     "agi": 55,
+     "class": 11,
+     "inte": 81,
+     "level": 49,
+     "race": 4,
+     "spi": 88,
+     "sta": 57,
+     "str": 51
+    },
+    "5": {
+     "agi": 27,
+     "class": 11,
+     "inte": 26,
+     "level": 5,
+     "race": 4,
+     "spi": 26,
+     "sta": 21,
+     "str": 20
+    },
+    "50": {
+     "agi": 56,
+     "class": 11,
+     "inte": 82,
+     "level": 50,
+     "race": 4,
+     "spi": 90,
+     "sta": 58,
+     "str": 52
+    },
+    "51": {
+     "agi": 57,
+     "class": 11,
+     "inte": 84,
+     "level": 51,
+     "race": 4,
+     "spi": 92,
+     "sta": 59,
+     "str": 53
+    },
+    "52": {
+     "agi": 58,
+     "class": 11,
+     "inte": 86,
+     "level": 52,
+     "race": 4,
+     "spi": 94,
+     "sta": 60,
+     "str": 54
+    },
+    "53": {
+     "agi": 59,
+     "class": 11,
+     "inte": 87,
+     "level": 53,
+     "race": 4,
+     "spi": 96,
+     "sta": 61,
+     "str": 55
+    },
+    "54": {
+     "agi": 59,
+     "class": 11,
+     "inte": 89,
+     "level": 54,
+     "race": 4,
+     "spi": 98,
+     "sta": 62,
+     "str": 56
+    },
+    "55": {
+     "agi": 60,
+     "class": 11,
+     "inte": 91,
+     "level": 55,
+     "race": 4,
+     "spi": 100,
+     "sta": 63,
+     "str": 57
+    },
+    "56": {
+     "agi": 61,
+     "class": 11,
+     "inte": 93,
+     "level": 56,
+     "race": 4,
+     "spi": 102,
+     "sta": 64,
+     "str": 58
+    },
+    "57": {
+     "agi": 62,
+     "class": 11,
+     "inte": 94,
+     "level": 57,
+     "race": 4,
+     "spi": 104,
+     "sta": 65,
+     "str": 59
+    },
+    "58": {
+     "agi": 63,
+     "class": 11,
+     "inte": 96,
+     "level": 58,
+     "race": 4,
+     "spi": 106,
+     "sta": 67,
+     "str": 60
+    },
+    "59": {
+     "agi": 64,
+     "class": 11,
+     "inte": 98,
+     "level": 59,
+     "race": 4,
+     "spi": 108,
+     "sta": 68,
+     "str": 61
+    },
+    "6": {
+     "agi": 27,
+     "class": 11,
+     "inte": 27,
+     "level": 6,
+     "race": 4,
+     "spi": 27,
+     "sta": 22,
+     "str": 21
+    },
+    "60": {
+     "agi": 65,
+     "class": 11,
+     "inte": 100,
+     "level": 60,
+     "race": 4,
+     "spi": 110,
+     "sta": 69,
+     "str": 62
+    },
+    "7": {
+     "agi": 28,
+     "class": 11,
+     "inte": 28,
+     "level": 7,
+     "race": 4,
+     "spi": 28,
+     "sta": 23,
+     "str": 21
+    },
+    "8": {
+     "agi": 28,
+     "class": 11,
+     "inte": 28,
+     "level": 8,
+     "race": 4,
+     "spi": 29,
+     "sta": 23,
+     "str": 22
+    },
+    "9": {
+     "agi": 29,
+     "class": 11,
+     "inte": 29,
+     "level": 9,
+     "race": 4,
+     "spi": 30,
+     "sta": 24,
+     "str": 22
+    }
+   },
+   "6": {
+    "1": {
+     "agi": 15,
+     "class": 11,
+     "inte": 17,
+     "level": 1,
+     "race": 6,
+     "spi": 24,
+     "sta": 22,
+     "str": 26
+    },
+    "10": {
+     "agi": 19,
+     "class": 11,
+     "inte": 25,
+     "level": 10,
+     "race": 6,
+     "spi": 33,
+     "sta": 27,
+     "str": 31
+    },
+    "11": {
+     "agi": 20,
+     "class": 11,
+     "inte": 26,
+     "level": 11,
+     "race": 6,
+     "spi": 35,
+     "sta": 28,
+     "str": 31
+    },
+    "12": {
+     "agi": 20,
+     "class": 11,
+     "inte": 27,
+     "level": 12,
+     "race": 6,
+     "spi": 36,
+     "sta": 29,
+     "str": 32
+    },
+    "13": {
+     "agi": 21,
+     "class": 11,
+     "inte": 28,
+     "level": 13,
+     "race": 6,
+     "spi": 37,
+     "sta": 29,
+     "str": 32
+    },
+    "14": {
+     "agi": 21,
+     "class": 11,
+     "inte": 29,
+     "level": 14,
+     "race": 6,
+     "spi": 38,
+     "sta": 30,
+     "str": 33
+    },
+    "15": {
+     "agi": 22,
+     "class": 11,
+     "inte": 31,
+     "level": 15,
+     "race": 6,
+     "spi": 39,
+     "sta": 31,
+     "str": 34
+    },
+    "16": {
+     "agi": 22,
+     "class": 11,
+     "inte": 32,
+     "level": 16,
+     "race": 6,
+     "spi": 40,
+     "sta": 31,
+     "str": 34
+    },
+    "17": {
+     "agi": 23,
+     "class": 11,
+     "inte": 33,
+     "level": 17,
+     "race": 6,
+     "spi": 42,
+     "sta": 32,
+     "str": 35
+    },
+    "18": {
+     "agi": 24,
+     "class": 11,
+     "inte": 34,
+     "level": 18,
+     "race": 6,
+     "spi": 43,
+     "sta": 33,
+     "str": 35
+    },
+    "19": {
+     "agi": 24,
+     "class": 11,
+     "inte": 35,
+     "level": 19,
+     "race": 6,
+     "spi": 44,
+     "sta": 33,
+     "str": 36
+    },
+    "2": {
+     "agi": 15,
+     "class": 11,
+     "inte": 18,
+     "level": 2,
+     "race": 6,
+     "spi": 25,
+     "sta": 23,
+     "str": 27
+    },
+    "20": {
+     "agi": 25,
+     "class": 11,
+     "inte": 36,
+     "level": 20,
+     "race": 6,
+     "spi": 45,
+     "sta": 34,
+     "str": 37
+    },
+    "21": {
+     "agi": 25,
+     "class": 11,
+     "inte": 37,
+     "level": 21,
+     "race": 6,
+     "spi": 47,
+     "sta": 35,
+     "str": 37
+    },
+    "22": {
+     "agi": 26,
+     "class": 11,
+     "inte": 38,
+     "level": 22,
+     "race": 6,
+     "spi": 48,
+     "sta": 36,
+     "str": 38
+    },
+    "23": {
+     "agi": 27,
+     "class": 11,
+     "inte": 39,
+     "level": 23,
+     "race": 6,
+     "spi": 49,
+     "sta": 36,
+     "str": 39
+    },
+    "24": {
+     "agi": 27,
+     "class": 11,
+     "inte": 41,
+     "level": 24,
+     "race": 6,
+     "spi": 51,
+     "sta": 37,
+     "str": 39
+    },
+    "25": {
+     "agi": 28,
+     "class": 11,
+     "inte": 42,
+     "level": 25,
+     "race": 6,
+     "spi": 52,
+     "sta": 38,
+     "str": 40
+    },
+    "26": {
+     "agi": 28,
+     "class": 11,
+     "inte": 43,
+     "level": 26,
+     "race": 6,
+     "spi": 53,
+     "sta": 39,
+     "str": 41
+    },
+    "27": {
+     "agi": 29,
+     "class": 11,
+     "inte": 44,
+     "level": 27,
+     "race": 6,
+     "spi": 55,
+     "sta": 39,
+     "str": 41
+    },
+    "28": {
+     "agi": 30,
+     "class": 11,
+     "inte": 45,
+     "level": 28,
+     "race": 6,
+     "spi": 56,
+     "sta": 40,
+     "str": 42
+    },
+    "29": {
+     "agi": 30,
+     "class": 11,
+     "inte": 47,
+     "level": 29,
+     "race": 6,
+     "spi": 58,
+     "sta": 41,
+     "str": 43
+    },
+    "3": {
+     "agi": 16,
+     "class": 11,
+     "inte": 19,
+     "level": 3,
+     "race": 6,
+     "spi": 26,
+     "sta": 23,
+     "str": 27
+    },
+    "30": {
+     "agi": 31,
+     "class": 11,
+     "inte": 48,
+     "level": 30,
+     "race": 6,
+     "spi": 59,
+     "sta": 42,
+     "str": 43
+    },
+    "31": {
+     "agi": 32,
+     "class": 11,
+     "inte": 49,
+     "level": 31,
+     "race": 6,
+     "spi": 60,
+     "sta": 43,
+     "str": 44
+    },
+    "32": {
+     "agi": 32,
+     "class": 11,
+     "inte": 51,
+     "level": 32,
+     "race": 6,
+     "spi": 62,
+     "sta": 44,
+     "str": 45
+    },
+    "33": {
+     "agi": 33,
+     "class": 11,
+     "inte": 52,
+     "level": 33,
+     "race": 6,
+     "spi": 63,
+     "sta": 44,
+     "str": 46
+    },
+    "34": {
+     "agi": 34,
+     "class": 11,
+     "inte": 53,
+     "level": 34,
+     "race": 6,
+     "spi": 65,
+     "sta": 45,
+     "str": 46
+    },
+    "35": {
+     "agi": 34,
+     "class": 11,
+     "inte": 55,
+     "level": 35,
+     "race": 6,
+     "spi": 66,
+     "sta": 46,
+     "str": 47
+    },
+    "36": {
+     "agi": 35,
+     "class": 11,
+     "inte": 56,
+     "level": 36,
+     "race": 6,
+     "spi": 68,
+     "sta": 47,
+     "str": 48
+    },
+    "37": {
+     "agi": 36,
+     "class": 11,
+     "inte": 57,
+     "level": 37,
+     "race": 6,
+     "spi": 70,
+     "sta": 48,
+     "str": 49
+    },
+    "38": {
+     "agi": 36,
+     "class": 11,
+     "inte": 59,
+     "level": 38,
+     "race": 6,
+     "spi": 71,
+     "sta": 49,
+     "str": 50
+    },
+    "39": {
+     "agi": 37,
+     "class": 11,
+     "inte": 60,
+     "level": 39,
+     "race": 6,
+     "spi": 73,
+     "sta": 50,
+     "str": 50
+    },
+    "4": {
+     "agi": 16,
+     "class": 11,
+     "inte": 20,
+     "level": 4,
+     "race": 6,
+     "spi": 27,
+     "sta": 24,
+     "str": 28
+    },
+    "40": {
+     "agi": 38,
+     "class": 11,
+     "inte": 62,
+     "level": 40,
+     "race": 6,
+     "spi": 74,
+     "sta": 51,
+     "str": 51
+    },
+    "41": {
+     "agi": 39,
+     "class": 11,
+     "inte": 63,
+     "level": 41,
+     "race": 6,
+     "spi": 76,
+     "sta": 52,
+     "str": 52
+    },
+    "42": {
+     "agi": 39,
+     "class": 11,
+     "inte": 65,
+     "level": 42,
+     "race": 6,
+     "spi": 78,
+     "sta": 53,
+     "str": 53
+    },
+    "43": {
+     "agi": 40,
+     "class": 11,
+     "inte": 66,
+     "level": 43,
+     "race": 6,
+     "spi": 79,
+     "sta": 54,
+     "str": 54
+    },
+    "44": {
+     "agi": 41,
+     "class": 11,
+     "inte": 68,
+     "level": 44,
+     "race": 6,
+     "spi": 81,
+     "sta": 54,
+     "str": 55
+    },
+    "45": {
+     "agi": 42,
+     "class": 11,
+     "inte": 69,
+     "level": 45,
+     "race": 6,
+     "spi": 83,
+     "sta": 55,
+     "str": 55
+    },
+    "46": {
+     "agi": 43,
+     "class": 11,
+     "inte": 71,
+     "level": 46,
+     "race": 6,
+     "spi": 85,
+     "sta": 56,
+     "str": 56
+    },
+    "47": {
+     "agi": 43,
+     "class": 11,
+     "inte": 72,
+     "level": 47,
+     "race": 6,
+     "spi": 86,
+     "sta": 58,
+     "str": 57
+    },
+    "48": {
+     "agi": 44,
+     "class": 11,
+     "inte": 74,
+     "level": 48,
+     "race": 6,
+     "spi": 88,
+     "sta": 59,
+     "str": 58
+    },
+    "49": {
+     "agi": 45,
+     "class": 11,
+     "inte": 76,
+     "level": 49,
+     "race": 6,
+     "spi": 90,
+     "sta": 60,
+     "str": 59
+    },
+    "5": {
+     "agi": 17,
+     "class": 11,
+     "inte": 21,
+     "level": 5,
+     "race": 6,
+     "spi": 28,
+     "sta": 24,
+     "str": 28
+    },
+    "50": {
+     "agi": 46,
+     "class": 11,
+     "inte": 77,
+     "level": 50,
+     "race": 6,
+     "spi": 92,
+     "sta": 61,
+     "str": 60
+    },
+    "51": {
+     "agi": 47,
+     "class": 11,
+     "inte": 79,
+     "level": 51,
+     "race": 6,
+     "spi": 94,
+     "sta": 62,
+     "str": 61
+    },
+    "52": {
+     "agi": 48,
+     "class": 11,
+     "inte": 81,
+     "level": 52,
+     "race": 6,
+     "spi": 96,
+     "sta": 63,
+     "str": 62
+    },
+    "53": {
+     "agi": 49,
+     "class": 11,
+     "inte": 82,
+     "level": 53,
+     "race": 6,
+     "spi": 98,
+     "sta": 64,
+     "str": 63
+    },
+    "54": {
+     "agi": 49,
+     "class": 11,
+     "inte": 84,
+     "level": 54,
+     "race": 6,
+     "spi": 100,
+     "sta": 65,
+     "str": 64
+    },
+    "55": {
+     "agi": 50,
+     "class": 11,
+     "inte": 86,
+     "level": 55,
+     "race": 6,
+     "spi": 102,
+     "sta": 66,
+     "str": 65
+    },
+    "56": {
+     "agi": 51,
+     "class": 11,
+     "inte": 88,
+     "level": 56,
+     "race": 6,
+     "spi": 104,
+     "sta": 67,
+     "str": 66
+    },
+    "57": {
+     "agi": 52,
+     "class": 11,
+     "inte": 89,
+     "level": 57,
+     "race": 6,
+     "spi": 106,
+     "sta": 68,
+     "str": 67
+    },
+    "58": {
+     "agi": 53,
+     "class": 11,
+     "inte": 91,
+     "level": 58,
+     "race": 6,
+     "spi": 108,
+     "sta": 70,
+     "str": 68
+    },
+    "59": {
+     "agi": 54,
+     "class": 11,
+     "inte": 93,
+     "level": 59,
+     "race": 6,
+     "spi": 110,
+     "sta": 71,
+     "str": 69
+    },
+    "6": {
+     "agi": 17,
+     "class": 11,
+     "inte": 22,
+     "level": 6,
+     "race": 6,
+     "spi": 29,
+     "sta": 25,
+     "str": 29
+    },
+    "60": {
+     "agi": 55,
+     "class": 11,
+     "inte": 95,
+     "level": 60,
+     "race": 6,
+     "spi": 112,
+     "sta": 72,
+     "str": 70
+    },
+    "7": {
+     "agi": 18,
+     "class": 11,
+     "inte": 23,
+     "level": 7,
+     "race": 6,
+     "spi": 30,
+     "sta": 26,
+     "str": 29
+    },
+    "8": {
+     "agi": 18,
+     "class": 11,
+     "inte": 23,
+     "level": 8,
+     "race": 6,
+     "spi": 31,
+     "sta": 26,
+     "str": 30
+    },
+    "9": {
+     "agi": 19,
+     "class": 11,
+     "inte": 24,
+     "level": 9,
+     "race": 6,
+     "spi": 32,
+     "sta": 27,
+     "str": 30
+    }
+   }
+  },
+  "2": {
+   "1": {
+    "1": {
+     "agi": 20,
+     "class": 2,
+     "inte": 20,
+     "level": 1,
+     "race": 1,
+     "spi": 22,
+     "sta": 22,
+     "str": 22
+    },
+    "10": {
+     "agi": 25,
+     "class": 2,
+     "inte": 25,
+     "level": 10,
+     "race": 1,
+     "spi": 28,
+     "sta": 30,
+     "str": 31
+    },
+    "11": {
+     "agi": 25,
+     "class": 2,
+     "inte": 26,
+     "level": 11,
+     "race": 1,
+     "spi": 29,
+     "sta": 31,
+     "str": 32
+    },
+    "12": {
+     "agi": 26,
+     "class": 2,
+     "inte": 27,
+     "level": 12,
+     "race": 1,
+     "spi": 29,
+     "sta": 32,
+     "str": 33
+    },
+    "13": {
+     "agi": 27,
+     "class": 2,
+     "inte": 27,
+     "level": 13,
+     "race": 1,
+     "spi": 30,
+     "sta": 33,
+     "str": 34
+    },
+    "14": {
+     "agi": 27,
+     "class": 2,
+     "inte": 28,
+     "level": 14,
+     "race": 1,
+     "spi": 31,
+     "sta": 34,
+     "str": 35
+    },
+    "15": {
+     "agi": 28,
+     "class": 2,
+     "inte": 29,
+     "level": 15,
+     "race": 1,
+     "spi": 31,
+     "sta": 36,
+     "str": 36
+    },
+    "16": {
+     "agi": 28,
+     "class": 2,
+     "inte": 29,
+     "level": 16,
+     "race": 1,
+     "spi": 32,
+     "sta": 37,
+     "str": 38
+    },
+    "17": {
+     "agi": 29,
+     "class": 2,
+     "inte": 30,
+     "level": 17,
+     "race": 1,
+     "spi": 33,
+     "sta": 38,
+     "str": 39
+    },
+    "18": {
+     "agi": 30,
+     "class": 2,
+     "inte": 31,
+     "level": 18,
+     "race": 1,
+     "spi": 34,
+     "sta": 39,
+     "str": 40
+    },
+    "19": {
+     "agi": 30,
+     "class": 2,
+     "inte": 31,
+     "level": 19,
+     "race": 1,
+     "spi": 34,
+     "sta": 40,
+     "str": 41
+    },
+    "2": {
+     "agi": 21,
+     "class": 2,
+     "inte": 21,
+     "level": 2,
+     "race": 1,
+     "spi": 23,
+     "sta": 23,
+     "str": 23
+    },
+    "20": {
+     "agi": 31,
+     "class": 2,
+     "inte": 32,
+     "level": 20,
+     "race": 1,
+     "spi": 35,
+     "sta": 41,
+     "str": 42
+    },
+    "21": {
+     "agi": 32,
+     "class": 2,
+     "inte": 33,
+     "level": 21,
+     "race": 1,
+     "spi": 36,
+     "sta": 42,
+     "str": 43
+    },
+    "22": {
+     "agi": 32,
+     "class": 2,
+     "inte": 34,
+     "level": 22,
+     "race": 1,
+     "spi": 37,
+     "sta": 43,
+     "str": 45
+    },
+    "23": {
+     "agi": 33,
+     "class": 2,
+     "inte": 34,
+     "level": 23,
+     "race": 1,
+     "spi": 38,
+     "sta": 44,
+     "str": 46
+    },
+    "24": {
+     "agi": 34,
+     "class": 2,
+     "inte": 35,
+     "level": 24,
+     "race": 1,
+     "spi": 38,
+     "sta": 46,
+     "str": 47
+    },
+    "25": {
+     "agi": 34,
+     "class": 2,
+     "inte": 36,
+     "level": 25,
+     "race": 1,
+     "spi": 39,
+     "sta": 47,
+     "str": 48
+    },
+    "26": {
+     "agi": 35,
+     "class": 2,
+     "inte": 37,
+     "level": 26,
+     "race": 1,
+     "spi": 40,
+     "sta": 48,
+     "str": 50
+    },
+    "27": {
+     "agi": 36,
+     "class": 2,
+     "inte": 37,
+     "level": 27,
+     "race": 1,
+     "spi": 42,
+     "sta": 49,
+     "str": 51
+    },
+    "28": {
+     "agi": 36,
+     "class": 2,
+     "inte": 38,
+     "level": 28,
+     "race": 1,
+     "spi": 43,
+     "sta": 50,
+     "str": 52
+    },
+    "29": {
+     "agi": 37,
+     "class": 2,
+     "inte": 39,
+     "level": 29,
+     "race": 1,
+     "spi": 44,
+     "sta": 52,
+     "str": 54
+    },
+    "3": {
+     "agi": 21,
+     "class": 2,
+     "inte": 21,
+     "level": 3,
+     "race": 1,
+     "spi": 23,
+     "sta": 24,
+     "str": 24
+    },
+    "30": {
+     "agi": 38,
+     "class": 2,
+     "inte": 40,
+     "level": 30,
+     "race": 1,
+     "spi": 44,
+     "sta": 53,
+     "str": 55
+    },
+    "31": {
+     "agi": 39,
+     "class": 2,
+     "inte": 41,
+     "level": 31,
+     "race": 1,
+     "spi": 45,
+     "sta": 54,
+     "str": 56
+    },
+    "32": {
+     "agi": 39,
+     "class": 2,
+     "inte": 42,
+     "level": 32,
+     "race": 1,
+     "spi": 46,
+     "sta": 56,
+     "str": 58
+    },
+    "33": {
+     "agi": 40,
+     "class": 2,
+     "inte": 42,
+     "level": 33,
+     "race": 1,
+     "spi": 47,
+     "sta": 57,
+     "str": 59
+    },
+    "34": {
+     "agi": 41,
+     "class": 2,
+     "inte": 43,
+     "level": 34,
+     "race": 1,
+     "spi": 48,
+     "sta": 58,
+     "str": 61
+    },
+    "35": {
+     "agi": 42,
+     "class": 2,
+     "inte": 44,
+     "level": 35,
+     "race": 1,
+     "spi": 49,
+     "sta": 60,
+     "str": 62
+    },
+    "36": {
+     "agi": 43,
+     "class": 2,
+     "inte": 45,
+     "level": 36,
+     "race": 1,
+     "spi": 50,
+     "sta": 61,
+     "str": 64
+    },
+    "37": {
+     "agi": 43,
+     "class": 2,
+     "inte": 46,
+     "level": 37,
+     "race": 1,
+     "spi": 51,
+     "sta": 62,
+     "str": 65
+    },
+    "38": {
+     "agi": 44,
+     "class": 2,
+     "inte": 47,
+     "level": 38,
+     "race": 1,
+     "spi": 52,
+     "sta": 64,
+     "str": 67
+    },
+    "39": {
+     "agi": 45,
+     "class": 2,
+     "inte": 48,
+     "level": 39,
+     "race": 1,
+     "spi": 53,
+     "sta": 65,
+     "str": 68
+    },
+    "4": {
+     "agi": 22,
+     "class": 2,
+     "inte": 22,
+     "level": 4,
+     "race": 1,
+     "spi": 24,
+     "sta": 25,
+     "str": 25
+    },
+    "40": {
+     "agi": 46,
+     "class": 2,
+     "inte": 49,
+     "level": 40,
+     "race": 1,
+     "spi": 54,
+     "sta": 67,
+     "str": 70
+    },
+    "41": {
+     "agi": 47,
+     "class": 2,
+     "inte": 50,
+     "level": 41,
+     "race": 1,
+     "spi": 55,
+     "sta": 68,
+     "str": 71
+    },
+    "42": {
+     "agi": 47,
+     "class": 2,
+     "inte": 51,
+     "level": 42,
+     "race": 1,
+     "spi": 56,
+     "sta": 70,
+     "str": 73
+    },
+    "43": {
+     "agi": 48,
+     "class": 2,
+     "inte": 52,
+     "level": 43,
+     "race": 1,
+     "spi": 57,
+     "sta": 71,
+     "str": 74
+    },
+    "44": {
+     "agi": 49,
+     "class": 2,
+     "inte": 52,
+     "level": 44,
+     "race": 1,
+     "spi": 58,
+     "sta": 73,
+     "str": 76
+    },
+    "45": {
+     "agi": 50,
+     "class": 2,
+     "inte": 53,
+     "level": 45,
+     "race": 1,
+     "spi": 59,
+     "sta": 74,
+     "str": 78
+    },
+    "46": {
+     "agi": 51,
+     "class": 2,
+     "inte": 54,
+     "level": 46,
+     "race": 1,
+     "spi": 60,
+     "sta": 76,
+     "str": 79
+    },
+    "47": {
+     "agi": 52,
+     "class": 2,
+     "inte": 56,
+     "level": 47,
+     "race": 1,
+     "spi": 61,
+     "sta": 77,
+     "str": 81
+    },
+    "48": {
+     "agi": 53,
+     "class": 2,
+     "inte": 57,
+     "level": 48,
+     "race": 1,
+     "spi": 63,
+     "sta": 79,
+     "str": 83
+    },
+    "49": {
+     "agi": 54,
+     "class": 2,
+     "inte": 58,
+     "level": 49,
+     "race": 1,
+     "spi": 65,
+     "sta": 81,
+     "str": 84
+    },
+    "5": {
+     "agi": 22,
+     "class": 2,
+     "inte": 22,
+     "level": 5,
+     "race": 1,
+     "spi": 25,
+     "sta": 26,
+     "str": 26
+    },
+    "50": {
+     "agi": 55,
+     "class": 2,
+     "inte": 59,
+     "level": 50,
+     "race": 1,
+     "spi": 66,
+     "sta": 82,
+     "str": 86
+    },
+    "51": {
+     "agi": 56,
+     "class": 2,
+     "inte": 60,
+     "level": 51,
+     "race": 1,
+     "spi": 67,
+     "sta": 84,
+     "str": 88
+    },
+    "52": {
+     "agi": 57,
+     "class": 2,
+     "inte": 61,
+     "level": 52,
+     "race": 1,
+     "spi": 68,
+     "sta": 86,
+     "str": 90
+    },
+    "53": {
+     "agi": 58,
+     "class": 2,
+     "inte": 62,
+     "level": 53,
+     "race": 1,
+     "spi": 69,
+     "sta": 87,
+     "str": 92
+    },
+    "54": {
+     "agi": 59,
+     "class": 2,
+     "inte": 63,
+     "level": 54,
+     "race": 1,
+     "spi": 70,
+     "sta": 89,
+     "str": 93
+    },
+    "55": {
+     "agi": 60,
+     "class": 2,
+     "inte": 64,
+     "level": 55,
+     "race": 1,
+     "spi": 72,
+     "sta": 91,
+     "str": 95
+    },
+    "56": {
+     "agi": 61,
+     "class": 2,
+     "inte": 65,
+     "level": 56,
+     "race": 1,
+     "spi": 73,
+     "sta": 93,
+     "str": 97
+    },
+    "57": {
+     "agi": 62,
+     "class": 2,
+     "inte": 66,
+     "level": 57,
+     "race": 1,
+     "spi": 74,
+     "sta": 94,
+     "str": 99
+    },
+    "58": {
+     "agi": 63,
+     "class": 2,
+     "inte": 68,
+     "level": 58,
+     "race": 1,
+     "spi": 75,
+     "sta": 96,
+     "str": 101
+    },
+    "59": {
+     "agi": 64,
+     "class": 2,
+     "inte": 69,
+     "level": 59,
+     "race": 1,
+     "spi": 77,
+     "sta": 98,
+     "str": 103
+    },
+    "6": {
+     "agi": 23,
+     "class": 2,
+     "inte": 23,
+     "level": 6,
+     "race": 1,
+     "spi": 25,
+     "sta": 27,
+     "str": 27
+    },
+    "60": {
+     "agi": 65,
+     "class": 2,
+     "inte": 70,
+     "level": 60,
+     "race": 1,
+     "spi": 78,
+     "sta": 100,
+     "str": 105
+    },
+    "7": {
+     "agi": 23,
+     "class": 2,
+     "inte": 24,
+     "level": 7,
+     "race": 1,
+     "spi": 26,
+     "sta": 28,
+     "str": 28
+    },
+    "8": {
+     "agi": 24,
+     "class": 2,
+     "inte": 24,
+     "level": 8,
+     "race": 1,
+     "spi": 26,
+     "sta": 28,
+     "str": 29
+    },
+    "9": {
+     "agi": 24,
+     "class": 2,
+     "inte": 25,
+     "level": 9,
+     "race": 1,
+     "spi": 27,
+     "sta": 29,
+     "str": 30
+    }
+   },
+   "3": {
+    "1": {
+     "agi": 16,
+     "class": 2,
+     "inte": 19,
+     "level": 1,
+     "race": 3,
+     "spi": 20,
+     "sta": 25,
+     "str": 24
+    },
+    "10": {
+     "agi": 21,
+     "class": 2,
+     "inte": 24,
+     "level": 10,
+     "race": 3,
+     "spi": 26,
+     "sta": 33,
+     "str": 33
+    },
+    "11": {
+     "agi": 21,
+     "class": 2,
+     "inte": 25,
+     "level": 11,
+     "race": 3,
+     "spi": 27,
+     "sta": 34,
+     "str": 34
+    },
+    "12": {
+     "agi": 22,
+     "class": 2,
+     "inte": 26,
+     "level": 12,
+     "race": 3,
+     "spi": 27,
+     "sta": 35,
+     "str": 35
+    },
+    "13": {
+     "agi": 23,
+     "class": 2,
+     "inte": 26,
+     "level": 13,
+     "race": 3,
+     "spi": 28,
+     "sta": 36,
+     "str": 36
+    },
+    "14": {
+     "agi": 23,
+     "class": 2,
+     "inte": 27,
+     "level": 14,
+     "race": 3,
+     "spi": 29,
+     "sta": 37,
+     "str": 37
+    },
+    "15": {
+     "agi": 24,
+     "class": 2,
+     "inte": 28,
+     "level": 15,
+     "race": 3,
+     "spi": 29,
+     "sta": 39,
+     "str": 38
+    },
+    "16": {
+     "agi": 24,
+     "class": 2,
+     "inte": 28,
+     "level": 16,
+     "race": 3,
+     "spi": 30,
+     "sta": 40,
+     "str": 40
+    },
+    "17": {
+     "agi": 25,
+     "class": 2,
+     "inte": 29,
+     "level": 17,
+     "race": 3,
+     "spi": 31,
+     "sta": 41,
+     "str": 41
+    },
+    "18": {
+     "agi": 26,
+     "class": 2,
+     "inte": 30,
+     "level": 18,
+     "race": 3,
+     "spi": 32,
+     "sta": 42,
+     "str": 42
+    },
+    "19": {
+     "agi": 26,
+     "class": 2,
+     "inte": 30,
+     "level": 19,
+     "race": 3,
+     "spi": 32,
+     "sta": 43,
+     "str": 43
+    },
+    "2": {
+     "agi": 17,
+     "class": 2,
+     "inte": 20,
+     "level": 2,
+     "race": 3,
+     "spi": 21,
+     "sta": 26,
+     "str": 25
+    },
+    "20": {
+     "agi": 27,
+     "class": 2,
+     "inte": 31,
+     "level": 20,
+     "race": 3,
+     "spi": 33,
+     "sta": 44,
+     "str": 44
+    },
+    "21": {
+     "agi": 28,
+     "class": 2,
+     "inte": 32,
+     "level": 21,
+     "race": 3,
+     "spi": 34,
+     "sta": 45,
+     "str": 45
+    },
+    "22": {
+     "agi": 28,
+     "class": 2,
+     "inte": 33,
+     "level": 22,
+     "race": 3,
+     "spi": 35,
+     "sta": 46,
+     "str": 47
+    },
+    "23": {
+     "agi": 29,
+     "class": 2,
+     "inte": 33,
+     "level": 23,
+     "race": 3,
+     "spi": 36,
+     "sta": 47,
+     "str": 48
+    },
+    "24": {
+     "agi": 30,
+     "class": 2,
+     "inte": 34,
+     "level": 24,
+     "race": 3,
+     "spi": 36,
+     "sta": 49,
+     "str": 49
+    },
+    "25": {
+     "agi": 30,
+     "class": 2,
+     "inte": 35,
+     "level": 25,
+     "race": 3,
+     "spi": 37,
+     "sta": 50,
+     "str": 50
+    },
+    "26": {
+     "agi": 31,
+     "class": 2,
+     "inte": 36,
+     "level": 26,
+     "race": 3,
+     "spi": 38,
+     "sta": 51,
+     "str": 52
+    },
+    "27": {
+     "agi": 32,
+     "class": 2,
+     "inte": 36,
+     "level": 27,
+     "race": 3,
+     "spi": 39,
+     "sta": 52,
+     "str": 53
+    },
+    "28": {
+     "agi": 32,
+     "class": 2,
+     "inte": 37,
+     "level": 28,
+     "race": 3,
+     "spi": 40,
+     "sta": 53,
+     "str": 54
+    },
+    "29": {
+     "agi": 33,
+     "class": 2,
+     "inte": 38,
+     "level": 29,
+     "race": 3,
+     "spi": 41,
+     "sta": 55,
+     "str": 56
+    },
+    "3": {
+     "agi": 17,
+     "class": 2,
+     "inte": 20,
+     "level": 3,
+     "race": 3,
+     "spi": 21,
+     "sta": 27,
+     "str": 26
+    },
+    "30": {
+     "agi": 34,
+     "class": 2,
+     "inte": 39,
+     "level": 30,
+     "race": 3,
+     "spi": 41,
+     "sta": 56,
+     "str": 57
+    },
+    "31": {
+     "agi": 35,
+     "class": 2,
+     "inte": 40,
+     "level": 31,
+     "race": 3,
+     "spi": 42,
+     "sta": 57,
+     "str": 58
+    },
+    "32": {
+     "agi": 35,
+     "class": 2,
+     "inte": 41,
+     "level": 32,
+     "race": 3,
+     "spi": 43,
+     "sta": 59,
+     "str": 60
+    },
+    "33": {
+     "agi": 36,
+     "class": 2,
+     "inte": 41,
+     "level": 33,
+     "race": 3,
+     "spi": 44,
+     "sta": 60,
+     "str": 61
+    },
+    "34": {
+     "agi": 37,
+     "class": 2,
+     "inte": 42,
+     "level": 34,
+     "race": 3,
+     "spi": 45,
+     "sta": 61,
+     "str": 63
+    },
+    "35": {
+     "agi": 38,
+     "class": 2,
+     "inte": 43,
+     "level": 35,
+     "race": 3,
+     "spi": 46,
+     "sta": 63,
+     "str": 64
+    },
+    "36": {
+     "agi": 39,
+     "class": 2,
+     "inte": 44,
+     "level": 36,
+     "race": 3,
+     "spi": 47,
+     "sta": 64,
+     "str": 66
+    },
+    "37": {
+     "agi": 39,
+     "class": 2,
+     "inte": 45,
+     "level": 37,
+     "race": 3,
+     "spi": 48,
+     "sta": 65,
+     "str": 67
+    },
+    "38": {
+     "agi": 40,
+     "class": 2,
+     "inte": 46,
+     "level": 38,
+     "race": 3,
+     "spi": 49,
+     "sta": 67,
+     "str": 69
+    },
+    "39": {
+     "agi": 41,
+     "class": 2,
+     "inte": 47,
+     "level": 39,
+     "race": 3,
+     "spi": 50,
+     "sta": 68,
+     "str": 70
+    },
+    "4": {
+     "agi": 18,
+     "class": 2,
+     "inte": 21,
+     "level": 4,
+     "race": 3,
+     "spi": 22,
+     "sta": 28,
+     "str": 27
+    },
+    "40": {
+     "agi": 42,
+     "class": 2,
+     "inte": 48,
+     "level": 40,
+     "race": 3,
+     "spi": 51,
+     "sta": 70,
+     "str": 72
+    },
+    "41": {
+     "agi": 43,
+     "class": 2,
+     "inte": 49,
+     "level": 41,
+     "race": 3,
+     "spi": 52,
+     "sta": 71,
+     "str": 73
+    },
+    "42": {
+     "agi": 43,
+     "class": 2,
+     "inte": 50,
+     "level": 42,
+     "race": 3,
+     "spi": 53,
+     "sta": 73,
+     "str": 75
+    },
+    "43": {
+     "agi": 44,
+     "class": 2,
+     "inte": 51,
+     "level": 43,
+     "race": 3,
+     "spi": 54,
+     "sta": 74,
+     "str": 76
+    },
+    "44": {
+     "agi": 45,
+     "class": 2,
+     "inte": 51,
+     "level": 44,
+     "race": 3,
+     "spi": 55,
+     "sta": 76,
+     "str": 78
+    },
+    "45": {
+     "agi": 46,
+     "class": 2,
+     "inte": 52,
+     "level": 45,
+     "race": 3,
+     "spi": 56,
+     "sta": 77,
+     "str": 80
+    },
+    "46": {
+     "agi": 47,
+     "class": 2,
+     "inte": 53,
+     "level": 46,
+     "race": 3,
+     "spi": 57,
+     "sta": 79,
+     "str": 81
+    },
+    "47": {
+     "agi": 48,
+     "class": 2,
+     "inte": 55,
+     "level": 47,
+     "race": 3,
+     "spi": 58,
+     "sta": 80,
+     "str": 83
+    },
+    "48": {
+     "agi": 49,
+     "class": 2,
+     "inte": 56,
+     "level": 48,
+     "race": 3,
+     "spi": 59,
+     "sta": 82,
+     "str": 85
+    },
+    "49": {
+     "agi": 50,
+     "class": 2,
+     "inte": 57,
+     "level": 49,
+     "race": 3,
+     "spi": 61,
+     "sta": 84,
+     "str": 86
+    },
+    "5": {
+     "agi": 18,
+     "class": 2,
+     "inte": 21,
+     "level": 5,
+     "race": 3,
+     "spi": 23,
+     "sta": 29,
+     "str": 28
+    },
+    "50": {
+     "agi": 51,
+     "class": 2,
+     "inte": 58,
+     "level": 50,
+     "race": 3,
+     "spi": 62,
+     "sta": 85,
+     "str": 88
+    },
+    "51": {
+     "agi": 52,
+     "class": 2,
+     "inte": 59,
+     "level": 51,
+     "race": 3,
+     "spi": 63,
+     "sta": 87,
+     "str": 90
+    },
+    "52": {
+     "agi": 53,
+     "class": 2,
+     "inte": 60,
+     "level": 52,
+     "race": 3,
+     "spi": 64,
+     "sta": 89,
+     "str": 92
+    },
+    "53": {
+     "agi": 54,
+     "class": 2,
+     "inte": 61,
+     "level": 53,
+     "race": 3,
+     "spi": 65,
+     "sta": 90,
+     "str": 94
+    },
+    "54": {
+     "agi": 55,
+     "class": 2,
+     "inte": 62,
+     "level": 54,
+     "race": 3,
+     "spi": 66,
+     "sta": 92,
+     "str": 95
+    },
+    "55": {
+     "agi": 56,
+     "class": 2,
+     "inte": 63,
+     "level": 55,
+     "race": 3,
+     "spi": 68,
+     "sta": 94,
+     "str": 97
+    },
+    "56": {
+     "agi": 57,
+     "class": 2,
+     "inte": 64,
+     "level": 56,
+     "race": 3,
+     "spi": 69,
+     "sta": 96,
+     "str": 99
+    },
+    "57": {
+     "agi": 58,
+     "class": 2,
+     "inte": 65,
+     "level": 57,
+     "race": 3,
+     "spi": 70,
+     "sta": 97,
+     "str": 101
+    },
+    "58": {
+     "agi": 59,
+     "class": 2,
+     "inte": 67,
+     "level": 58,
+     "race": 3,
+     "spi": 71,
+     "sta": 99,
+     "str": 103
+    },
+    "59": {
+     "agi": 60,
+     "class": 2,
+     "inte": 68,
+     "level": 59,
+     "race": 3,
+     "spi": 73,
+     "sta": 101,
+     "str": 105
+    },
+    "6": {
+     "agi": 19,
+     "class": 2,
+     "inte": 22,
+     "level": 6,
+     "race": 3,
+     "spi": 23,
+     "sta": 30,
+     "str": 29
+    },
+    "60": {
+     "agi": 61,
+     "class": 2,
+     "inte": 69,
+     "level": 60,
+     "race": 3,
+     "spi": 74,
+     "sta": 103,
+     "str": 107
+    },
+    "7": {
+     "agi": 19,
+     "class": 2,
+     "inte": 23,
+     "level": 7,
+     "race": 3,
+     "spi": 24,
+     "sta": 31,
+     "str": 30
+    },
+    "8": {
+     "agi": 20,
+     "class": 2,
+     "inte": 23,
+     "level": 8,
+     "race": 3,
+     "spi": 24,
+     "sta": 31,
+     "str": 31
+    },
+    "9": {
+     "agi": 20,
+     "class": 2,
+     "inte": 24,
+     "level": 9,
+     "race": 3,
+     "spi": 25,
+     "sta": 32,
+     "str": 32
+    }
+   }
+  }
+ },
+ "levelstats_by_race": {
+  "4": {
+   "1": {
+    "agi": 25,
+    "class": 11,
+    "inte": 22,
+    "level": 1,
+    "race": 4,
+    "spi": 22,
+    "sta": 19,
+    "str": 18
+   },
+   "10": {
+    "agi": 29,
+    "class": 11,
+    "inte": 30,
+    "level": 10,
+    "race": 4,
+    "spi": 31,
+    "sta": 24,
+    "str": 23
+   },
+   "11": {
+    "agi": 30,
+    "class": 11,
+    "inte": 31,
+    "level": 11,
+    "race": 4,
+    "spi": 33,
+    "sta": 25,
+    "str": 23
+   },
+   "12": {
+    "agi": 30,
+    "class": 11,
+    "inte": 32,
+    "level": 12,
+    "race": 4,
+    "spi": 34,
+    "sta": 26,
+    "str": 24
+   },
+   "13": {
+    "agi": 31,
+    "class": 11,
+    "inte": 33,
+    "level": 13,
+    "race": 4,
+    "spi": 35,
+    "sta": 26,
+    "str": 24
+   },
+   "14": {
+    "agi": 31,
+    "class": 11,
+    "inte": 34,
+    "level": 14,
+    "race": 4,
+    "spi": 36,
+    "sta": 27,
+    "str": 25
+   },
+   "15": {
+    "agi": 32,
+    "class": 11,
+    "inte": 36,
+    "level": 15,
+    "race": 4,
+    "spi": 37,
+    "sta": 28,
+    "str": 26
+   },
+   "16": {
+    "agi": 32,
+    "class": 11,
+    "inte": 37,
+    "level": 16,
+    "race": 4,
+    "spi": 38,
+    "sta": 28,
+    "str": 26
+   },
+   "17": {
+    "agi": 33,
+    "class": 11,
+    "inte": 38,
+    "level": 17,
+    "race": 4,
+    "spi": 40,
+    "sta": 29,
+    "str": 27
+   },
+   "18": {
+    "agi": 34,
+    "class": 11,
+    "inte": 39,
+    "level": 18,
+    "race": 4,
+    "spi": 41,
+    "sta": 30,
+    "str": 27
+   },
+   "19": {
+    "agi": 34,
+    "class": 11,
+    "inte": 40,
+    "level": 19,
+    "race": 4,
+    "spi": 42,
+    "sta": 30,
+    "str": 28
+   },
+   "2": {
+    "agi": 25,
+    "class": 11,
+    "inte": 23,
+    "level": 2,
+    "race": 4,
+    "spi": 23,
+    "sta": 20,
+    "str": 19
+   },
+   "20": {
+    "agi": 35,
+    "class": 11,
+    "inte": 41,
+    "level": 20,
+    "race": 4,
+    "spi": 43,
+    "sta": 31,
+    "str": 29
+   },
+   "21": {
+    "agi": 35,
+    "class": 11,
+    "inte": 42,
+    "level": 21,
+    "race": 4,
+    "spi": 45,
+    "sta": 32,
+    "str": 29
+   },
+   "22": {
+    "agi": 36,
+    "class": 11,
+    "inte": 43,
+    "level": 22,
+    "race": 4,
+    "spi": 46,
+    "sta": 33,
+    "str": 30
+   },
+   "23": {
+    "agi": 37,
+    "class": 11,
+    "inte": 44,
+    "level": 23,
+    "race": 4,
+    "spi": 47,
+    "sta": 33,
+    "str": 31
+   },
+   "24": {
+    "agi": 37,
+    "class": 11,
+    "inte": 46,
+    "level": 24,
+    "race": 4,
+    "spi": 49,
+    "sta": 34,
+    "str": 31
+   },
+   "25": {
+    "agi": 38,
+    "class": 11,
+    "inte": 47,
+    "level": 25,
+    "race": 4,
+    "spi": 50,
+    "sta": 35,
+    "str": 32
+   },
+   "26": {
+    "agi": 38,
+    "class": 11,
+    "inte": 48,
+    "level": 26,
+    "race": 4,
+    "spi": 51,
+    "sta": 36,
+    "str": 33
+   },
+   "27": {
+    "agi": 39,
+    "class": 11,
+    "inte": 49,
+    "level": 27,
+    "race": 4,
+    "spi": 53,
+    "sta": 36,
+    "str": 33
+   },
+   "28": {
+    "agi": 40,
+    "class": 11,
+    "inte": 50,
+    "level": 28,
+    "race": 4,
+    "spi": 54,
+    "sta": 37,
+    "str": 34
+   },
+   "29": {
+    "agi": 40,
+    "class": 11,
+    "inte": 52,
+    "level": 29,
+    "race": 4,
+    "spi": 56,
+    "sta": 38,
+    "str": 35
+   },
+   "3": {
+    "agi": 26,
+    "class": 11,
+    "inte": 24,
+    "level": 3,
+    "race": 4,
+    "spi": 24,
+    "sta": 20,
+    "str": 19
+   },
+   "30": {
+    "agi": 41,
+    "class": 11,
+    "inte": 53,
+    "level": 30,
+    "race": 4,
+    "spi": 57,
+    "sta": 39,
+    "str": 35
+   },
+   "31": {
+    "agi": 42,
+    "class": 11,
+    "inte": 54,
+    "level": 31,
+    "race": 4,
+    "spi": 58,
+    "sta": 40,
+    "str": 36
+   },
+   "32": {
+    "agi": 42,
+    "class": 11,
+    "inte": 56,
+    "level": 32,
+    "race": 4,
+    "spi": 60,
+    "sta": 41,
+    "str": 37
+   },
+   "33": {
+    "agi": 43,
+    "class": 11,
+    "inte": 57,
+    "level": 33,
+    "race": 4,
+    "spi": 61,
+    "sta": 41,
+    "str": 38
+   },
+   "34": {
+    "agi": 44,
+    "class": 11,
+    "inte": 58,
+    "level": 34,
+    "race": 4,
+    "spi": 63,
+    "sta": 42,
+    "str": 38
+   },
+   "35": {
+    "agi": 44,
+    "class": 11,
+    "inte": 60,
+    "level": 35,
+    "race": 4,
+    "spi": 64,
+    "sta": 43,
+    "str": 39
+   },
+   "36": {
+    "agi": 45,
+    "class": 11,
+    "inte": 61,
+    "level": 36,
+    "race": 4,
+    "spi": 66,
+    "sta": 44,
+    "str": 40
+   },
+   "37": {
+    "agi": 46,
+    "class": 11,
+    "inte": 62,
+    "level": 37,
+    "race": 4,
+    "spi": 68,
+    "sta": 45,
+    "str": 41
+   },
+   "38": {
+    "agi": 46,
+    "class": 11,
+    "inte": 64,
+    "level": 38,
+    "race": 4,
+    "spi": 69,
+    "sta": 46,
+    "str": 42
+   },
+   "39": {
+    "agi": 47,
+    "class": 11,
+    "inte": 65,
+    "level": 39,
+    "race": 4,
+    "spi": 71,
+    "sta": 47,
+    "str": 42
+   },
+   "4": {
+    "agi": 26,
+    "class": 11,
+    "inte": 25,
+    "level": 4,
+    "race": 4,
+    "spi": 25,
+    "sta": 21,
+    "str": 20
+   },
+   "40": {
+    "agi": 48,
+    "class": 11,
+    "inte": 67,
+    "level": 40,
+    "race": 4,
+    "spi": 72,
+    "sta": 48,
+    "str": 43
+   },
+   "41": {
+    "agi": 49,
+    "class": 11,
+    "inte": 68,
+    "level": 41,
+    "race": 4,
+    "spi": 74,
+    "sta": 49,
+    "str": 44
+   },
+   "42": {
+    "agi": 49,
+    "class": 11,
+    "inte": 70,
+    "level": 42,
+    "race": 4,
+    "spi": 76,
+    "sta": 50,
+    "str": 45
+   },
+   "43": {
+    "agi": 50,
+    "class": 11,
+    "inte": 71,
+    "level": 43,
+    "race": 4,
+    "spi": 77,
+    "sta": 51,
+    "str": 46
+   },
+   "44": {
+    "agi": 51,
+    "class": 11,
+    "inte": 73,
+    "level": 44,
+    "race": 4,
+    "spi": 79,
+    "sta": 51,
+    "str": 47
+   },
+   "45": {
+    "agi": 52,
+    "class": 11,
+    "inte": 74,
+    "level": 45,
+    "race": 4,
+    "spi": 81,
+    "sta": 52,
+    "str": 47
+   },
+   "46": {
+    "agi": 53,
+    "class": 11,
+    "inte": 76,
+    "level": 46,
+    "race": 4,
+    "spi": 83,
+    "sta": 53,
+    "str": 48
+   },
+   "47": {
+    "agi": 53,
+    "class": 11,
+    "inte": 77,
+    "level": 47,
+    "race": 4,
+    "spi": 84,
+    "sta": 55,
+    "str": 49
+   },
+   "48": {
+    "agi": 54,
+    "class": 11,
+    "inte": 79,
+    "level": 48,
+    "race": 4,
+    "spi": 86,
+    "sta": 56,
+    "str": 50
+   },
+   "49": {
+    "agi": 55,
+    "class": 11,
+    "inte": 81,
+    "level": 49,
+    "race": 4,
+    "spi": 88,
+    "sta": 57,
+    "str": 51
+   },
+   "5": {
+    "agi": 27,
+    "class": 11,
+    "inte": 26,
+    "level": 5,
+    "race": 4,
+    "spi": 26,
+    "sta": 21,
+    "str": 20
+   },
+   "50": {
+    "agi": 56,
+    "class": 11,
+    "inte": 82,
+    "level": 50,
+    "race": 4,
+    "spi": 90,
+    "sta": 58,
+    "str": 52
+   },
+   "51": {
+    "agi": 57,
+    "class": 11,
+    "inte": 84,
+    "level": 51,
+    "race": 4,
+    "spi": 92,
+    "sta": 59,
+    "str": 53
+   },
+   "52": {
+    "agi": 58,
+    "class": 11,
+    "inte": 86,
+    "level": 52,
+    "race": 4,
+    "spi": 94,
+    "sta": 60,
+    "str": 54
+   },
+   "53": {
+    "agi": 59,
+    "class": 11,
+    "inte": 87,
+    "level": 53,
+    "race": 4,
+    "spi": 96,
+    "sta": 61,
+    "str": 55
+   },
+   "54": {
+    "agi": 59,
+    "class": 11,
+    "inte": 89,
+    "level": 54,
+    "race": 4,
+    "spi": 98,
+    "sta": 62,
+    "str": 56
+   },
+   "55": {
+    "agi": 60,
+    "class": 11,
+    "inte": 91,
+    "level": 55,
+    "race": 4,
+    "spi": 100,
+    "sta": 63,
+    "str": 57
+   },
+   "56": {
+    "agi": 61,
+    "class": 11,
+    "inte": 93,
+    "level": 56,
+    "race": 4,
+    "spi": 102,
+    "sta": 64,
+    "str": 58
+   },
+   "57": {
+    "agi": 62,
+    "class": 11,
+    "inte": 94,
+    "level": 57,
+    "race": 4,
+    "spi": 104,
+    "sta": 65,
+    "str": 59
+   },
+   "58": {
+    "agi": 63,
+    "class": 11,
+    "inte": 96,
+    "level": 58,
+    "race": 4,
+    "spi": 106,
+    "sta": 67,
+    "str": 60
+   },
+   "59": {
+    "agi": 64,
+    "class": 11,
+    "inte": 98,
+    "level": 59,
+    "race": 4,
+    "spi": 108,
+    "sta": 68,
+    "str": 61
+   },
+   "6": {
+    "agi": 27,
+    "class": 11,
+    "inte": 27,
+    "level": 6,
+    "race": 4,
+    "spi": 27,
+    "sta": 22,
+    "str": 21
+   },
+   "60": {
+    "agi": 65,
+    "class": 11,
+    "inte": 100,
+    "level": 60,
+    "race": 4,
+    "spi": 110,
+    "sta": 69,
+    "str": 62
+   },
+   "7": {
+    "agi": 28,
+    "class": 11,
+    "inte": 28,
+    "level": 7,
+    "race": 4,
+    "spi": 28,
+    "sta": 23,
+    "str": 21
+   },
+   "8": {
+    "agi": 28,
+    "class": 11,
+    "inte": 28,
+    "level": 8,
+    "race": 4,
+    "spi": 29,
+    "sta": 23,
+    "str": 22
+   },
+   "9": {
+    "agi": 29,
+    "class": 11,
+    "inte": 29,
+    "level": 9,
+    "race": 4,
+    "spi": 30,
+    "sta": 24,
+    "str": 22
+   }
+  },
+  "6": {
+   "1": {
+    "agi": 15,
+    "class": 11,
+    "inte": 17,
+    "level": 1,
+    "race": 6,
+    "spi": 24,
+    "sta": 22,
+    "str": 26
+   },
+   "10": {
+    "agi": 19,
+    "class": 11,
+    "inte": 25,
+    "level": 10,
+    "race": 6,
+    "spi": 33,
+    "sta": 27,
+    "str": 31
+   },
+   "11": {
+    "agi": 20,
+    "class": 11,
+    "inte": 26,
+    "level": 11,
+    "race": 6,
+    "spi": 35,
+    "sta": 28,
+    "str": 31
+   },
+   "12": {
+    "agi": 20,
+    "class": 11,
+    "inte": 27,
+    "level": 12,
+    "race": 6,
+    "spi": 36,
+    "sta": 29,
+    "str": 32
+   },
+   "13": {
+    "agi": 21,
+    "class": 11,
+    "inte": 28,
+    "level": 13,
+    "race": 6,
+    "spi": 37,
+    "sta": 29,
+    "str": 32
+   },
+   "14": {
+    "agi": 21,
+    "class": 11,
+    "inte": 29,
+    "level": 14,
+    "race": 6,
+    "spi": 38,
+    "sta": 30,
+    "str": 33
+   },
+   "15": {
+    "agi": 22,
+    "class": 11,
+    "inte": 31,
+    "level": 15,
+    "race": 6,
+    "spi": 39,
+    "sta": 31,
+    "str": 34
+   },
+   "16": {
+    "agi": 22,
+    "class": 11,
+    "inte": 32,
+    "level": 16,
+    "race": 6,
+    "spi": 40,
+    "sta": 31,
+    "str": 34
+   },
+   "17": {
+    "agi": 23,
+    "class": 11,
+    "inte": 33,
+    "level": 17,
+    "race": 6,
+    "spi": 42,
+    "sta": 32,
+    "str": 35
+   },
+   "18": {
+    "agi": 24,
+    "class": 11,
+    "inte": 34,
+    "level": 18,
+    "race": 6,
+    "spi": 43,
+    "sta": 33,
+    "str": 35
+   },
+   "19": {
+    "agi": 24,
+    "class": 11,
+    "inte": 35,
+    "level": 19,
+    "race": 6,
+    "spi": 44,
+    "sta": 33,
+    "str": 36
+   },
+   "2": {
+    "agi": 15,
+    "class": 11,
+    "inte": 18,
+    "level": 2,
+    "race": 6,
+    "spi": 25,
+    "sta": 23,
+    "str": 27
+   },
+   "20": {
+    "agi": 25,
+    "class": 11,
+    "inte": 36,
+    "level": 20,
+    "race": 6,
+    "spi": 45,
+    "sta": 34,
+    "str": 37
+   },
+   "21": {
+    "agi": 25,
+    "class": 11,
+    "inte": 37,
+    "level": 21,
+    "race": 6,
+    "spi": 47,
+    "sta": 35,
+    "str": 37
+   },
+   "22": {
+    "agi": 26,
+    "class": 11,
+    "inte": 38,
+    "level": 22,
+    "race": 6,
+    "spi": 48,
+    "sta": 36,
+    "str": 38
+   },
+   "23": {
+    "agi": 27,
+    "class": 11,
+    "inte": 39,
+    "level": 23,
+    "race": 6,
+    "spi": 49,
+    "sta": 36,
+    "str": 39
+   },
+   "24": {
+    "agi": 27,
+    "class": 11,
+    "inte": 41,
+    "level": 24,
+    "race": 6,
+    "spi": 51,
+    "sta": 37,
+    "str": 39
+   },
+   "25": {
+    "agi": 28,
+    "class": 11,
+    "inte": 42,
+    "level": 25,
+    "race": 6,
+    "spi": 52,
+    "sta": 38,
+    "str": 40
+   },
+   "26": {
+    "agi": 28,
+    "class": 11,
+    "inte": 43,
+    "level": 26,
+    "race": 6,
+    "spi": 53,
+    "sta": 39,
+    "str": 41
+   },
+   "27": {
+    "agi": 29,
+    "class": 11,
+    "inte": 44,
+    "level": 27,
+    "race": 6,
+    "spi": 55,
+    "sta": 39,
+    "str": 41
+   },
+   "28": {
+    "agi": 30,
+    "class": 11,
+    "inte": 45,
+    "level": 28,
+    "race": 6,
+    "spi": 56,
+    "sta": 40,
+    "str": 42
+   },
+   "29": {
+    "agi": 30,
+    "class": 11,
+    "inte": 47,
+    "level": 29,
+    "race": 6,
+    "spi": 58,
+    "sta": 41,
+    "str": 43
+   },
+   "3": {
+    "agi": 16,
+    "class": 11,
+    "inte": 19,
+    "level": 3,
+    "race": 6,
+    "spi": 26,
+    "sta": 23,
+    "str": 27
+   },
+   "30": {
+    "agi": 31,
+    "class": 11,
+    "inte": 48,
+    "level": 30,
+    "race": 6,
+    "spi": 59,
+    "sta": 42,
+    "str": 43
+   },
+   "31": {
+    "agi": 32,
+    "class": 11,
+    "inte": 49,
+    "level": 31,
+    "race": 6,
+    "spi": 60,
+    "sta": 43,
+    "str": 44
+   },
+   "32": {
+    "agi": 32,
+    "class": 11,
+    "inte": 51,
+    "level": 32,
+    "race": 6,
+    "spi": 62,
+    "sta": 44,
+    "str": 45
+   },
+   "33": {
+    "agi": 33,
+    "class": 11,
+    "inte": 52,
+    "level": 33,
+    "race": 6,
+    "spi": 63,
+    "sta": 44,
+    "str": 46
+   },
+   "34": {
+    "agi": 34,
+    "class": 11,
+    "inte": 53,
+    "level": 34,
+    "race": 6,
+    "spi": 65,
+    "sta": 45,
+    "str": 46
+   },
+   "35": {
+    "agi": 34,
+    "class": 11,
+    "inte": 55,
+    "level": 35,
+    "race": 6,
+    "spi": 66,
+    "sta": 46,
+    "str": 47
+   },
+   "36": {
+    "agi": 35,
+    "class": 11,
+    "inte": 56,
+    "level": 36,
+    "race": 6,
+    "spi": 68,
+    "sta": 47,
+    "str": 48
+   },
+   "37": {
+    "agi": 36,
+    "class": 11,
+    "inte": 57,
+    "level": 37,
+    "race": 6,
+    "spi": 70,
+    "sta": 48,
+    "str": 49
+   },
+   "38": {
+    "agi": 36,
+    "class": 11,
+    "inte": 59,
+    "level": 38,
+    "race": 6,
+    "spi": 71,
+    "sta": 49,
+    "str": 50
+   },
+   "39": {
+    "agi": 37,
+    "class": 11,
+    "inte": 60,
+    "level": 39,
+    "race": 6,
+    "spi": 73,
+    "sta": 50,
+    "str": 50
+   },
+   "4": {
+    "agi": 16,
+    "class": 11,
+    "inte": 20,
+    "level": 4,
+    "race": 6,
+    "spi": 27,
+    "sta": 24,
+    "str": 28
+   },
+   "40": {
+    "agi": 38,
+    "class": 11,
+    "inte": 62,
+    "level": 40,
+    "race": 6,
+    "spi": 74,
+    "sta": 51,
+    "str": 51
+   },
+   "41": {
+    "agi": 39,
+    "class": 11,
+    "inte": 63,
+    "level": 41,
+    "race": 6,
+    "spi": 76,
+    "sta": 52,
+    "str": 52
+   },
+   "42": {
+    "agi": 39,
+    "class": 11,
+    "inte": 65,
+    "level": 42,
+    "race": 6,
+    "spi": 78,
+    "sta": 53,
+    "str": 53
+   },
+   "43": {
+    "agi": 40,
+    "class": 11,
+    "inte": 66,
+    "level": 43,
+    "race": 6,
+    "spi": 79,
+    "sta": 54,
+    "str": 54
+   },
+   "44": {
+    "agi": 41,
+    "class": 11,
+    "inte": 68,
+    "level": 44,
+    "race": 6,
+    "spi": 81,
+    "sta": 54,
+    "str": 55
+   },
+   "45": {
+    "agi": 42,
+    "class": 11,
+    "inte": 69,
+    "level": 45,
+    "race": 6,
+    "spi": 83,
+    "sta": 55,
+    "str": 55
+   },
+   "46": {
+    "agi": 43,
+    "class": 11,
+    "inte": 71,
+    "level": 46,
+    "race": 6,
+    "spi": 85,
+    "sta": 56,
+    "str": 56
+   },
+   "47": {
+    "agi": 43,
+    "class": 11,
+    "inte": 72,
+    "level": 47,
+    "race": 6,
+    "spi": 86,
+    "sta": 58,
+    "str": 57
+   },
+   "48": {
+    "agi": 44,
+    "class": 11,
+    "inte": 74,
+    "level": 48,
+    "race": 6,
+    "spi": 88,
+    "sta": 59,
+    "str": 58
+   },
+   "49": {
+    "agi": 45,
+    "class": 11,
+    "inte": 76,
+    "level": 49,
+    "race": 6,
+    "spi": 90,
+    "sta": 60,
+    "str": 59
+   },
+   "5": {
+    "agi": 17,
+    "class": 11,
+    "inte": 21,
+    "level": 5,
+    "race": 6,
+    "spi": 28,
+    "sta": 24,
+    "str": 28
+   },
+   "50": {
+    "agi": 46,
+    "class": 11,
+    "inte": 77,
+    "level": 50,
+    "race": 6,
+    "spi": 92,
+    "sta": 61,
+    "str": 60
+   },
+   "51": {
+    "agi": 47,
+    "class": 11,
+    "inte": 79,
+    "level": 51,
+    "race": 6,
+    "spi": 94,
+    "sta": 62,
+    "str": 61
+   },
+   "52": {
+    "agi": 48,
+    "class": 11,
+    "inte": 81,
+    "level": 52,
+    "race": 6,
+    "spi": 96,
+    "sta": 63,
+    "str": 62
+   },
+   "53": {
+    "agi": 49,
+    "class": 11,
+    "inte": 82,
+    "level": 53,
+    "race": 6,
+    "spi": 98,
+    "sta": 64,
+    "str": 63
+   },
+   "54": {
+    "agi": 49,
+    "class": 11,
+    "inte": 84,
+    "level": 54,
+    "race": 6,
+    "spi": 100,
+    "sta": 65,
+    "str": 64
+   },
+   "55": {
+    "agi": 50,
+    "class": 11,
+    "inte": 86,
+    "level": 55,
+    "race": 6,
+    "spi": 102,
+    "sta": 66,
+    "str": 65
+   },
+   "56": {
+    "agi": 51,
+    "class": 11,
+    "inte": 88,
+    "level": 56,
+    "race": 6,
+    "spi": 104,
+    "sta": 67,
+    "str": 66
+   },
+   "57": {
+    "agi": 52,
+    "class": 11,
+    "inte": 89,
+    "level": 57,
+    "race": 6,
+    "spi": 106,
+    "sta": 68,
+    "str": 67
+   },
+   "58": {
+    "agi": 53,
+    "class": 11,
+    "inte": 91,
+    "level": 58,
+    "race": 6,
+    "spi": 108,
+    "sta": 70,
+    "str": 68
+   },
+   "59": {
+    "agi": 54,
+    "class": 11,
+    "inte": 93,
+    "level": 59,
+    "race": 6,
+    "spi": 110,
+    "sta": 71,
+    "str": 69
+   },
+   "6": {
+    "agi": 17,
+    "class": 11,
+    "inte": 22,
+    "level": 6,
+    "race": 6,
+    "spi": 29,
+    "sta": 25,
+    "str": 29
+   },
+   "60": {
+    "agi": 55,
+    "class": 11,
+    "inte": 95,
+    "level": 60,
+    "race": 6,
+    "spi": 112,
+    "sta": 72,
+    "str": 70
+   },
+   "7": {
+    "agi": 18,
+    "class": 11,
+    "inte": 23,
+    "level": 7,
+    "race": 6,
+    "spi": 30,
+    "sta": 26,
+    "str": 29
+   },
+   "8": {
+    "agi": 18,
+    "class": 11,
+    "inte": 23,
+    "level": 8,
+    "race": 6,
+    "spi": 31,
+    "sta": 26,
+    "str": 30
+   },
+   "9": {
+    "agi": 19,
+    "class": 11,
+    "inte": 24,
+    "level": 9,
+    "race": 6,
+    "spi": 32,
+    "sta": 27,
+    "str": 30
+   }
+  }
+ },
+ "provenance": {
+  "client_build": "1.12.1.5875",
+  "cmangos_commit": "8ec338a1704e7dcb1c0213eb7ed58f9231ade40f",
+  "cmangos_sha256": {
+   "src/game/Entities/Player.cpp": "d02d693f2575b0f47be405fe6e81e2a4e833fca8d149354d9cb8d3b458527c7e",
+   "src/game/Entities/Unit.cpp": "03b67a4b6226f1f463e71be3694d3c950fc9b915a6e921407a98e4ff82fc21d0",
+   "src/game/Globals/ObjectMgr.cpp": "dd27915ca363f81885d20783fc4f6c0392df20c4e3dfa031faa1a30df7a4b78b",
+   "src/game/Spells/SpellAuras.cpp": "5e60510d23b789f8f0fb584da8f05a5be675f1cb4024ce997c989cde00105fde"
+  },
+  "dbc_sha256": {
+   "CharStartOutfit": "9f247d849ac8a713aaa215a4e94f06237465e09f6e309cd40e1950a1197cafe9",
+   "ChrRaces": "c338676c04e9c322839ab46ca45f5ba76f55e1eabe3e72847e467d675ea99d43",
+   "SkillLine": "9737b923079a1d2c1ef05bdefdd8e6b9a75f0268f4c926d58ef2383d4b234e9e",
+   "SkillLineAbility": "3c09ed367dfbbc9e249e493ccc4dcd4d27cf1b781bed8f49ee2190dd612e586b",
+   "SkillRaceClassInfo": "b6efcbcbd6071a4bb0e6e2653bab0ba279ea4335fc8cbc4cf24eb9a2b32847bf",
+   "Spell": "913d01c0376d88310ed4a44ea1115f30fd8be15af64ce304f4f17b6bc51cf15b",
+   "SpellDuration": "de06e81905c46f687c444dd553cb39cb3d8d993bd81c1be5e5ab616d0cd169b0"
+  },
+  "dump_sha256": "4f92db520868ab4e566726f68b5b2e380ae781209beaf22237b4f7f04600d0c0"
+ },
+ "racials": {
+  "1": [
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 5,
+      "aura": 98,
+      "effect": 6,
+      "misc": 43
+     },
+     {
+      "amount": 5,
+      "aura": 98,
+      "effect": 6,
+      "misc": 55
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:159",
+     "src/game/Entities/Player.cpp:5453"
+    ],
+    "key": "sword_specialization",
+    "name": "Sword Specialization",
+    "passive": true,
+    "service": {
+     "amount": 5,
+     "note": "+5 weapon skill on the attack table melee.py rolls (level x 5) while the main hand is of one of these skills; Skyrim's own One-Handed/Two-Handed skill is not raised (a named zero-magnitude Skyrim marker)",
+     "runtime": "delivered",
+     "skills": [
+      {
+       "classes": [
+        2
+       ],
+       "name": "Swords",
+       "skill": 43
+      },
+      {
+       "classes": [
+        2
+       ],
+       "name": "Two-Handed Swords",
+       "skill": 55
+      }
+     ],
+     "skyrim": "converted",
+     "type": "weapon_skill"
+    },
+    "skill_line": 754,
+    "spell": 20597
+   },
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 5,
+      "aura": 137,
+      "effect": 6,
+      "misc": 4
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:198",
+     "src/game/Spells/SpellAuras.cpp:3542"
+    ],
+    "key": "the_human_spirit",
+    "name": "The Human Spirit",
+    "passive": true,
+    "service": {
+     "amount": 5,
+     "note": "Character.build scales total Spirit by the aura as it scales stats for talents (aura 137 misc 4) and Character.regen reads it; its share of their Spirit is bonus Spirit natively, Fortify Magicka Rate a point a Spirit point (aura_effects' stat route), the plugin's constant The Human Spirit",
+     "runtime": "delivered",
+     "skyrim": "converted",
+     "stat": "spi",
+     "type": "stat_percent"
+    },
+    "skill_line": 754,
+    "spell": 20598
+   },
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 10,
+      "aura": 156,
+      "effect": 6,
+      "misc": 0
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:217",
+     "src/game/Entities/Player.cpp:6308"
+    ],
+    "key": "diplomacy",
+    "name": "Diplomacy",
+    "passive": true,
+    "service": {
+     "amount": 10,
+     "note": "Player::CalculateReputationGain adds it to every reputation gain; Skyrim keeps no WoW reputation and the character pane has none to show: a named zero-magnitude Skyrim marker",
+     "runtime": "delivered",
+     "skyrim": "informational",
+     "type": "reputation_gain"
+    },
+    "skill_line": 754,
+    "spell": 20599
+   },
+   {
+    "cooldown_ms": 180000,
+    "duration_ms": 20000,
+    "effects": [
+     {
+      "amount": 50,
+      "aura": 17,
+      "effect": 6,
+      "misc": 0
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:78",
+     "src/game/Spells/SpellAuras.cpp:2623"
+    ],
+    "key": "perception",
+    "name": "Perception",
+    "passive": false,
+    "service": {
+     "amount": 50,
+     "cooldown_ms": 180000,
+     "duration_ms": 20000,
+     "note": "a self cast validated as Shadowmeld is (self target) with its 3-minute cooldown; for its 20 seconds the plugin keeps Skyrim's Detect Life on the player (the Thieves Guild scroll's effects): Skyrim has no stealth detection value, and Detect Life is its sight of hidden creatures",
+     "runtime": "delivered",
+     "skyrim": "native",
+     "type": "stealth_detection"
+    },
+    "skill_line": 754,
+    "spell": 20600
+   },
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 5,
+      "aura": 98,
+      "effect": 6,
+      "misc": 54
+     },
+     {
+      "amount": 5,
+      "aura": 98,
+      "effect": 6,
+      "misc": 160
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:159",
+     "src/game/Entities/Player.cpp:5453"
+    ],
+    "key": "mace_specialization",
+    "name": "Mace Specialization",
+    "passive": true,
+    "service": {
+     "amount": 5,
+     "note": "+5 weapon skill on the attack table melee.py rolls (level x 5) while the main hand is of one of these skills; Skyrim's own One-Handed/Two-Handed skill is not raised (a named zero-magnitude Skyrim marker)",
+     "runtime": "delivered",
+     "skills": [
+      {
+       "classes": [
+        2
+       ],
+       "name": "Maces",
+       "skill": 54
+      },
+      {
+       "classes": [
+        2
+       ],
+       "name": "Two-Handed Maces",
+       "skill": 160
+      }
+     ],
+     "skyrim": "converted",
+     "type": "weapon_skill"
+    },
+    "skill_line": 754,
+    "spell": 20864
+   }
+  ],
+  "3": [
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 0,
+      "aura": 45,
+      "effect": 6,
+      "misc": 6
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:106",
+     "src/game/Spells/SpellAuras.cpp:2174"
+    ],
+    "key": "find_treasure",
+    "name": "Find Treasure",
+    "passive": false,
+    "service": {
+     "cooldown_ms": 0,
+     "duration_ms": -1,
+     "lock_type": 6,
+     "note": "a toggled tracking aura (PLAYER_TRACK_RESOURCES bit for lock type 6, Treasure): Cast keeps it as one tracker until cancelled; marking treasure containers on the minimap needs resource blips there (pending)",
+     "runtime": "pending",
+     "skyrim": "native",
+     "type": "tracking"
+    },
+    "skill_line": 101,
+    "spell": 2481
+   },
+   {
+    "cooldown_ms": 180000,
+    "duration_ms": 8000,
+    "effects": [
+     {
+      "amount": 10,
+      "aura": 101,
+      "effect": 6,
+      "misc": 1
+     },
+     {
+      "amount": 0,
+      "aura": 41,
+      "effect": 6,
+      "misc": 4
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:162",
+     "src/game/Spells/SpellAuras.cpp:102",
+     "src/game/Spells/SpellAuras.cpp:138",
+     "src/game/Spells/SpellAuras.cpp:5582",
+     "src/game/Entities/Unit.cpp:7716",
+     "src/game/Spells/SpellAuras.cpp:2950"
+    ],
+    "key": "stoneform",
+    "linked": [
+     {
+      "cooldown_ms": 0,
+      "duration_ms": 8000,
+      "effects": [
+       {
+        "amount": 0,
+        "aura": 77,
+        "effect": 6,
+        "misc": 15
+       },
+       {
+        "amount": 0,
+        "aura": 41,
+        "effect": 6,
+        "misc": 3
+       }
+      ],
+      "name": "Stoneform",
+      "spell": 20612
+     }
+    ],
+    "name": "Stoneform",
+    "passive": false,
+    "service": {
+     "armor_percent": 10,
+     "cooldown_ms": 180000,
+     "dispel_immunity": [
+      3,
+      4
+     ],
+     "duration_ms": 8000,
+     "mechanic_immunity": [
+      15
+     ],
+     "note": "armor +10% of their worn armor (Cast's armor_percent, as Enrage's); Resist Poison and Resist Disease 100 (Skyrim's own immunity, Hevnoraak's); applying its immunities purges active poison, disease and bleed effects (SPELL_ATTR_EX_IMMUNITY_PURGES_EFFECT) and refuses new ones for 8 seconds: the plugin ends their Skyrim poisons, diseases and Bleeding Damage while it lasts",
+     "runtime": "delivered",
+     "skyrim": "native",
+     "type": "stoneform"
+    },
+    "skill_line": 101,
+    "spell": 20594
+   },
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 5,
+      "aura": 98,
+      "effect": 6,
+      "misc": 46
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:159",
+     "src/game/Entities/Player.cpp:5453"
+    ],
+    "key": "gun_specialization",
+    "name": "Gun Specialization",
+    "passive": true,
+    "service": {
+     "amount": 5,
+     "note": "no playable class of the race here has the skill (SkillRaceClassInfo gives Guns to Warriors, Rogues and Hunters): the bonus is listed but never applies, as in WoW; Skyrim has no guns: a named zero-magnitude marker",
+     "runtime": "delivered",
+     "skills": [
+      {
+       "classes": [],
+       "name": "Guns",
+       "skill": 46
+      }
+     ],
+     "skyrim": "informational",
+     "type": "weapon_skill"
+    },
+    "skill_line": 101,
+    "spell": 20595
+   },
+   {
+    "cooldown_ms": 0,
+    "duration_ms": -1,
+    "effects": [
+     {
+      "amount": 10,
+      "aura": 22,
+      "effect": 6,
+      "misc": 16
+     }
+    ],
+    "evidence": [
+     "src/game/Spells/SpellAuras.cpp:83",
+     "src/game/Spells/SpellAuras.cpp:3367"
+    ],
+    "key": "frost_resistance",
+    "name": "Frost Resistance",
+    "passive": true,
+    "service": {
+     "amount": 10,
+     "note": "as the Night Elf's and Tauren's Nature Resistance: Character.resistance, and gear's /3 rate as Resist Frost (aura_effects' frost_res; the plugin's constant Frost Resistance)",
+     "runtime": "delivered",
+     "school_mask": 16,
+     "skyrim": "converted",
+     "type": "resistance"
+    },
+    "skill_line": 101,
+    "spell": 20596
+   }
+  ]
+ },
+ "starting_outfits": [
+  {
+   "ClassID": 11,
+   "DisplayItemID": [
+    18530,
+    12683,
+    9987,
+    18084,
+    6410,
+    -1,
+    6418,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ID": 286,
+   "InventoryType": [
+    17,
+    20,
+    7,
+    0,
+    0,
+    -1,
+    0,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ItemID": [
+    3661,
+    6123,
+    6124,
+    159,
+    4536,
+    0,
+    6948,
+    0,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "OutfitID": 0,
+   "RaceID": 4,
+   "SexID": 0
+  },
+  {
+   "ClassID": 11,
+   "DisplayItemID": [
+    18530,
+    12683,
+    9987,
+    18084,
+    6410,
+    -1,
+    6418,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ID": 287,
+   "InventoryType": [
+    17,
+    20,
+    7,
+    0,
+    0,
+    -1,
+    0,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ItemID": [
+    3661,
+    6123,
+    6124,
+    159,
+    4536,
+    0,
+    6948,
+    0,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "OutfitID": 0,
+   "RaceID": 4,
+   "SexID": 1
+  },
+  {
+   "ClassID": 11,
+   "DisplayItemID": [
+    472,
+    12684,
+    9987,
+    18084,
+    -1,
+    6410,
+    6418,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ID": 284,
+   "InventoryType": [
+    17,
+    20,
+    7,
+    0,
+    -1,
+    0,
+    0,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ItemID": [
+    35,
+    6139,
+    6124,
+    159,
+    0,
+    4536,
+    6948,
+    0,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "OutfitID": 0,
+   "RaceID": 6,
+   "SexID": 0
+  },
+  {
+   "ClassID": 11,
+   "DisplayItemID": [
+    472,
+    12684,
+    9987,
+    18084,
+    -1,
+    6410,
+    6418,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ID": 285,
+   "InventoryType": [
+    17,
+    20,
+    7,
+    0,
+    -1,
+    0,
+    0,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "ItemID": [
+    35,
+    6139,
+    6124,
+    159,
+    0,
+    4536,
+    6948,
+    0,
+    -1,
+    -1,
+    -1,
+    -1
+   ],
+   "OutfitID": 0,
+   "RaceID": 6,
+   "SexID": 1
+  }
+ ],
+ "starting_outfits_by_class": {
+  "11": [
+   {
+    "ClassID": 11,
+    "DisplayItemID": [
+     18530,
+     12683,
+     9987,
+     18084,
+     6410,
+     -1,
+     6418,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 286,
+    "InventoryType": [
+     17,
+     20,
+     7,
+     0,
+     0,
+     -1,
+     0,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     3661,
+     6123,
+     6124,
+     159,
+     4536,
+     0,
+     6948,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 4,
+    "SexID": 0
+   },
+   {
+    "ClassID": 11,
+    "DisplayItemID": [
+     18530,
+     12683,
+     9987,
+     18084,
+     6410,
+     -1,
+     6418,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 287,
+    "InventoryType": [
+     17,
+     20,
+     7,
+     0,
+     0,
+     -1,
+     0,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     3661,
+     6123,
+     6124,
+     159,
+     4536,
+     0,
+     6948,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 4,
+    "SexID": 1
+   },
+   {
+    "ClassID": 11,
+    "DisplayItemID": [
+     472,
+     12684,
+     9987,
+     18084,
+     -1,
+     6410,
+     6418,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 284,
+    "InventoryType": [
+     17,
+     20,
+     7,
+     0,
+     -1,
+     0,
+     0,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     35,
+     6139,
+     6124,
+     159,
+     0,
+     4536,
+     6948,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 6,
+    "SexID": 0
+   },
+   {
+    "ClassID": 11,
+    "DisplayItemID": [
+     472,
+     12684,
+     9987,
+     18084,
+     -1,
+     6410,
+     6418,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 285,
+    "InventoryType": [
+     17,
+     20,
+     7,
+     0,
+     -1,
+     0,
+     0,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     35,
+     6139,
+     6124,
+     159,
+     0,
+     4536,
+     6948,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 6,
+    "SexID": 1
+   }
+  ],
+  "2": [
+   {
+    "ClassID": 2,
+    "DisplayItemID": [
+     3265,
+     10272,
+     9937,
+     6418,
+     8690,
+     18084,
+     6353,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 79,
+    "InventoryType": [
+     4,
+     8,
+     7,
+     0,
+     17,
+     0,
+     0,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     45,
+     43,
+     44,
+     6948,
+     2361,
+     159,
+     2070,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 1,
+    "SexID": 0
+   },
+   {
+    "ClassID": 2,
+    "DisplayItemID": [
+     3265,
+     10272,
+     9937,
+     6418,
+     8690,
+     18084,
+     6353,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 36,
+    "InventoryType": [
+     4,
+     8,
+     7,
+     0,
+     17,
+     0,
+     0,
+     -1,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     45,
+     43,
+     44,
+     6948,
+     2361,
+     159,
+     2070,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 1,
+    "SexID": 1
+   },
+   {
+    "ClassID": 2,
+    "DisplayItemID": [
+     9972,
+     9974,
+     10272,
+     -1,
+     8690,
+     6399,
+     18084,
+     6418,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 7,
+    "InventoryType": [
+     4,
+     7,
+     8,
+     -1,
+     17,
+     0,
+     0,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     6117,
+     6118,
+     43,
+     0,
+     2361,
+     4540,
+     159,
+     6948,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 3,
+    "SexID": 0
+   },
+   {
+    "ClassID": 2,
+    "DisplayItemID": [
+     9972,
+     9974,
+     10272,
+     -1,
+     8690,
+     6399,
+     18084,
+     6418,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ID": 48,
+    "InventoryType": [
+     4,
+     7,
+     8,
+     -1,
+     17,
+     0,
+     0,
+     0,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "ItemID": [
+     6117,
+     6118,
+     43,
+     0,
+     2361,
+     4540,
+     159,
+     6948,
+     -1,
+     -1,
+     -1,
+     -1
+    ],
+    "OutfitID": 0,
+    "RaceID": 3,
+    "SexID": 1
+   }
+  ]
+ }
+}

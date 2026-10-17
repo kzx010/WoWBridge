@@ -25,6 +25,7 @@ if(NOT COMMAND add_commonlibsse_plugin)
     include("${COMMONLIB_DIR}/cmake/CommonLibSSE.cmake")
 endif()
 
+# Includes render/Shadows.cpp/.h, NpcShoulders, NpcWeapons, NpcHelms and the other renderer sources, like GroundItems.
 file(GLOB_RECURSE WOWBRIDGE_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 add_commonlibsse_plugin(WoWBridge
     NAME "WoWBridge"
@@ -34,21 +35,34 @@ add_commonlibsse_plugin(WoWBridge
 target_include_directories(WoWBridge PRIVATE src)
 target_precompile_headers(WoWBridge PRIVATE src/PCH.h)
 target_compile_definitions(WoWBridge PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(WoWBridge PRIVATE d3d11.lib dxgi.lib ws2_32.lib psapi.lib)
+target_link_libraries(WoWBridge PRIVATE d3d11.lib dxgi.lib ws2_32.lib psapi.lib dbghelp.lib)
 target_link_options(WoWBridge PRIVATE /DEBUG /PDBALTPATH:WoWBridge.pdb)   # WoWBridge.pdb: names for a fault's offsets (main.cpp OnFault)
 
-# HLSL -> DXBC headers at build time with fxc2 (Microsoft's d3dcompiler_47 under Wine), so the game
-# never depends on Proton's runtime HLSL compiler.
+# HLSL -> DXBC headers at build time with fxc2 (Microsoft's d3dcompiler_47), so the game never depends on a
+# runtime HLSL compiler. fxc2 is a Windows program: Wine runs it on Linux, WSL's interop on Windows.
 set(FXC2 "$ENV{FXC2}" CACHE FILEPATH "fxc2.exe")
+if(EXISTS /proc/sys/kernel/osrelease)
+    file(READ /proc/sys/kernel/osrelease WB_OSRELEASE)   # WSL as tools/winhost.py tells it
+endif()
+if(WB_OSRELEASE MATCHES "[Mm]icrosoft")
+    set(FXC2_RUN "${FXC2}")
+else()
+    set(FXC2_RUN ${CMAKE_COMMAND} -E env WINEDEBUG=-all wine "${FXC2}")
+endif()
 set(SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 function(wb_shader FILE ENTRY PROFILE)
     get_filename_component(stem "${FILE}" NAME_WE)
     set(out "${SHADER_OUT}/${stem}_${ENTRY}.h")
+    set(shader_deps "${CMAKE_CURRENT_SOURCE_DIR}/${FILE}")
+    if(stem STREQUAL "WowModel")
+        list(APPEND shader_deps "${CMAKE_CURRENT_SOURCE_DIR}/shaders/WowShadow.hlsl")
+    endif()
+    file(RELATIVE_PATH rel_out "${CMAKE_CURRENT_SOURCE_DIR}" "${out}")   # Windows cannot read a Linux absolute path
     add_custom_command(OUTPUT "${out}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
-        COMMAND ${CMAKE_COMMAND} -E env WINEDEBUG=-all wine "${FXC2}" /nologo /T${PROFILE} /E${ENTRY} /Vng_${stem}_${ENTRY} /Fh${out} "${FILE}"
+        COMMAND ${FXC2_RUN} /nologo /T${PROFILE} /E${ENTRY} /Vng_${stem}_${ENTRY} /Fh${rel_out} "${FILE}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"  # fxc2 would parse an absolute /path as an option
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${FILE}" VERBATIM)
+        DEPENDS ${shader_deps} VERBATIM)
     target_sources(WoWBridge PRIVATE "${out}")
 endfunction()
 wb_shader(shaders/Debug.hlsl VSMain vs_5_0)
@@ -59,6 +73,11 @@ wb_shader(shaders/WowQuad.hlsl VSMain vs_5_0)
 wb_shader(shaders/WowQuad.hlsl PSMain ps_5_0)
 wb_shader(shaders/WowDecal.hlsl VSMain vs_5_0)
 wb_shader(shaders/WowDecal.hlsl PSMain ps_5_0)
+wb_shader(shaders/WowShadow.hlsl VSMain vs_5_0)
+wb_shader(shaders/WowShadow.hlsl BlobPS ps_5_0)
+wb_shader(shaders/WowShadow.hlsl MaskPS ps_5_0)
+wb_shader(shaders/WowShadow.hlsl MaskProbePS ps_5_0)
+wb_shader(shaders/WowShadow.hlsl CascadeProbePS ps_5_0)
 wb_shader(shaders/ImGui.hlsl VSMain vs_4_0)
 wb_shader(shaders/ImGui.hlsl PSMain ps_4_0)
 find_package(imgui CONFIG REQUIRED)

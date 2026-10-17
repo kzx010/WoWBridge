@@ -1,5 +1,6 @@
 #include <catch_amalgamated.hpp>
 #include "wowcore/character.hpp"
+#include "wowcore/character.h"
 #include "wowcore/dbc.hpp"
 #include "wowcore/mpq.hpp"
 #include "wowcore/player_model.hpp"
@@ -14,6 +15,154 @@ extern "C" {
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+
+TEST_CASE("Paladin identity reaches client APIs and class race controls", "[client][api][character][identity]") {
+    const char* env=std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data=env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data/"interface.MPQ")) SKIP("WoW client absent");
+    auto mpq=std::make_shared<wowcore::Mpq>(data);
+    const wowcore::ClientDb db(*mpq);
+    wowcore::SoftTextures textures;
+    wowcore::UiSession ui(mpq,db,textures,1280,720);
+    std::string error; REQUIRE(ui.start(&error));
+    auto* L=ui.lua();
+    const auto run=[&](const std::string& script) {
+        const int rc=luaL_dostring(L,script.c_str()); INFO(script); INFO((rc ? lua_tostring(L,-1) : "")); REQUIRE(rc==0);
+    };
+    REQUIRE(luaL_dofile(L,(std::string(WOWBRIDGE_ROOT)+"/wowcore/tests/fixtures/elunara.lua").c_str())==0);
+    run("__WBFixture('idle')"); REQUIRE(ui.loadInterface(&error)); run("__WBLogin()");
+    std::string classes="classes={";
+    for (const auto& c : wowcore::characterClasses(*mpq)) {
+        classes+="["+std::to_string(c.id)+"]={name='"+c.name+"',token='"+c.token+"',races={";
+        for (const auto r : c.races) classes+="["+std::to_string(r)+"]=true,";
+        classes+="}},";
+    }
+    run(classes+"}");
+    run(R"(
+      defaults={}
+      for _,race in ipairs({1,3,4,6}) do
+        defaults[race]={}
+        for sex=0,1 do defaults[race][sex]={race=race,sex=sex,skin=0,face=0,hairStyle=0,hairColor=0,facialHair=0} end
+      end
+      calls={} __WB.host=function(...) tinsert(calls,arg) end
+      for _,race in ipairs({1,3}) do for sex=0,1 do
+        __WB.spellbook={5176,768,20580,6603} __WB.actions={[1]={spell=5176},[73]={spell=768}}
+        __WBAppearance(defaults[race][sex],defaults,2,classes)
+        local c,t=UnitClass('player') assert(c=='Paladin' and t=='PALADIN')
+        local r,token=UnitRace('player') assert(r==(race==1 and 'Human' or 'Dwarf') and token==r)
+        assert(UnitSex('player')==sex+2 and UnitClassification('player')=='normal')
+        assert(UnitIsPlayer('player') and UnitCreatureType('player')=='Humanoid' and UnitHasRelicSlot('player'))
+        assert(GetNumShapeshiftForms()==0 and GetNumTalentTabs()==0 and UnitCharacterPoints('player')==0)
+        -- Attack, then their race's General racials (actives first); no Druid spell or Night Elf racial stays.
+        local general=race==1 and {6603,20600,20597,20598,20599,20864} or {6603,20594,2481,20595,20596}
+        assert(table.getn(__WB.spellbook)==table.getn(general) and not __WB.actions[1] and not __WB.actions[73])
+        for i,id in ipairs(general) do assert(__WB.spellbook[i]==id,id) end
+        assert(not __WB.spellInfo(20600).passive and __WB.spellInfo(20598).passive and not __WB.spellInfo(20594).passive)
+        __WBDruidForms() __WBDefaultFormActions() assert(GetNumShapeshiftForms()==0 and not __WB.actions[73])
+        -- Their own trees arrive from Progression (here a stand-in tree): a Paladin's talents are accepted.
+        __WBTalents({ok=true,trees={{name='Holy',icon='Interface\\Icons\\Spell_Holy_HolyBolt',points_spent=0,
+          background='PaladinHoly',talents={}}},talents={},level=60,points_spent=0,points_available=51})
+        assert(GetNumTalentTabs()==1)
+        ToggleTalentFrame() TalentFrame_Update()
+        assert(TalentFrame:IsShown() and not TalentFrameTalent1:IsVisible()) HideUIPanel(TalentFrame)
+        PaperDollFrame_SetLevel()
+        assert(string.find(CharacterLevelText:GetText(),r,1,true) and string.find(CharacterLevelText:GetText(),'Paladin',1,true))
+        __WBCustomizeAppearance()
+        assert(WBCustomizeClass2:GetChecked() and WBCustomizeClass2HighlightText:GetText()=='Paladin')
+        assert(WBCustomizeRace1:IsEnabled()==1 and WBCustomizeRace3:IsEnabled()==1)
+        for _,id in ipairs({2,4,5,6,7,8}) do assert(getglobal('WBCustomizeRace'..id):IsEnabled()==0) end
+        WBCustomizeRace4:Click() assert(not WBCustomizeRace4:GetChecked())
+        assert(getglobal('WBCustomizeGender'..(sex==1 and 'Female' or 'Male')):GetChecked())
+        WBCustomizeCancel:Click()
+      end end
+      -- Choosing a class only changes the preview until accepted; Cancel keeps the host's identity.
+      __WBAppearance(defaults[4][1],defaults,11,classes,true) __WBCustomizeAppearance() calls={}
+      WBCustomizeClass2:Click()
+      assert(WBCustomizeClass2:GetChecked() and WBCustomizeRace1:GetChecked())
+      assert(WBCustomizeRace4:IsEnabled()==0 and UnitClass('player')=='Druid' and table.getn(calls)==0)
+      WBCustomizeCancel:Click() assert(calls[1][1]=='appearance' and calls[1].n==1)
+      __WBCustomizeAppearance() WBCustomizeClass2:Click() WBCustomizeRace3:Click() WBCustomizeGenderMale:Click()
+      calls={} WBCustomizeAccept:Click()
+      assert(calls[1][1]=='testCommand' and calls[1][2]=='appearance' and calls[1][3]=='2' and calls[1][4]=='3,0,0,0,0,0,0')
+      __WBAppearance(defaults[3][0],defaults,2,classes,true)
+      __WBLogin() assert(UnitClass('player')=='Paladin' and GetNumTalentTabs()==0 and GetNumShapeshiftForms()==0)
+      -- Their auras ride the stance bar (AttributesEx2 USE_SHAPESHIFT_BAR): the highest rank of each, the one on their active.
+      local book=__WB.spellbook __WB.spellbook={635,465,10290,7294} __WBPaladinAuras()
+      assert(GetNumShapeshiftForms()==2 and __WB.forms[1].spell==10290 and __WB.forms[2].spell==7294)
+      local _,devotion,on=GetShapeshiftFormInfo(1) assert(devotion=='Devotion Aura' and not on)
+      local _,retribution=GetShapeshiftFormInfo(2) assert(retribution=='Retribution Aura')
+      __WBAuraAdd('player',10290,false,0) _,_,on=GetShapeshiftFormInfo(1) assert(on==1)
+      __WBAuraRemove('player',10290) _,_,on=GetShapeshiftFormInfo(1) assert(not on)
+      __WB.spellbook=book __WBPaladinAuras()
+      __WBCustomizeAppearance() WBCustomizeClass11:Click()
+      assert(WBCustomizeRace4:IsEnabled()==1 and WBCustomizeRace6:IsEnabled()==1 and WBCustomizeRace1:IsEnabled()==0)
+      WBCustomizeCancel:Click()
+      -- Established characters can change race/looks, but neither click nor a stale handler changes class.
+      for _,id in ipairs({11,2}) do
+        local race=id==11 and 4 or 1
+        __WBAppearance(defaults[race][1],defaults,id,classes,false) __WBCustomizeAppearance() calls={}
+        assert(WBCustomizeClass11:IsEnabled()==0 and WBCustomizeClass2:IsEnabled()==0)
+        local other=id==11 and 2 or 11
+        getglobal('WBCustomizeClass'..other):Click()
+        getglobal('WBCustomizeClass'..other):GetScript('OnClick')()
+        assert(getglobal('WBCustomizeClass'..id):GetChecked())
+        WBCustomizeAccept:Click()
+        assert(table.getn(calls)==1 and calls[1][1]=='appearance' and calls[1][2]==race)
+      end
+      -- Repeated identity publications and login keep learned ground/synthetic mounts and non-spell actions.
+      -- Start reads saved actions before the mount catalog has supplied its synthetic spells.
+      __WB.mountCatalog={} __WB.spellbook={5176,6603,23221}
+      __WB.actions={[1]={spell=5176},[2]={spell=23221},[3]={spell=900001},[5]={item=123},[6]={macro=1}}
+      __WBAppearance(defaults[1][1],defaults,2,classes,false)
+      assert(not __WB.actions[1] and __WB.actions[2].spell==23221 and __WB.actions[3].spell==900001)
+      assert(__WB.actions[5].item==123 and __WB.actions[6].macro==1)
+      __WBMountCatalog({{key='swift_frostsaber',spell=23221,learned=true},
+        {key='test_flyer',spell=900001,learned=true,name='Test flyer',icon='Interface\\Icons\\Ability_Mount_Gryphon_01'},
+        {key='unlearned',spell=23227,learned=false}})
+      __WB.actions={[1]={spell=5176},[2]={spell=23221},[3]={spell=900001},[4]={spell=23227},
+        [5]={item=123},[6]={macro=1},[7]={spell=6603}}
+      for n=1,3 do
+        __WBAppearance(defaults[1][1],defaults,2,classes,false)
+        if n==2 then __WBLogin() end
+        local seen={} for _,spell in ipairs(__WB.spellbook) do seen[spell]=true end
+        assert(seen[6603] and seen[23221] and seen[900001] and not seen[5176] and not seen[23227])
+        assert(__WB.actions[2].spell==23221 and __WB.actions[3].spell==900001)
+        assert(__WB.actions[5].item==123 and __WB.actions[6].macro==1 and __WB.actions[7].spell==6603)
+        assert(not __WB.actions[1] and not __WB.actions[4])
+      end
+      -- Native abilities have metadata once published, but still belong to Skyrim rather than the class kit.
+      __WBSkyrimSpells({{id=-0x12FCC,name='Healing'}})
+      __WBSkyrimPowers({{id=-0xFE001234,name='Native power',kind='greater'}})
+      __WBSkyrimShouts({{id=-0xE40C3,name='Unrelenting Force',words={
+        {name='Force',spell=123,learned=true,unlocked=true,recovery=15}}}})
+      __WB.actions[8]={spell=-0x12FCC} __WB.actions[9]={spell=-0xFE001234} __WB.actions[10]={spell=-0xE40C3}
+      for n=1,3 do
+        __WBAppearance(defaults[1][1],defaults,2,classes,false)
+        __WBLogin() -- ReloadUI's login path republishes the empty class too
+        assert(__WB.actions[8].spell==-0x12FCC and __WB.actions[9].spell==-0xFE001234 and __WB.actions[10].spell==-0xE40C3)
+        local seen={} for _,id in ipairs(__WB.spellbook) do seen[id]=true end
+        assert(seen[-0x12FCC] and seen[-0xFE001234] and seen[-0xE40C3] and not seen[5176])
+      end
+    )");
+    run("__WB.actions[6]=nil"); // the dummy macro above only exercises filtering; macros have no client backend
+    REQUIRE(luaL_dostring(L,"return __WBReloadStateText()") == 0);
+    const std::string reload=lua_tostring(L,-1); lua_pop(L,1);
+    wowcore::SoftTextures freshTextures;
+    wowcore::UiSession fresh(mpq,db,freshTextures,1280,720);
+    REQUIRE(fresh.start(&error));
+    REQUIRE(luaL_dostring(fresh.lua(),reload.c_str())==0);
+    const bool freshLoaded=fresh.loadInterface(&error);
+    INFO(error); REQUIRE(freshLoaded);
+    const int reloaded=luaL_dostring(fresh.lua(),R"(
+      __WBLogin()
+      assert(UnitClass('player')=='Paladin')
+      assert(__WB.actions[8].spell==-0x12FCC and __WB.actions[9].spell==-0xFE001234 and __WB.actions[10].spell==-0xE40C3)
+      assert(not __WB.actions[1] and not __WB.actions[4])
+    )");
+    INFO((reloaded ? lua_tostring(fresh.lua(),-1) : "")); REQUIRE(reloaded==0);
+    CHECK(fresh.engine().lastError().empty());
+    CHECK(ui.engine().lastError().empty());
+}
 
 TEST_CASE("live CharacterFrame uses Skyrim equipment, skills and native Skyrim statistics", "[client][api][character]") {
     const char* env=std::getenv("WOWBRIDGE_WOW_DATA");
@@ -343,7 +492,8 @@ TEST_CASE("epic mount models carry animated saddles and independent rider scale"
     if (!std::filesystem::exists(data/"interface.MPQ")) SKIP("WoW client absent");
     const wowcore::Mpq mpq(data);
     for (const uint32_t display : {14332,14329,14331,14377,14376,14374,14582,14338,14583,
-        14347,14576,14346,14339,14344,14342,10721,14349,14579,14578,14573,14575}) {
+        14347,14576,14346,14339,14344,14342,10721,14349,14579,14578,14573,14575,
+        8469,14584}) {   // the last two: the Paladin's Warhorse and Charger (class mounts)
         INFO(display);
         const auto look = wowcore::dressCreature(mpq, display);
         REQUIRE(look);
@@ -366,4 +516,34 @@ TEST_CASE("epic mount models carry animated saddles and independent rider scale"
     REQUIRE(model);
     REQUIRE(wowcore::findSequence(*model, 91) >= 0);
     REQUIRE_FALSE(wowcore::mountedRiderMatrix({}, {}, 1));
+}
+
+TEST_CASE("flying mount models carry Fly and animated saddles", "[model][mount]") {
+    const auto* env=std::getenv("WOWBRIDGE_WOW_DATA");
+    const std::filesystem::path data=env ? env : WOWBRIDGE_ROOT "/../WoW/client/Data";
+    if (!std::filesystem::exists(data/"interface.MPQ")) SKIP("WoW client absent");
+    const wowcore::Mpq mpq(data);
+    // The taxi Riding Gryphon and the green Wind Rider (data/mounts.json). Their Stand/Walk/Run are 1.12's
+    // hovering poses; neither model has Walkbackwards (13) or the Jump set (37-40).
+    for (const uint32_t display : {6852u, 11011u}) {
+        INFO(display);
+        const auto look = wowcore::dressCreature(mpq, display);
+        REQUIRE(look);
+        const auto model = wowcore::loadModel(mpq, look->body);
+        REQUIRE(model);
+        for (const uint32_t anim : {0u, 4u, 5u, 135u}) {
+            INFO(anim);
+            const int seq = wowcore::findSequence(*model, anim);
+            REQUIRE(seq >= 0);
+            for (const float t : {0.0f, 300.0f, 600.0f}) {
+                std::vector<glm::mat4> bones;
+                wowcore::poseBones(*model, seq, t, t, bones);
+                const auto at = wowcore::mountedRiderMatrix(*model, bones, look->scale);
+                REQUIRE(at);
+                REQUIRE(std::isfinite((*at)[3].x));
+                REQUIRE(std::isfinite((*at)[3].z));
+                REQUIRE(glm::length(glm::vec3((*at)[0])) == Catch::Approx(1).margin(.01));
+            }
+        }
+    }
 }

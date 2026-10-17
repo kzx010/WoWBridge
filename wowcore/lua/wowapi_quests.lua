@@ -1,12 +1,12 @@
--- WoWBridge: her Skyrim quests in the client's Quest Log and quest watch (Quests.cpp). Loaded after the recorded
+-- WoWBridge: their Skyrim quests in the client's Quest Log and quest watch (Quests.cpp). Loaded after the recorded
 -- answers (wowapi_recorded.lua), whose empty quest log these replace.
 local WB = __WB
 local function fire(...) __WBFire(...) end
 
------------------------------------------------------------------------------------------------------- her quests
--- Her Skyrim quests in the client's Quest Log and quest watch (Quests.cpp): __WBQuests(list), each quest
+------------------------------------------------------------------------------------------------------ their quests
+-- Their Skyrim quests in the client's Quest Log and quest watch (Quests.cpp): __WBQuests(list), each quest
 -- { id, title, header, text, objectives = { { text, done, failed } }, failed }, grouped under its header (Skyrim's
--- kind of quest, as the client groups by zone) in the order given. Skyrim's quests have no level: hers is used (the
+-- kind of quest, as the client groups by zone) in the order given. Skyrim's quests have no level: theirs is used (the
 -- client's yellow). The log's selection, collapsed headers and watches are the interface's, kept by quest id.
 WB.quests, WB.questEntries, WB.questCollapsed, WB.questWatched = {}, {}, {}, {}
 local function questEntries()
@@ -104,7 +104,7 @@ function GetQuestLogRewardSpell() return nil, nil, nil end
 function GetNumQuestLogRewards() return 0 end
 function GetNumQuestLogChoices() return 0 end
 function GetQuestLogGroupNum() return 0 end
-function GetQuestGreenRange() return 12 end   -- the client's answer at her level
+function GetQuestGreenRange() return 12 end   -- the client's answer at their level
 function GetAbandonQuestName() local q = questAt() return q and q.title end
 function SetAbandonQuest() end
 function AbandonQuest() end   -- Skyrim's quests cannot be abandoned: the log's Abandon button is disabled for them

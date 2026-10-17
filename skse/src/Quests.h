@@ -1,6 +1,6 @@
 #pragma once
 
-// Her Skyrim quests in the client's Quest Log and quest watch: the quests Skyrim's journal shows (running, with an
+// Their Skyrim quests in the client's Quest Log and quest watch: the quests Skyrim's journal shows (running, with an
 // objective displayed), grouped by Skyrim's kind of quest, their journal text and objectives; a new quest, a
 // completed objective, a completed or failed quest told as the client tells them. Main thread.
 namespace Quests

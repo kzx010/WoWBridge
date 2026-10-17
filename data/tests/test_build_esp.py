@@ -1,6 +1,7 @@
 """Read-back checks against the real Skyrim master and client spell descriptions."""
 import copy
 import json
+import re
 import struct
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ class BuildESPTests(unittest.TestCase):
         cls.dbc = B.REPO / 'build/dbc/DBFilesClient/Spell.dbc'
         B.build(cls.catalog, B.MASTER, cls.dbc, cls.forms, cls.root)
         cls.path = cls.root / 'esp/WoWBridge.esp'
-        cls.groups = esm.read(cls.path, {'ARMO', 'WEAP', 'ENCH', 'SPEL', 'MGEF', 'COBJ'})
+        cls.groups = esm.read(cls.path, {'ARMO', 'WEAP', 'ENCH', 'SPEL', 'MGEF', 'COBJ', 'BOOK', 'LVLI', 'GLOB'})
         cls.records = {r.form: r for rs in cls.groups.values() for r in rs}
         cls.gear = json.loads((cls.root / 'gear.json').read_text())
 
@@ -70,8 +71,110 @@ class BuildESPTests(unittest.TestCase):
                     self.assertNotEqual(len(r.get(field)), 4)
             if r.type != 'COBJ':
                 self.assertIsNone(r.get('CTDA'))  # includes no level gates inherited from templates
-            if r.type == 'ARMO':
-                self.assertIsNone(r.get('MODL'))
+
+    def test_books_and_mount_items_are_plain_skyrim_books_with_client_rows(self):
+        learn = json.loads(B.LEARNABLES.read_text())
+        books, mounts = self.gear['books'], self.gear['mounts']
+        self.assertEqual((len(books), len(mounts)),
+                         (len(learn['books']) + len(learn['class_books']['paladin']), len(learn['mounts'])))
+        self.assertEqual(len(self.groups['BOOK']), len(books) + len(mounts))
+        for row in list(books.values()) + list(mounts.values()):
+            r = self.records[0x01000000 | row['form']]
+            self.assertEqual((r.type, row['kind']), ('BOOK', 'BOOK'))
+            self.assertEqual(r.get('FULL'), esm.zstring(row['name']))
+            flags, _, _, teaches, value, _ = struct.unpack('<BBHIIf', r.get('DATA'))
+            self.assertEqual((flags, teaches), (0, 0xFFFFFFFF))   # reading teaches no Skyrim spell or skill itself
+            self.assertEqual(value, row['skyrim']['value'])
+            self.assertIsNone(r.get('CNAM'))
+            self.assertEqual(row['wow']['RequiredLevel'], row['skyrim']['level'])
+        by_spell = {b['teaches']['spell']: b for b in books.values()}
+        values = {spell: b['skyrim']['value'] for spell, b in by_spell.items()}
+        # Vanilla tome values by the skill a rank asks: Moonfire 1 (20), Starfire 1 (43), Moonfire 7 (72), Wrath 8 (92).
+        self.assertEqual((values[8921], values[2912], values[8929], values[9912], values[25297]), (50, 300, 650, 1300, 1300))
+        moonfire, touch = by_spell[8921], by_spell[25297]
+        self.assertEqual((moonfire['skyrim']['level'], touch['skyrim']['level'], by_spell[9912]['skyrim']['level']), (1, 36, 31))
+        self.assertEqual(touch['wow']['requiredspell'], 9889)   # Healing Touch (Rank 10) first
+        self.assertEqual(moonfire['wow']['requiredspell'], 0)
+        self.assertEqual(touch['teaches'], {'spell': 25297, 'previous': 9889, 'text': 'Teaches Healing Touch (Rank 11).'})
+        self.assertEqual(touch['wow']['spellid_1'], 0)   # the Use: line is the teaching text
+        self.assertEqual(self.records[0x01000000 | touch['form']].get('DESC'),
+                         esm.zstring('Book of Healing Touch XI\n\nUse: Teaches Healing Touch (Rank 11).'))
+        saber = mounts['18766']
+        self.assertEqual(saber['teaches'], {'mount': 'swift_frostsaber', 'spell': 23221})
+        self.assertEqual((saber['wow']['RequiredLevel'], saber['wow']['RequiredSkill'], saber['wow']['AllowableRace']), (30, 0, -1))
+        self.assertEqual(saber['wow']['spellid_1'], 23221)   # its 1.12 Use: line
+        self.assertEqual(saber['skyrim']['value'], 2000)
+        self.assertEqual((mounts['25531']['skyrim'], mounts['25531']['icon']),
+                         ({'level': 46, 'value': 6000}, 'Interface\\Icons\\Ability_Hunter_Pet_Bat'))
+        self.assertNotIn('icon', saber)
+
+    def test_leveled_lists_reach_only_treasure_and_vendors(self):
+        lists = {r.edid: r for r in self.groups['LVLI']}
+        self.assertEqual(set(lists), {'WoWSpellBooks', 'WoWSpellBooksDestruction', 'WoWSpellBooksRestoration',
+                                      'WoWSpellBooksAlteration', 'WoWMountItemsStables', 'WoWMountItemsCaravan',
+                                      'WoWPaladinBooks', 'WoWPaladinBooksRestoration'})
+        entries = lambda r: [struct.unpack('<HHIHH', d) for d in r.all('LVLO')]
+        paladin = lambda b: b['wow']['AllowableClass'] & 1 << 1 and not b['wow']['AllowableClass'] & 1 << 10
+        books = {0x01000000 | b['form']: b for b in self.gear['books'].values() if not paladin(b)}
+        librams = {0x01000000 | b['form']: b for b in self.gear['books'].values() if paladin(b)}
+        self.assertEqual(len(librams), 142)
+        self.assertEqual({e[2] for e in entries(lists['WoWPaladinBooks'])}, set(librams))
+        # Each class's lists roll only for that class: a chance-none global the plugin sets (0 hers, 100 others').
+        globals_ = {r.edid: r for r in self.groups['GLOB']}
+        druid, pal = (0x01000000 | globals_[e].form & 0xFFFFFF for e in ('WoWBridgeDruidBooksNone', 'WoWBridgePaladinBooksNone'))
+        self.assertEqual(self.gear['class_book_globals'], {'11': druid, '2': pal})
+        self.assertEqual((struct.unpack('<f', globals_['WoWBridgeDruidBooksNone'].get('FLTV'))[0],
+                          struct.unpack('<f', globals_['WoWBridgePaladinBooksNone'].get('FLTV'))[0]), (0.0, 100.0))
+        for edid, gate in (('WoWSpellBooks', druid), ('WoWSpellBooksRestoration', druid), ('WoWPaladinBooks', pal),
+                           ('WoWPaladinBooksRestoration', pal), ('WoWMountItemsStables', None)):
+            self.assertEqual(lists[edid].get('LVLG'), None if gate is None else struct.pack('<I', gate))
+        mounts = {0x01000000 | m['form']: m for m in self.gear['mounts'].values()}
+        everything = entries(lists['WoWSpellBooks'])
+        self.assertEqual({e[2] for e in everything}, set(books))
+        for level, _, form, count, _ in everything:
+            self.assertEqual((level, count), (books[form]['skyrim']['level'], 1))
+        self.assertEqual(lists['WoWSpellBooks'].get('LVLF'), b'\x03')
+        self.assertEqual(lists['WoWSpellBooks'].get('LLCT'), bytes([len(books)]))
+        restoration = {e[2] for e in entries(lists['WoWSpellBooksRestoration'])}
+        self.assertIn(0x01000000 | self.gear['books']['21294']['form'], restoration)
+        self.assertEqual(lists['WoWMountItemsStables'].get('LVLF'), b'\x05')   # every mount she is old enough for
+        stables = entries(lists['WoWMountItemsStables'])
+        self.assertEqual({e[2] for e in stables}, set(mounts))
+        self.assertEqual(sorted({e[0] for e in stables}), [30, 46])
+        # Targets: lists and vendor chests that no NPC inventory, death item or outfit reaches.
+        master = esm.read(B.MASTER, {'LVLI', 'CONT', 'NPC_', 'OTFT', 'FACT'})
+        users = {}
+        for r in master['LVLI']:
+            for d in r.all('LVLO'):
+                users.setdefault(struct.unpack_from('<I', d, 4)[0], set()).add(r.form)
+        for r in master['NPC_']:
+            for d in r.all('CNTO') + r.all('INAM'):
+                users.setdefault(struct.unpack_from('<I', d)[0], set()).add('npc')
+        for r in master['OTFT']:
+            for d in r.all('INAM'):
+                for n in range(0, len(d), 4):
+                    users.setdefault(struct.unpack_from('<I', d, n)[0], set()).add('npc')
+        for r in master['CONT']:
+            for d in r.all('CNTO'):
+                users.setdefault(struct.unpack_from('<I', d)[0], set()).add(('cont', r.form))
+
+        def reaches_npc(form, seen=()):
+            return any(u == 'npc' or isinstance(u, int) and u not in seen and reaches_npc(u, seen + (form,))
+                       for u in users.get(form, ()))
+        factions = {r.form: r for r in master['FACT']}
+        targets = {d['name']: d for d in self.gear['distribution']}
+        self.assertEqual(set(targets), set(lists))
+        for d in targets.values():
+            self.assertEqual(self.records[0x01000000 | d['list']].edid, d['name'])
+            for target in d['lists']:
+                self.assertFalse(reaches_npc(target['form']), hex(target['form']))
+            for target in d['vendors']:
+                self.assertIsNotNone(factions[target['form']].get('VENC'), hex(target['form']))   # a merchant chest
+        self.assertTrue(reaches_npc(0x9E2B0))   # LItemSpellTomes00Alteration: mage bandits carry it
+        self.assertIsNone(factions[0xA3F21].get('VENC'))   # ServicesWindhelmStables: no chest to stock
+        self.assertEqual([t['form'] for t in targets['WoWSpellBooks']['lists']], [0x10FD8C, 0xA297A])
+        self.assertEqual([t['form'] for t in targets['WoWMountItemsStables']['vendors']], [0xA6C01])
+        self.assertEqual([t['form'] for t in targets['WoWMountItemsCaravan']['vendors']], [0x74351, 0x74352, 0x74354])
 
     def test_relic_world_models_keep_equipment_identity(self):
         native = next(r for r in esm.read(B.MASTER, {'MISC'})['MISC'] if r.edid == 'StatueDibellaGold')
@@ -86,11 +189,45 @@ class BuildESPTests(unittest.TestCase):
             self.assertIsNone(item.get('MODL'))  # no worn cuirass or statue armor addon
             self.assertEqual(self.gear['items'][str(entry)]['form'], self.original_forms[f'item:{entry}'])
 
+    def test_worn_looks_fill_only_the_items_own_slots(self):
+        # As the Armory's: her armour has a Skyrim look (data/build_esp.py look), its world model and, for an NPC (a
+        # follower) wearing it, its addons over the item's own slots only. Helms, chests and robes, gloves, boots and the
+        # shield are seen; shoulders, belts, legs and bracers (whose look is a cuirass's or gauntlets') and relics are not.
+        templates, _ = B.read_master(B.MASTER, {'ARMO', 'WEAP', 'MISC'})
+        arma = {r.form: r for r in esm.read(B.MASTER, {'ARMA'})['ARMA']}
+        biped = lambda r: struct.unpack_from('<I', r.get('BOD2') or r.get('BODT'))[0]
+        curated = B.reviewed_looks()
+        seen = {}
+        for entry, item in self.catalog['items'].items():
+            r = self.item(entry)
+            if r.type != 'ARMO':
+                continue
+            look = B.look(item, self.gear['items'][entry]['skyrim'], templates, curated)
+            for d in r.all('MODL'):
+                form = struct.unpack('<I', d)[0]
+                self.assertEqual(form >> 24, 0, entry)   # Skyrim.esm's
+                self.assertIn(form, arma, (entry, hex(form)))
+                self.assertTrue(biped(arma[form]) & biped(r) or (biped(r) & B.HEAD_SLOTS and biped(arma[form]) & B.CIRCLET),
+                                (entry, hex(form)))   # a helm with a circlet look wears the circlet
+                self.assertIn(d, look.all('MODL'), entry)
+            if look is not None:
+                self.assertEqual((r.get('MOD2'), r.get('OBND')), (look.get('MOD2'), look.get('OBND')), entry)
+            seen.setdefault(item['InventoryType'], set()).add(bool(r.all('MODL')))
+        self.assertEqual(seen, {**{slot: {True} for slot in (1, 5, 20, 10, 8, 14)}, **{slot: {False} for slot in (3, 6, 7, 9, 28)}})
+        # Pauldrons of Might look like a cuirass on the ground, and wear none of it over the Breastplate of Might.
+        pauldrons = B.look(self.catalog['items']['16868'], self.gear['items']['16868']['skyrim'], templates, curated)
+        self.assertTrue(pauldrons.edid.endswith(('Cuirass', 'CuirassA')) and pauldrons.all('MODL'), pauldrons.edid)
+        self.assertEqual(self.item(16868).all('MODL'), [])
+        self.assertTrue(self.item(16865).all('MODL'))
+
     def test_stormrage(self):
         r = self.item(16897)
         self.assertEqual(r.type, 'ARMO')
         self.assertEqual(struct.unpack('<II', r.get('BOD2')), (1 << 2, 0))
-        self.assertEqual(struct.unpack('<I', r.get('DNAM'))[0], round(225 / 8) * 100)
+        # ItemLevel 76 is Skyrim level 48: a Dragonscale Cuirass (41), epic (x1.1).
+        self.assertEqual({k: self.gear['items']['16897']['skyrim'][k] for k in ('level', 'tier', 'armor')},
+                         {'level': 48, 'tier': 'Dragonscale', 'armor': round(41 * 1.1)})
+        self.assertEqual(struct.unpack('<I', r.get('DNAM'))[0], round(41 * 1.1) * 100)
         self.assertEqual(struct.unpack('<If', r.get('DATA'))[1], 6)
         keywords = struct.unpack('<' + 'I' * (len(r.get('KWDA')) // 4), r.get('KWDA'))
         self.assertIn(0x6BBD3, keywords)
@@ -109,9 +246,13 @@ class BuildESPTests(unittest.TestCase):
     def test_staff(self):
         r = self.item(873)
         self.assertEqual(r.type, 'WEAP')
-        self.assertEqual(struct.unpack('<IfH', r.get('DATA'))[2], round(149.5 * .25))
+        # ItemLevel 40 is Skyrim level 21: an Elven Warhammer's 23 damage at speed .6, swung at 2.6/3.7, epic.
+        damage = round(23 * .6 / (2.6 / 3.7) * 1.1)
+        self.assertEqual(self.gear['items']['873']['skyrim'], {'level': 21, 'tier': 'Elven', 'damage': damage,
+                                                               'value': round(565 * 1.1)})
+        self.assertEqual(struct.unpack('<IfH', r.get('DATA')), (round(565 * 1.1), 24.0, damage))
         self.assertAlmostEqual(struct.unpack_from('<f', r.get('DNAM'), 4)[0], 2.6 / 3.7, places=6)
-        self.assertEqual(r.get('MODL'), esm.zstring(r'Weapons\Staff01\Staff01.nif'))
+        self.assertEqual(r.get('MODL'), esm.zstring(r'Weapons\Iron\WarHammer.nif'))
         self.assertIsNone(r.get('EITM'))
         self.assertNotIn(struct.pack('<I', 0xC27BD), r.get('KWDA'))
         ability = self.records[0x01000000 | self.gear['items']['873']['ability']]
@@ -161,21 +302,30 @@ class BuildESPTests(unittest.TestCase):
         for fid, value in {0x7A0F4: 20, 0x7A0FF: 20, 0x7A106: 20, 0x49507: 15,
                            0x49504: 10, 0x493AA: 15, 0x7A0FD: 10}.items():
             self.assertEqual(e[fid], value)
-        for subclass, kind, divisor in ((1, 0, 15), (2, 0, 8), (3, 1, 12), (4, 1, 30), (6, 1, 30), (8, 0, 15)):
+        ratings = {}
+        for subclass, kind in ((1, 0), (2, 0), (3, 1), (4, 1), (6, 1), (8, 0)):
             base['subclass'] = subclass
-            r = B.armor(base, templates, 0xFFF)
+            stats = B.skyrim_stats(base, templates)
+            r = B.armor(base, templates, 0xFFF, stats)
             self.assertEqual(struct.unpack('<II', r.get('BOD2'))[1], kind)
-            self.assertEqual(struct.unpack('<I', r.get('DNAM'))[0], round(225 / divisor) * 100)
+            self.assertEqual(struct.unpack('<I', r.get('DNAM'))[0], stats['armor'] * 100)
+            ratings[subclass] = stats['armor']
+        self.assertEqual(ratings[8], 0)   # an idol is no armour
+        self.assertGreaterEqual(ratings[4], ratings[3])
+        self.assertGreaterEqual(ratings[3], ratings[2])
+        self.assertGreaterEqual(ratings[2], ratings[1])
         for inv, slot in B.SLOTS.items():
             base['InventoryType'] = inv
-            r = B.armor(base, templates, 0xFFF)
+            r = B.armor(base, templates, 0xFFF, B.skyrim_stats(base, templates))
             self.assertEqual(struct.unpack('<II', r.get('BOD2'))[0], 0b11 if slot == 30 else 1 << (slot - 30))   # a helm: head and hair
         base.update({'class': 2, 'delay': 2600, 'dmg_min1': 40, 'dmg_max1': 80})
         for subclass in B.WEAPONS:
             base['subclass'] = subclass
-            r = B.weapon(base, templates, 0xFFF)
-            self.assertEqual(struct.unpack('<IfH', r.get('DATA'))[2], 15)
+            stats = B.skyrim_stats(base, templates)
+            r = B.weapon(base, templates, 0xFFF, stats)
+            self.assertEqual(struct.unpack('<IfH', r.get('DATA'))[2], stats['damage'])
             self.assertEqual(struct.unpack_from('<f', r.get('DNAM'), 4)[0], 1)
+            self.assertEqual(struct.unpack_from('<H', r.get('CRDT'))[0], round(stats['damage'] / 2))
 
     def test_every_armor_trains_a_skill_and_has_matching_material(self):
         for entry, item in self.catalog['items'].items():
@@ -206,16 +356,19 @@ class BuildESPTests(unittest.TestCase):
         for entry in (19019, 17182, 19364, 18842, 18713, 18715, 18608, 18609, 18816, 18348):
             r, item = self.item(entry), self.catalog['items'][str(entry)]
             self.assertEqual(r.type, 'WEAP')
-            self.assertEqual(struct.unpack('<IfH', r.get('DATA'))[2], round((item['dmg_min1'] + item['dmg_max1']) / 8))
+            self.assertEqual(struct.unpack('<IfH', r.get('DATA'))[2], self.gear['items'][str(entry)]['skyrim']['damage'])
             self.assertAlmostEqual(struct.unpack_from('<f', r.get('DNAM'), 4)[0], 2600 / item['delay'], places=6)
 
     def test_material_policy_boundaries_and_enchanter_slot_restrictions(self):
-        item = {'class': 2, 'subclass': 7, 'Material': 1, 'ItemLevel': 59}
-        self.assertEqual(B.crafting_material(item), ('Steel', 'IngotSteel', 'SteelSmithing'))
+        # A metal weapon tempers with its tier's alloy: ItemLevel 59 is Skyrim level 35 (Glass), 60 is 36 (Ebony).
+        item = {'class': 2, 'subclass': 7, 'Material': 1, 'ItemLevel': 5}
+        self.assertEqual(B.crafting_material(item), ('Iron', 'IngotIron', None))
+        item['ItemLevel'] = 59
+        self.assertEqual(B.crafting_material(item), ('Glass', 'IngotMalachite', 'GlassSmithing'))
         item['ItemLevel'] = 60
-        self.assertEqual(B.crafting_material(item), ('Dwarven', 'IngotDwarven', 'DwarvenSmithing'))
-        item['ItemLevel'] = 70
         self.assertEqual(B.crafting_material(item), ('Ebony', 'IngotEbony', 'EbonySmithing'))
+        item['ItemLevel'] = 76
+        self.assertEqual(B.crafting_material(item), ('Daedric', 'IngotEbony', 'DaedricSmithing'))
         item['Material'] = 2
         self.assertEqual(B.crafting_material(item), ('Wood', 'LeatherStrips', None))
         item.update({'class': 4, 'subclass': 4, 'ItemLevel': 60})
@@ -264,6 +417,101 @@ class BuildESPTests(unittest.TestCase):
             if item['class'] == 2:
                 self.assertIn(B.u32(master['WeapMaterial' + material].form), self.item(entry).get('KWDA'))
 
+    def test_every_item_is_as_good_or_a_little_better_than_its_tier(self):
+        # The best vanilla piece of its slot by its Skyrim level, read from the records here; shoulders, waist, legs,
+        # wrists and back share 12.5% of the four-piece total by WoW's ratios (Tier 1 plate: 562/749 shoulders ...
+        # 328/749 wrists; a cloak .6), which comes to 3.225 chests.
+        master = {r.edid: r for rs in esm.read(B.MASTER, {'ARMO', 'WEAP'}).values() for r in rs}
+        shares = {slot: share / 16 / 3.225 * .125 for slot, share in ((3, 12), (6, 9), (7, 14), (9, 7))}
+        parts = {1: 'Helmet', 5: 'Cuirass', 20: 'Cuirass', 10: 'Gauntlets', 8: 'Boots', 14: 'Shield'}
+        classes = {1: .6, 2: 1, 3: .9, 4: 1, 6: 1}
+
+        def rating(level, tiers, part):
+            return max(struct.unpack('<I', r.get('DNAM'))[0] / 100 for at, m in tiers if at <= level
+                       for r in [master.get(f'Armor{m}{part}') or master.get(f'Armor{m}{part}A')] if r)
+        checked = 0
+        for entry, item in self.catalog['items'].items():
+            r, skyrim = self.item(entry), self.gear['items'][entry]['skyrim']
+            level = skyrim['level']
+            self.assertEqual(level, B.skyrim_level(item['ItemLevel']))
+            if item['class'] == 2:
+                kind = B.WEAPONS[item['subclass']]
+                rate = max(struct.unpack('<IfH', w.get('DATA'))[2] * struct.unpack_from('<f', w.get('DNAM'), 4)[0]
+                           for at, m in B.ARMS if at <= level
+                           for w in [master.get(m + kind.removeprefix('Iron').removeprefix('Hunting')) or
+                                     (master[kind] if m == 'Iron' else None)] if w)
+                expected, actual = rate * item['delay'] / 2600, struct.unpack('<IfH', r.get('DATA'))[2]
+                self.assertEqual(actual, skyrim['damage'], entry)
+            elif item['armor']:
+                tiers = B.HEAVY if item['subclass'] in (3, 4, 6) else B.LIGHT
+                slot = item['InventoryType']
+                base = rating(level, tiers, parts[slot]) if slot in parts else \
+                    sum(rating(level, tiers, part) for part in ('Cuirass', 'Helmet', 'Gauntlets', 'Boots')) * shares[slot]
+                expected, actual = base * classes[item['subclass']], struct.unpack('<I', r.get('DNAM'))[0] / 100
+                self.assertEqual(actual, skyrim['armor'], entry)
+            else:
+                self.assertEqual(skyrim['armor'], 0)   # idols
+                continue
+            self.assertGreaterEqual(actual, expected - .5, entry)          # whole-number ratings and damage
+            self.assertLessEqual(actual, expected * 1.11 + .5, entry)
+            checked += 1
+        self.assertEqual(checked, 93)
+        # A whole WoW set is a little strong, not overwhelmingly so: 1.10-1.25x the Skyrim set of its tier (class
+        # factor applied), these epic sets near the top.
+        for key, group in self.gear['sets'].items():
+            item = self.catalog['items'][str(group['entries'][0])]
+            tiers = B.HEAVY if item['subclass'] in (3, 4) else B.LIGHT
+            level = self.gear['items'][str(group['entries'][0])]['skyrim']['level']
+            skyrim = sum(rating(level, tiers, part) for part in ('Cuirass', 'Helmet', 'Gauntlets', 'Boots')) * classes[item['subclass']]
+            ratio = sum(self.gear['items'][str(e)]['skyrim']['armor'] for e in group['entries']) / skyrim
+            self.assertTrue(1.18 <= ratio <= 1.25, (key, ratio))
+
+    def test_tiers_are_vanilla_leveled_list_levels(self):
+        master = esm.read(B.MASTER, {'ARMO', 'WEAP', 'LVLI'})
+        names = {r.form: r.edid for rs in master.values() for r in rs}
+        lists = {r.edid.lower(): r for r in master['LVLI']}
+
+        def entries(*edids):   # (level, item), a sublist by its first item
+            out = set()
+            for edid in edids:
+                for d in lists[edid.lower()].all('LVLO'):
+                    level, _, form = struct.unpack_from('<HHI', d)
+                    while names[form].lower() in lists:
+                        form = struct.unpack_from('<HHI', lists[names[form].lower()].get('LVLO'))[2]
+                    out.add((level, names[form]))
+            return out
+        known = {n.lower() for n in names.values()}
+        for tiers, weight in ((B.HEAVY, 'Heavy'), (B.LIGHT, 'Light')):
+            for part in ('Cuirass', 'Helmet', 'Gauntlets', 'Boots', 'Shield'):
+                given = entries(f'LItemArmor{part}{weight}', f'LItemArmor{part}{weight}Special')
+                for at, m in tiers[1:]:   # level 1 mixes Iron, Banded Iron and Steel; Hide and Studded
+                    piece = f'armor{m}{part}'.lower()
+                    if {piece, piece + 'a'} & known:   # Steel's are A/B variants
+                        self.assertTrue(any(level == at and item.lower().startswith(piece) for level, item in given), (m, part))
+        for kind in ('WarAxe', 'BattleAxe', 'Mace', 'Warhammer', 'GreatSword', 'Sword', 'Dagger', 'Bow'):
+            given = {(level, item.lower()) for level, item in entries(f'LItemWeapon{kind}', f'LItemWeapon{kind}Special')}
+            for at, m in B.ARMS[1:]:   # Steel at 2 from the plain lists, the rest as the Special ones give them
+                if (m + kind).lower() in known:
+                    self.assertIn((at, (m + kind).lower()), given, (m, kind))
+        tiers = {}
+        for d in lists['litemencharmorheavycuirass'].all('LVLO'):
+            level, _, form = struct.unpack_from('<HHI', d)
+            tiers.setdefault(int(re.search(r'Cuirass0(\d)', names[form], re.I)[1]), level)
+        self.assertEqual(tiers, {n: at for at, n in B.ENCHANTMENTS})
+
+    def test_native_bonuses_stay_within_vanilla_enchantments(self):
+        caps = B.enchantment_caps({r.edid: r for r in esm.read(B.MASTER, {'ENCH'})['ENCH']})
+        self.assertEqual(sorted(caps[0x49504].items()), [(1, 20), (2, 30), (3, 40), (4, 50), (5, 60), (6, 70)])
+        checked = 0
+        for entry, row in self.gear['items'].items():
+            tier = max(n for at, n in B.ENCHANTMENTS if at <= row['skyrim']['level'])
+            for effect, magnitude in self.effects(self.records[0x01000000 | row['ability']]).items() if 'ability' in row else ():
+                if effect in caps:
+                    allowed = caps[effect][max((n for n in caps[effect] if n <= tier), default=min(caps[effect]))]
+                    self.assertLessEqual(magnitude, allowed + 1e-4, (entry, hex(effect)))
+                    checked += 1
+        self.assertGreater(checked, 200)
+
     def test_id_budget(self):
         path = self.root / 'full.json'
         path.write_text(json.dumps({'reserved': 0xFFF}))
@@ -273,7 +521,6 @@ class BuildESPTests(unittest.TestCase):
     def test_shared_conversion_tables_and_vanilla_armor_effects(self):
         self.assertIs(B.STAT, skyrim_effects.STAT)
         self.assertIs(B.RESISTS, skyrim_effects.RESISTS)
-        self.assertIs(B.ARMOR_DIVISORS, skyrim_effects.ARMOR_DIVISORS)
         master = {r.form: r for r in esm.read(B.MASTER, {'MGEF'})['MGEF']}
         for form, edid, detrimental in (
                 (skyrim_effects.ARMOR_BUFF, 'doomLordDamageEffect', False),
@@ -284,6 +531,84 @@ class BuildESPTests(unittest.TestCase):
             self.assertEqual(struct.unpack_from('<I', data, 64)[0], 0)  # Value Modifier
             self.assertEqual(struct.unpack_from('<i', data, 68)[0], 39)  # DamageResist
             self.assertEqual(bool(struct.unpack_from('<I', data)[0] & 4), detrimental)
+
+
+class TierConversionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.templates = {r.edid: r for rs in esm.read(B.MASTER, {'ARMO', 'WEAP', 'ENCH'}).values() for r in rs}
+
+    def test_item_levels_map_to_skyrim_levels(self):
+        for item_level, level in ((0, 1), (5, 1), (20, 8), (35, 18), (40, 21), (50, 27), (59, 35), (60, 36),
+                                  (66, 40), (71, 44), (76, 48), (80, 52), (92, 52)):
+            self.assertEqual(B.skyrim_level(item_level), level, item_level)
+
+    def test_classes_keep_their_order_and_everything_rises_with_tier(self):
+        for slot in (1, 3, 5, 6, 7, 8, 9, 10, 14, 16, 20):
+            last = None
+            for item_level in range(1, 90, 2):
+                stats = {sub: B.skyrim_stats({'class': 4, 'subclass': sub, 'InventoryType': slot, 'armor': 100,
+                                              'Quality': 2, 'ItemLevel': item_level, 'SellPrice': 100}, self.templates)
+                         for sub in (1, 2, 3, 4)}
+                ratings = [stats[sub]['armor'] for sub in (4, 3, 2, 1)]   # plate >= mail >= leather >= cloth
+                self.assertEqual(ratings, sorted(ratings, reverse=True), (slot, item_level))
+                for sub, now in stats.items() if last else ():
+                    self.assertGreaterEqual(now['armor'], last[sub]['armor'], (slot, sub, item_level))
+                    self.assertGreaterEqual(now['value'], last[sub]['value'], (slot, sub, item_level))
+                last = stats
+        for subclass in B.WEAPONS:
+            last = None
+            for item_level in range(1, 90, 2):
+                now = B.skyrim_stats({'class': 2, 'subclass': subclass, 'InventoryType': 17, 'delay': 2600, 'Quality': 2,
+                                      'ItemLevel': item_level, 'SellPrice': 100}, self.templates)
+                if last:
+                    self.assertGreaterEqual(now['damage'], last['damage'], (subclass, item_level))
+                    self.assertGreaterEqual(now['value'], last['value'], (subclass, item_level))
+                last = now
+        # Quality and the item's strength in its band: grey .85 .. legendary 1.11, never above 1.11.
+        chest = {'class': 4, 'subclass': 4, 'InventoryType': 5, 'armor': 100, 'ItemLevel': 80, 'SellPrice': 1}
+        self.assertEqual([B.skyrim_stats({**chest, 'Quality': q}, self.templates)['armor'] for q in range(6)],
+                         [round(49 * f) for f in (.85, .925, 1, 1.05, 1.1, 1.11)])
+        self.assertEqual(B.skyrim_stats({**chest, 'Quality': 4}, self.templates, 1.1)['armor'], round(49 * 1.11))
+        self.assertEqual(B.skyrim_stats({**chest, 'SellPrice': 0}, self.templates)['value'], 1)   # unsellable in WoW
+
+    def test_a_full_outfit_is_a_little_strong_not_overwhelmingly(self):
+        # Eight WoW pieces, and with a cloak: green near 1.10x the Skyrim set of its tier, epic/legendary near 1.25x.
+        def outfit(sub, quality, item_level, slots):
+            return sum(B.skyrim_stats({'class': 4, 'subclass': sub, 'InventoryType': slot, 'armor': 100, 'Quality': quality,
+                                       'ItemLevel': item_level, 'SellPrice': 1}, self.templates)['armor'] for slot in slots)
+        eight = (1, 3, 5, 6, 7, 8, 9, 10)
+        for sub, item_level in ((4, 80), (4, 66), (3, 76), (2, 76), (2, 66)):
+            skyrim = outfit(sub, 2, item_level, (1, 5, 8, 10)) / B.QUALITY_FACTORS[2]
+            for quality, low, high in ((2, 1.08, 1.15), (3, 1.13, 1.2), (4, 1.18, 1.25), (5, 1.19, 1.26)):
+                for slots in (eight, eight + (16,)):
+                    ratio = outfit(sub, quality, item_level, slots) / skyrim
+                    self.assertTrue(low <= ratio <= high, (sub, item_level, quality, len(slots), ratio))
+
+    def test_variation_within_a_band_is_capped(self):
+        # Per chest share: 200, 200 (a 162.5 head), 274 (a 120 wrist), 170, 190; another item level is its own band.
+        band = {'class': 4, 'subclass': 2, 'Quality': 4, 'ItemLevel': 66}
+        items = {'1': {**band, 'InventoryType': 5, 'armor': 200}, '2': {**band, 'InventoryType': 1, 'armor': 162.5},
+                 '3': {**band, 'InventoryType': 9, 'armor': 120}, '4': {**band, 'InventoryType': 20, 'armor': 170},
+                 '5': {**band, 'InventoryType': 5, 'armor': 190}, '6': {**band, 'ItemLevel': 70, 'InventoryType': 5, 'armor': 1}}
+        v = B.variations(items)
+        self.assertEqual([v[k] for k in '12346'], [1, 1, 1.1, .9, 1])
+        self.assertAlmostEqual(v['5'], .95)
+
+    def test_the_services_weapon_skill_scaling_is_skyrims(self):
+        from service.skyrim_balance import DAMAGE_PC_SKILL_MIN, DAMAGE_PC_SKILL_MAX
+        gmst = {r.edid: struct.unpack('<f', r.get('DATA')[:4])[0] for r in esm.read(B.MASTER, {'GMST'})['GMST']
+                if r.edid.startswith('fDamagePCSkill')}
+        self.assertEqual(gmst, {'fDamagePCSkillMax': DAMAGE_PC_SKILL_MAX})   # Min keeps the engine's default
+        self.assertEqual(DAMAGE_PC_SKILL_MIN, 1.0)
+
+    def test_native_bonuses_are_capped_at_vanilla_enchantments(self):
+        caps = B.enchantment_caps(self.templates)
+        # Level 8 has vanilla's 03 enchantments (Fortify Magicka 40; Magicka Rate starts at 03, 40%); 52 has 06.
+        self.assertEqual(B.capped([(0x49504, 150), (0x7A0FD, 100), (0x49504, 12), (0xE5F55, 500)], 8, caps),
+                         [(0x49504, 40), (0x7A0FD, 40), (0x49504, 12), (0xE5F55, 500)])
+        self.assertEqual(B.capped([(0x49504, 150), (0x7A0FD, 100)], 1, caps), [(0x49504, 20), (0x7A0FD, 40)])
+        self.assertEqual(B.capped([(0x49504, 150), (0x7A0FD, 150)], 52, caps), [(0x49504, 70), (0x7A0FD, 100)])
 
 
 class GearAdaptationTests(unittest.TestCase):
@@ -304,8 +629,11 @@ class GearAdaptationTests(unittest.TestCase):
 
     def test_client_item_use_export_is_real_and_has_shared_category_cooldown(self):
         gear = json.loads((B.REPO / 'build/gear.json').read_text())['items']
-        self.assertEqual(gear['18608']['use'], {'spell': 23041, 'entry': 18609, 'cooldown_ms': 1800000})
-        self.assertEqual(gear['18609']['use'], {'spell': 23042, 'entry': 18608, 'cooldown_ms': 1800000})
+        # The staves share category 1031's 30 minutes (CMaNGOS Player::AddCooldown); cooldown_ms stays the longest timer.
+        for item, spell, other in (('18608', 23041, 18609), ('18609', 23042, 18608)):
+            use = gear[item]['use']
+            self.assertEqual((use['spell'], use['entry'], use['cooldown_ms']), (spell, other, 1800000))
+            self.assertEqual((use['category'], use['category_cooldown_ms']), (1031, 1800000))
 
 
 if __name__ == '__main__':

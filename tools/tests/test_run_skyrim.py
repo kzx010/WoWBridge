@@ -19,6 +19,27 @@ with patch.dict(sys.modules, {'inputdev': types.SimpleNamespace(focus_window=Moc
     spec.loader.exec_module(runner)
 
 
+class ConfigurationRestore(unittest.TestCase):
+    def test_failure_before_launch_restores_game_configuration(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ini, prefs, logs = root / 'WoWBridge.ini', root / 'SkyrimPrefs.ini', root / 'SKSE'
+            ini.write_text('[Test]\nautorun=0\n')
+            prefs.write_text('[General]\nbAlwaysActive=0\n')
+            logs.mkdir()
+            with patch.object(runner, 'INI', ini), patch.object(runner, 'PREFS', prefs), \
+                    patch.object(runner, 'SKSE_LOGS', logs), patch.object(runner, 'OUT', root / 'runs'), \
+                    patch.object(runner, 'game_running', return_value=False), patch.object(runner, 'Injector'), \
+                    patch.object(runner, 'stop_game') as stop, \
+                    patch.object(runner, 'start_service', side_effect=OSError('port check failed')), \
+                    patch.object(sys, 'argv', ['run_skyrim.py', '--autorun']):
+                with self.assertRaises(OSError):
+                    runner.main()
+            self.assertEqual(ini.read_text(), '[Test]\nautorun=0\n')
+            self.assertEqual(prefs.read_text(), '[General]\nbAlwaysActive=0\n')
+            stop.assert_called_once_with()
+
+
 class ServiceActions(unittest.TestCase):
     def test_shared_service_stop_fails_without_success_or_focus(self):
         log = []
@@ -189,3 +210,137 @@ else:
             with self.subTest(mode=mode):
                 result = self.run_wrapper(mode)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class RequiredSuite(unittest.TestCase):
+    def options(self, **overrides):
+        values = dict(rerun_failed=None, diagnostic=False, keep=False, snap=[], autorun=False,
+                      only='', timeout=240, until=r'selftest: suite (passed|failed)')
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def execute(self, options=None, failures=(), missing=(), raises=(), observe=lambda name: None):
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            def fake(a, directory):
+                calls.append((directory.name, a.only, a.keep))
+                observe(directory.name)
+                directory.mkdir()
+                if directory.name in raises:
+                    raise OSError('launch failed')
+                names = a.only.split(',') if a.only else ['ordinary_probe']
+                rows = [{'test': n, 'pass': directory.name not in failures, 't': i + 1, 'frames': (i + 1) * 20}
+                        for i, n in enumerate(names) if n not in missing]
+                (directory / 'WoWBridge.log').write_text('selftest: suite passed')
+                (directory / 'WoWBridge_test.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+                issues = runner.suite_failures(directory, a.only)
+                return dict(status='failed' if issues else 'passed', issues=issues,
+                            result='marker', run_dir=str(directory), elapsed=2)
+            with patch.object(runner, 'OUT', Path(td)), patch.object(runner, 'launch', side_effect=fake), \
+                    patch('builtins.print'):
+                code = runner.run_suite(options or self.options())
+            suite = next(Path(td).glob('suite-*'))
+            self.assertTrue((suite / 'summary.txt').exists())
+            return code, calls, json.loads((suite / 'summary.json').read_text())
+
+    def test_order_and_diagnostic_is_non_gating(self):
+        code, calls, summary = self.execute(self.options(diagnostic=True, keep=True), failures=['diagnostic'])
+        self.assertEqual(code, 0)
+        self.assertEqual([c[0] for c in calls], [s[0] for s in runner.REQUIRED_SUITE])
+        self.assertEqual([c[2] for c in calls], [False] * (len(runner.REQUIRED_SUITE) - 1) + [True])
+        self.assertEqual(summary['verdict'], 'passed')
+        self.assertFalse(summary['launches'][-1]['gating'])
+        self.assertEqual(len(summary['slowest_steps']), 10)
+        self.assertTrue(summary['under_30_fps'])
+        self.assertTrue(all(step['fps'] == 20 for step in summary['under_30_fps']))
+
+    def test_failure_and_exception_continue(self):
+        for kwargs in (dict(failures=['ordinary']), dict(raises=['ordinary']),
+                       dict(missing=['wow_prowl_miss'])):
+            with self.subTest(kwargs=kwargs):
+                code, calls, summary = self.execute(**kwargs)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(calls), len(runner.REQUIRED_SUITE) - 1)
+                self.assertEqual(summary['verdict'], 'failed')
+
+    def test_seed_failure_skips_verify_and_continues(self):
+        code, calls, summary = self.execute(failures=['cold-seed'])
+        self.assertEqual(code, 1)
+        names = [s[0] for s in runner.REQUIRED_SUITE[:-1]]
+        self.assertEqual([c[0] for c in calls], [n for n in names if n != 'cold-verify'])
+        self.assertEqual(summary['launches'][names.index('cold-verify')]['status'], 'not_run')
+
+    def test_rerun_selects_failed_steps_talents_missing_and_cold_pair(self):
+        source = {'launches': [
+            dict(name='ordinary', status='failed', only='', steps=[dict(test='bad', **{'pass': False}), dict(test='good', **{'pass': True})], failed_talents=[dict(step='tree')]),
+            dict(name='explicit-world', status='failed', only='wow_start_dialog', steps=[]),
+            dict(name='cold-verify', status='failed', only='wow_cold_persistence_verify', steps=[]),
+            dict(name='diagnostic', status='failed', steps=[]),
+        ]}
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / 'summary.json').write_text(json.dumps(source))
+            code, calls, summary = self.execute(self.options(rerun_failed=td))
+        self.assertEqual(code, 0)
+        self.assertEqual([(c[0], c[1]) for c in calls], [
+            ('ordinary', 'bad,tree'), ('explicit-world', 'wow_start_dialog'),
+            ('cold-seed', dict((n, o) for n, o, _ in runner.REQUIRED_SUITE)['cold-seed']), ('cold-verify', 'wow_cold_persistence_verify')])
+        self.assertTrue(summary['triage'])
+        self.assertEqual(summary['verdict'], 'triage_passed')
+
+    def test_compass_manifest_withheld_only_for_its_launch(self):
+        for raises in ([], ['compass-fallback']):
+            with self.subTest(raises=raises), tempfile.TemporaryDirectory() as game:
+                manifest = Path(game) / 'compass.json'
+                manifest.write_text('{}')
+                seen = {}
+                with patch.object(runner, 'WITHHELD', {'compass-fallback': manifest}):
+                    self.execute(raises=raises, observe=lambda name: seen.setdefault(name, manifest.exists()))
+                self.assertFalse(seen['compass-fallback'])
+                self.assertTrue(all(present for name, present in seen.items() if name != 'compass-fallback'))
+                self.assertTrue(manifest.exists())
+
+    def test_timing_frames_and_talent_details(self):
+        rows = [dict(test='first', **{'pass': True}, t=2, frames=120),
+                dict(test='slow', **{'pass': False}, t=5, frames=180, error='x' * 400, after_unrestored=['first']),
+                dict(event='talent_result', step='tree', talent='name', result={'pass': False, 'error': 'failure'}),
+                dict(test='old', **{'pass': True}, t=7),
+                dict(test='mixed', **{'pass': True}, t=9, frames=250)]
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / 'WoWBridge_test.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+            steps, talents = runner.step_evidence(Path(td))
+        self.assertEqual([s['duration'] for s in steps], [2, 3, 2, 2])
+        self.assertEqual([s['fps'] for s in steps], [None, 20, None, None])
+        self.assertEqual(len(steps[1]['error']), 300)
+        self.assertEqual(steps[1]['after_unrestored'], ['first'])
+        self.assertEqual(talents[0]['error'], 'failure')
+
+    def test_configuration_restores_each_launch_on_failure_and_sigterm(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ini, prefs, logs = root / 'ini', root / 'prefs', root / 'logs'
+            ini.write_text('[Test]\nautorun=0\n')
+            prefs.write_text('[General]\nbAlwaysActive=0\n')
+            logs.mkdir()
+            with patch.object(runner, 'INI', ini), patch.object(runner, 'PREFS', prefs), \
+                    patch.object(runner, 'SKSE_LOGS', logs), patch.object(runner, 'game_running', return_value=False), \
+                    patch.object(runner, 'Injector'), patch.object(runner, 'stop_game') as stop, \
+                    patch.object(runner.time, 'sleep'), patch.object(runner.signal, 'signal') as handler:
+                def fail():
+                    self.assertIn('autorun=1', ini.read_text())
+                    self.assertIn('bAlwaysActive=1', prefs.read_text())
+                    raise OSError('startup failed')
+                with patch.object(runner, 'start_service', side_effect=fail):
+                    for i in range(2):
+                        with self.assertRaises(OSError):
+                            runner.launch(self.options(autorun=True), root / str(i))
+                        self.assertEqual(ini.read_text(), '[Test]\nautorun=0\n')
+                        self.assertEqual(prefs.read_text(), '[General]\nbAlwaysActive=0\n')
+                def terminate():
+                    handler.call_args_list[-1].args[1]()
+                with patch.object(runner, 'start_service', side_effect=terminate):
+                    with self.assertRaises(SystemExit) as exc:
+                        runner.launch(self.options(autorun=True), root / 'term')
+                self.assertEqual(exc.exception.code, 143)
+                self.assertEqual(ini.read_text(), '[Test]\nautorun=0\n')
+                self.assertEqual(prefs.read_text(), '[General]\nbAlwaysActive=0\n')
+                self.assertEqual(stop.call_count, 3)

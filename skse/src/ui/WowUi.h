@@ -2,6 +2,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+namespace wowcore { struct MinimapFloorTriangle; }
 
 // The WoW 1.12 interface in Skyrim: wowcore's UiSession (the client's FrameXML over WoWBridge's API) drawn by the
 // UI pass, with WoW art and fonts read from the WoW client's own archives (Config::ClientData()).
@@ -40,6 +41,9 @@ namespace WowUi
 	// Main thread: the cursor the world under the pointer calls for ("ATTACK", "SPEAK", ... or "" for the default),
 	// shown unless the interface has set its own (SetCursor) or the pointer is over a WoW frame.
 	void SetWorldCursor(std::string a_name);
+	// Main thread: their interior's floor plan for the minimap (empty outdoors), applied before the next frame.
+	void SetMinimapFloor(std::vector<wowcore::MinimapFloorTriangle> a_floor);
+	std::size_t MinimapFloorSize();   // triangles in the last plan sent (SelfTest)
 	// Main thread -> interface: Lua run in order before the next interface frame (casting events, auras, the log).
 	void Run(std::string a_lua);
 
@@ -78,7 +82,8 @@ namespace WowUi
 		bool        resurrect = false; // explicit corpse selection; never auto-target the caster
 		bool        harmful = false;  // cast at an enemy
 		bool        ground = false;   // cast at a place
-		bool        self = false;     // on herself or around her, whoever is targeted (Barkskin, a form, Demoralizing Roar)
+		bool        self = false;     // on the player or around the player, whoever is targeted (Barkskin, a form, Demoralizing Roar)
+		float       rangeMin = 0;
 		float       rangeMax = 0;
 		float       speed = 0;        // a missile's yards a second
 		float       radius = 0;       // its area's, in yards (the widest of its effects')
@@ -94,9 +99,15 @@ namespace WowUi
 	SpellSounds   Sounds(std::uint32_t a_spell);
 	// A melee swing's sounds (WeaponSwingSounds2 / WeaponImpactSounds): 0 when there is none.
 	std::uint32_t SwingSound(std::uint32_t a_swingType, bool a_crit);
+	// A text emote by its token ("DANCE"): their lines alone and at a target, its animation, its kind (0 once, 1 a stand
+	// state, 2 a loop), the stand state, and their race and sex's voice. Nothing for an unknown token.
+	struct Emote { std::uint32_t anim = 0, specProc = 0, standState = 0, sound = 0; std::string alone, atTarget; };
+	std::optional<Emote> EmoteText(std::string_view a_token, std::uint32_t a_race, std::uint32_t a_sex);
 	std::uint32_t ImpactSound(std::uint32_t a_subclass, std::uint32_t a_parryType, std::uint32_t a_index, bool a_crit);
 	std::uint64_t PlaySound(std::uint32_t a_soundId, const RE::NiPoint3* a_at = nullptr);
-	// A melee blow's sounds by what strikes (docs/combat-world.md): a creature display (her form), a weapon subclass
+	// Interface sounds (PlaySound / PlaySoundFile) started so far: a SelfTest counter.
+	std::uint32_t InterfaceSounds();
+	// A melee blow's sounds by what strikes (docs/combat-world.md): a creature display (their form), a weapon subclass
 	// (parry type 0 wood, 1 metal) or bare hands; a_index: what it lands on (0 flesh, 1 chain, 2 plate, 4 wood shield, 5
 	// parried by metal).
 	struct MeleeSounds

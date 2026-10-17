@@ -84,6 +84,56 @@ def read(path: Path, types: set[str]) -> dict[str, list[Record]]:
     return out
 
 
+def exterior_land(path: Path, references: frozenset[str] = frozenset()):
+    """Yield (WRLD form, CELL form, record) from exterior CELL/LAND groups.
+
+    LAND lives in a cell's temporary children, not in a top-level LAND group.
+    Placed references of the requested types (e.g. REFR) come from any of a cell's
+    children, including the worldspace's persistent cell; exterior DATA positions are world units.
+    Skip unrelated record bodies; retain group labels for master remapping.
+    """
+    with path.open('rb') as source:
+        header = source.read(24)
+        source.seek(24 + struct.unpack_from('<I', header, 4)[0])
+
+        def walk(end, world=None, cell=None, temporary=False):
+            while source.tell() < end:
+                at = source.tell()
+                header = source.read(24)
+                if len(header) != 24:
+                    raise ValueError(f'truncated group/record in {path}')
+                size = struct.unpack_from('<I', header, 4)[0]
+                if header[:4] == b'GRUP':
+                    group = struct.unpack_from('<i', header, 12)[0]
+                    label = struct.unpack_from('<I', header, 8)[0]
+                    if size < 24 or at + size > end:
+                        raise ValueError(f'invalid group size in {path}')
+                    if group == 0 and header[8:12] != b'WRLD':
+                        source.seek(at + size)
+                        continue
+                    yield from walk(at + size, label if group == 1 else world,
+                                    label if group == 6 else cell, group == 9)
+                else:
+                    rtype = header[:4].decode('ascii')
+                    flags, form = struct.unpack_from('<II', header, 8)
+                    if at + 24 + size > end:
+                        raise ValueError(f'invalid record size in {path}')
+                    if world is not None and (rtype == 'CELL' or cell is not None and (
+                            rtype == 'LAND' and temporary or rtype in references)):
+                        body = source.read(size)
+                        if flags & COMPRESSED:
+                            expected = struct.unpack_from('<I', body)[0]
+                            body = zlib.decompress(body[4:])
+                            if len(body) != expected:
+                                raise ValueError(f'bad uncompressed size in {path}')
+                        yield world, form if rtype == 'CELL' else cell, Record(
+                            rtype, form, flags & ~COMPRESSED, _subrecords(body))
+                    else:
+                        source.seek(at + 24 + size)
+
+        yield from walk(path.stat().st_size)
+
+
 def _sub(t: str, d: bytes) -> bytes:
     if len(d) > 0xFFFF:
         return b'XXXX' + struct.pack('<HI', 4, len(d)) + t.encode() + struct.pack('<H', 0) + d

@@ -13,10 +13,14 @@ FILES = {
     REPO / 'build/skse/WoWBridge.dll': 'SKSE/Plugins/WoWBridge.dll',
     REPO / 'skse/WoWBridge.ini': 'SKSE/Plugins/WoWBridge.ini',
     REPO / 'build/esp/WoWBridge.esp': 'WoWBridge.esp',
+    REPO / 'build/esp/WoWBridgeArmory.esp': 'WoWBridgeArmory.esp',   # data/build_armory.py: loads after WoWBridge.esp
     REPO / 'build/character.json': 'SKSE/Plugins/WoWBridge/character.json',   # data/build_catalog.py
+    REPO / 'data/character-tauren-male.json': 'SKSE/Plugins/WoWBridge/character-tauren-male.json',
+    REPO / 'data/character-tauren-female.json': 'SKSE/Plugins/WoWBridge/character-tauren-female.json',
     REPO / 'data/character-male.json': 'SKSE/Plugins/WoWBridge/character-male.json',
     REPO / 'data/progression.json': 'SKSE/Plugins/WoWBridge/progression.json',   # wb learnall rank metadata
     REPO / 'build/gear.json': 'SKSE/Plugins/WoWBridge/gear.json',   # data/build_esp.py
+    REPO / 'build/armory.json': 'SKSE/Plugins/WoWBridge/armory.json',   # data/build_armory.py
     REPO / 'data/skyrim_gear_looks.json': 'SKSE/Plugins/WoWBridge/skyrim_gear_looks.json',
 }
 

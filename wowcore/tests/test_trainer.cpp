@@ -153,7 +153,7 @@ TEST_CASE("ClassTrainerFrame uses live Skyrim training and pending class ranks",
       __WBTrainer({session=202,name='Colette Marence',skill='restoration',skillName='Restoration',
         current=25,maximum=75,trained=0,limit=5,cost=300,gold=2000},__WB.trainerRevision+1)
       assert(GetNumTrainerServices()==4 and __WB.trainerEntries[4].spell==5186)
-      -- Her class response is authoritative, independent of the trainer's NPC class.
+      -- Their class response is authoritative, independent of the trainer's NPC class.
       -- A priest's Restoration preview replaces the druid's Healing Touch.
       __WBClassSpells({class_id=5,lines={['56']={name='Holy',tab=2}},known_spells={},spells={},
         unlearned_spells={{spell=2061,chain=2061,name='Flash Heal',rank=1,rank_name='Rank 1',skill='restoration',

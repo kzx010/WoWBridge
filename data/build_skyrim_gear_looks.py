@@ -129,6 +129,11 @@ def text(raw):
     return raw.rstrip(b'\0').decode('utf-8', 'replace') if raw else ''
 
 
+def biped_mask(record):
+    """An ARMO's or ARMA's biped slots (bit n: slot 30 + n): BOD2's, or legacy BODT's (Skyrim.esm's addons have BODT)."""
+    return integer(record.get('BOD2') or record.get('BODT'))
+
+
 def inventory(data, language='english', plugins=None):
     """Apply masters/overrides, then resolve keywords, addons and templates."""
     data = Path(data)
@@ -197,7 +202,7 @@ def inventory(data, language='english', plugins=None):
                     # WEAP TNAM is attack-fail sound; CNAM is its template.
                     'template': resolve(integer(record.get('CNAM' if record.type == 'WEAP' else 'TNAM')))
                                 if record.type in ('WEAP', 'ARMO') else None,
-                    'biped_mask': integer(bod),
+                    'biped_mask': biped_mask(record),
                     'armor_type': integer(bod, 4 if record.get('BOD2') else 8, default=2),
                     'animation_type': raw_dnam[0] if record.type == 'WEAP' else None,
                 }

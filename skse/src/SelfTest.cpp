@@ -19,6 +19,7 @@
 #include "Portrait.h"
 #include "Progression.h"
 #include "Service.h"
+#include "Reactions.h"
 #include "Quests.h"
 #include "Merchant.h"
 #include "Loot.h"
@@ -35,15 +36,27 @@
 #include "render/WowModels.h"
 #include "render/ItemPreview.h"
 #include "render/GroundItems.h"
+#include "render/NpcShoulders.h"
+#include "render/NpcWeapons.h"
+#include "render/NpcHelms.h"
+#include "render/PlayerWeapons.h"
+#include "render/Shadows.h"
 #include "Avatar.h"
 #include "Carriers.h"
 #include "Cast.h"
 #include "Forms.h"
 #include "Service.h"
 #include "LuaText.h"
+#include "Learning.h"
+#include "Distribution.h"
+#include "SkyrimAuras.h"
+#include "Armory.h"
+#include "wowcore/dbc.hpp"
 #include "wowcore/merchant.hpp"
+#include "wowcore/mpq.hpp"
 
 #include <nlohmann/json.hpp>
+#include <cctype>
 
 #undef GetObject  // Windows GDI macro, not CommonLib's default-object accessor.
 
@@ -52,6 +65,8 @@ namespace SelfTest
 	namespace
 	{
 		using json = nlohmann::json;
+		std::function<void()> g_restorePlayerWeapons;
+		std::atomic<bool> g_wantFrontView = false;
 
 		struct Step
 		{
@@ -80,7 +95,9 @@ namespace SelfTest
             std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
             std::chrono::steady_clock::time_point changed = start;
             int stage = 0, sequence = 0, count = 0, playerGold = 0, vendorGold = 0, buyPrice = 0, sellPrice = 0;
-            bool done = false;
+            bool done = false, panelHelpers = false;
+            RE::TESBoundObject* item = nullptr;   // what is bought (the Iron Sword unless a step names another)
+            bool buyOnly = false;                 // bought and kept: the probe ends after the purchase
             json result;
         };
         std::mutex g_nativeBarterLock;
@@ -93,17 +110,135 @@ namespace SelfTest
 		std::vector<Step> g_steps;
 		std::size_t       g_index = 0;
 		double            g_stepStart = 0.0;
+		// Frame::Now is suite-wide; a_t in Landed is the current step's elapsed time.
+		std::optional<double> g_lastTeleport;
+		bool g_landingPending = false;
+		bool g_stepPolled = false;
+
+		void TeleportStarted()
+		{
+			g_lastTeleport = Frame::Now();
+			g_landingPending = true;
+		}
+
+		void Teleport(RE::TESObjectREFR* a_ref, RE::TESObjectREFR* a_destination)
+		{
+			if (a_ref == RE::PlayerCharacter::GetSingleton()) TeleportStarted();
+			a_ref->MoveTo(a_destination);
+		}
+
+		bool Travel(const std::string& a_name)
+		{
+			if (!Console::Command("travel", a_name)) return false;
+			TeleportStarted();
+			return true;
+		}
+
+		void TravelCell(std::string_view a_command)
+		{
+			TeleportStarted();
+			Console::Execute(a_command);
+		}
+
+		bool Landed(double a_t)
+		{
+			const double elapsed = g_lastTeleport ? g_stepStart + a_t - *g_lastTeleport : 0.0;
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			auto* cell = player ? player->GetParentCell() : nullptr;
+			auto* ui = RE::UI::GetSingleton();
+			if (!cell || !cell->IsAttached() || !player->Is3DLoaded() || !ui ||
+				ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || elapsed < 1.5) return false;
+			if (!cell->IsInteriorCell()) {
+				auto ready = [](RE::TESObjectCELL* a_cell) {
+					if (!a_cell || !a_cell->IsAttached()) return false;
+					const auto& data = a_cell->GetRuntimeData();
+					// Some city cells have no LAND of their own (the parent's terrain shows).
+					// There attachment, loaded cell data and the settle interval are our evidence.
+					return data.loadedData && (!data.cellLand || data.cellLand->loadedData);
+				};
+				auto* tes = RE::TES::GetSingleton();
+				auto* grid = tes ? tes->gridCells : nullptr;
+				if (!ready(cell) || !grid || !grid->cells || !grid->length) return false;
+				for (std::uint32_t x = 0; x < grid->length; ++x)
+					for (std::uint32_t y = 0; y < grid->length; ++y)
+						if (!ready(grid->GetCell(x, y))) return false;
+			}
+			// The symptom itself (the user's Riften capture, October 17): the player below the terrain's surface. A
+			// ray down from well above the feet must meet the ground at or below them; the first frames after a load
+			// can stand the player on nothing while the collision streams in. Interiors and water excluded.
+			if (!cell->IsInteriorCell()) {
+				const auto at = player->GetPosition();
+				const auto ground = Picker::Cast(at + RE::NiPoint3{ 0, 0, 400 }, at - RE::NiPoint3{ 0, 0, 200 }, true, player);
+				// The terrain only: a roof, bridge or overhang above the feet is not "under the ground" (suite 231431
+				// moved the player 176 units up onto one after a moveto).
+				if (ground.hit && ground.layer == static_cast<int>(RE::COL_LAYER::kTerrain) && ground.pos.z > at.z + 12.f) {
+					static double reported = -1;
+					if (g_landingPending && reported != g_lastTeleport.value_or(-1)) {
+						logger::warn("selftest: under the ground after a teleport: feet {:.0f}, ground {:.0f}", at.z, ground.pos.z);
+						reported = g_lastTeleport.value_or(-1);
+					}
+					if (elapsed < 10.0) return false;   // wait for the collision; after 10 s, place the player on it
+					player->SetPosition({ at.x, at.y, ground.pos.z + 2.f }, true);
+					logger::warn("selftest: placed on the ground after a teleport (feet {:.0f} -> {:.0f})", at.z, ground.pos.z + 2.f);
+					return false;
+				}
+			}
+			if (g_landingPending) {
+				logger::info("selftest: landed after {:.0f} ms", elapsed * 1000.0);
+				g_landingPending = false;
+			}
+			return true;
+		}
+
+		bool CaptureWhenLanded(const std::string& a_name, double a_t)
+		{
+			if (g_landingPending && !Landed(a_t)) return false;
+			UiPass::RequestCapture(a_name);
+			return true;
+		}
+
+		double g_landingWait = 0;   // this step's seconds spent waiting to land: not part of its timeout
+		bool PollWhenLanded(const Step& a_step, double a_t, json& a_result)
+		{
+			static double lastT = 0;
+			if (a_t < lastT) g_landingWait = 0;   // a new step
+			const double dt = std::max(0.0, a_t - lastT); lastT = a_t;
+			if (g_landingPending && !Landed(a_t)) { g_landingWait += dt; return false; }
+			// A preceding step may have timed out in transit. Its successor still gets its
+			// t == 0 initializer, while RunSuite keeps counting its original timeout.
+			const bool first = !g_stepPolled;
+			g_stepPolled = true;
+			return a_step.poll(first ? 0.0 : a_t, a_result);
+		}
+
 		int               g_failed = 0;
 		json              g_ctx;  // scratch state shared inside a step
+		void StepCheckpoint(const char* a_fallback = "poll")
+		{
+			const auto stage = g_ctx.find("stage");
+			const auto label = stage == g_ctx.end() ? std::string(a_fallback) :
+				stage->is_string() ? stage->get<std::string>() : stage->dump();
+			Frame::Checkpoint(std::format("selftest:{}:{}", g_steps[g_index].name, label).c_str());
+		}
         std::atomic<bool> g_allowStartDialog=false; // explicit native popup fixture only
         std::atomic<int> g_startDialogChoice=-1, g_startDialogAnswered=-1;
+        std::atomic<std::uint32_t> g_startDialogClass=11, g_startDialogRace=4;
+		std::unique_ptr<RE::PlayerCharacter::PlayerSkills::Data> g_formSavedSkills;
 		std::function<bool()> g_restoreTalentCast;   // full runtime state, not limited to logout's self auras
 		std::function<void()> g_restoreIdolModels;
 		std::function<void()> g_restoreTestingPanel;
+        std::function<json()> g_restorePanelHelpers;
 		std::function<void()> g_restoreMounts;
         std::function<void()> g_restoreCompassEnemy;
 		std::function<bool()> g_restoreFlightController;
 		std::function<void()> g_restoreGearFeedback; // level, progression and exact hand instances on every exit
+		std::function<json()> g_restoreShrine;   // wow_talent_shrine's allocation, wipe price, septims, level and shrine
+		std::function<json()> g_restoreLearning;   // wow_book_learn / wow_mount_items / wow_armory: skills, level, book, mounts, items
+		std::function<void()> g_restorePaladinEquipment;
+		std::function<void()> g_restorePaladinTreasure;
+		std::function<void()> g_restoreRaceModels;   // wow_race_models: their gear back on, the window closed
+		std::function<void()> g_restoreTauren;   // wow_tauren_*: look, surrogate and Lua state, also after a reload/timeout
+		std::string g_unrestored; // the first step whose baseline/progression restore never completed
 		struct LoadSink : RE::BSTEventSink<RE::TESLoadGameEvent>
 		{
 			std::atomic<std::uint64_t> loads = 0;
@@ -144,10 +279,29 @@ namespace SelfTest
 		};
 		ShoutFires g_shoutFires;
 
+		// Where the suite started (the test cell's arrival): open ground, as long probes need.
+		std::optional<RE::NiPoint3> g_startPos;
+		void CalmVillage();
+		// Whoever is fighting the player, frozen so a step can begin out of combat (Riverwood's wild animals and bandits find
+		// the player again at once after a stopcombat); every step's end thaws them.
+		std::vector<RE::ActorHandle> g_pacified;
+		void Pacify()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			for (auto& h : RE::ProcessLists::GetSingleton()->highActorHandles) {
+				auto a = h.get();
+				if (!a || a.get() == player || a->IsDead() || !a->IsHostileToActor(player)) continue;
+				a->StopCombat();
+				if (a->IsAIEnabled()) { a->EnableAI(false); g_pacified.push_back(a->CreateRefHandle()); }
+			}
+			player->StopCombat();
+		}
+
 		void Record(const std::string& a_name, json a_result)
 		{
 			a_result["test"] = a_name;
 			a_result["t"] = Frame::Now();
+			a_result["frames"] = Frame::Count();   // with t, each step's frame rate in the suite summary
 			const bool pass = a_result.value("pass", false);
 			g_failed += !pass;
 			g_out << a_result.dump() << '\n';
@@ -157,8 +311,84 @@ namespace SelfTest
 
 		int g_actions = 0;
 
-		// Log the exact unmet gate on transitions and every five seconds while waiting.
-		// Keep the last read in the failure JSON so an --only run is self-contained.
+		// A held, acknowledged capture sequence. Review measurements never enter the fixture's pass criteria.
+		// Save metrics when requesting the image, after a new render frame has observed the changed heading.
+		bool FitViews(RE::Actor* actor, const std::string& base, double t, std::uint64_t frame,
+			const std::function<json()>& measure, bool player = false, bool drawn = true,
+			const std::function<void(bool)>& replacement = {})
+		{
+			if (!g_ctx.contains("fit_views")) {
+				g_ctx["fit_views"] = { { "heading", actor->GetAngleZ() }, { "view", 0 }, { "rows", json::array() }, { "phase", 0 } };
+			}
+			auto& state = g_ctx["fit_views"];
+			const int view = state["view"], phase = state["phase"];
+			const bool native = view == 3;
+			const int facing = native ? 0 : player && !drawn ? 2 - view : view;
+			constexpr const char* names[] = { "front", "side", "back" };
+			const float heading = state["heading"].get<float>();
+			const float turn = static_cast<float>(facing - (player && !drawn ? 2 : 0)) * RE::NI_HALF_PI;
+			if (phase == 0) {
+				actor->SetAngle({ 0.f, 0.f, heading + turn }); actor->Update3DPosition(true);
+				if (native && replacement) replacement(false);
+				state["since"] = t; state["before"] = frame; state["phase"] = 1; return false;
+			}
+			if (player) {
+				auto* camera = RE::PlayerCamera::GetSingleton();
+				auto* third = camera && camera->currentState && camera->currentState->id == RE::CameraState::kThirdPerson ?
+					static_cast<RE::ThirdPersonState*>(camera->currentState.get()) : nullptr;
+				if (!third) return false;
+				g_wantFrontView = drawn;
+				third->freeRotationEnabled = drawn || view != 0;
+				third->freeRotation = { (drawn ? RE::NI_PI : 0.f) - turn, 0.f };
+			}
+			const std::string name = base + (native ? "_native_front" : std::string("_") + names[facing]);
+			if (phase == 1) {
+				if (t - state["since"].get<double>() < .5 || (!native && frame <= state["before"].get<std::uint64_t>())) return false;
+				auto metrics = native ? state["rows"][0]["metrics"] : measure();
+				if (metrics.is_null()) return false;
+				if (native) {
+					// Native reference pixels use the restored clone's bound from the same item, not the WoW AABB.
+					const auto bound = metrics.value("native_bound", json());
+					RE::NiBound b{};
+					if (bound.is_object()) {
+						const auto& c = bound["centre"]; const float radius = bound["radius"];
+						b.center = { c[0].get<float>(), c[1].get<float>(), c[2].get<float>() }; b.radius = radius;
+					}
+					metrics = { { "item_bound", bound }, { "item_px", FitEvidence::Pixels(b) }, { "reference", "native Skyrim clone, WoW replacement disabled" } };
+				}
+				float viewAngle = 0;
+				if (auto* camera = RE::Main::WorldRootCamera()) {
+					const auto to = camera->world.translate - actor->GetPosition();
+					viewAngle = std::abs(std::remainder(std::atan2(to.x, to.y) - actor->GetAngleZ(), 2.f * RE::NI_PI)) * 57.29578f;
+				}
+				state["sample"] = { { "capture", name }, { "view", native ? "native_front" : names[facing] }, { "frame", frame },
+					{ "heading", actor->GetAngleZ() }, { "view_angle_deg", viewAngle },
+					{ "view_angle", FitEvidence::Range(viewAngle, static_cast<float>(facing) * 90.f - 15.f, static_cast<float>(facing) * 90.f + 15.f) }, { "metrics", metrics }, { "item_px", metrics.value("item_px", json()) } };
+				if (auto* head = actor->Get3D(false) ? actor->Get3D(false)->GetObjectByName("NPC Head [Head]") : nullptr) {
+					float x = 0, y = 0, tx = 0, ty = 0;
+					if (Picker::WorldToScreen(head->world.translate, x, y) && Picker::WorldToScreen(head->world.translate + RE::NiPoint3{ 0, 0, 14 }, tx, ty))
+						state["sample"]["head_px"] = { x, y, std::hypot(tx - x, ty - y) };
+				}
+				state["before"] = frame;
+				UiPass::RequestCapture(name); state["phase"] = 2; return false;
+			}
+			if (!native && frame <= state["before"].get<std::uint64_t>()) return false;
+			const auto capture = UiPass::TakeCapture(name);
+			if (!capture.done) return false;
+			const auto ui = UiPass::GetInfo();
+			auto sample = state["sample"];
+			sample["width"] = capture.width; sample["height"] = capture.height;
+			sample["full_resolution"] = capture.width > 0 && capture.height > 0 && capture.width == ui.width && capture.height == ui.height;
+			state["rows"].push_back(std::move(sample));
+			if (view < 2 || (view == 2 && replacement)) { state["view"] = view + 1; state["phase"] = 0; return false; }
+			actor->SetAngle({ 0.f, 0.f, heading }); actor->Update3DPosition(true);
+			if (replacement) replacement(true);
+			g_ctx["views"] = state["rows"];
+			g_ctx.erase("fit_views");
+			return true;
+		}
+
+		// Log unmet gates on transitions and every five seconds; keep evidence in --only failures.
 		void ProbeWait(const char* a_step, double a_t, json a_evidence)
 		{
 			const auto gate = a_evidence.value("gate", std::string());
@@ -199,6 +429,26 @@ namespace SelfTest
 			return placed.get();
 		}
 
+		// A fixture the pointer must reach: when no pixel picks it where it stands (a fence, a cart or a passer-by in
+		// between, after earlier steps moved the player), the next spot around the player, ahead first. False once all are tried.
+		bool NextPickSpot(RE::TESObjectREFR* a_ref, int a_try)
+		{
+			static constexpr std::pair<float, float> kSpots[]{ { 150, -110 }, { 180, 0 }, { 130, 60 }, { 130, -60 }, { 220, 140 },
+				{ 220, -140 }, { 90, 0 }, { 110, 110 } };
+			if (!a_ref || a_try >= static_cast<int>(std::size(kSpots))) return false;
+			auto f = CameraFwd();
+			f.z = 0;
+			f.Unitize();
+			const RE::NiPoint3 right{ f.y, -f.x, 0 };
+			auto at = RE::PlayerCharacter::GetSingleton()->GetPosition() + f * kSpots[a_try].first + right * kSpots[a_try].second;
+			// On the ground there, not at their height: on a slope a container at the player's feet' height is buried or floating.
+			if (const auto ground = Picker::Cast(at + RE::NiPoint3{ 0, 0, 300 }, at - RE::NiPoint3{ 0, 0, 600 }, true, a_ref); ground.hit)
+				at.z = ground.pos.z;
+			a_ref->SetPosition(at);
+			a_ref->Update3DPosition(true);
+			return true;
+		}
+
 		RE::Actor* SpawnAhead(RE::TESNPC* a_base, float a_forward, float a_right = 0.0f)
 		{
 			auto* ref = PlaceAhead(a_base, a_forward, a_right);
@@ -233,13 +483,13 @@ namespace SelfTest
 			return actor;
 		}
 
-		// Her caster-form book's steps: full magicka first (a cast costs Skyrim magicka), the spell as her bar casts it
+		// Their caster-form book's steps: full magicka first (a cast costs Skyrim magicka), the spell as their bar casts it
 		// (Cast::Use), the combat log's lines kept in __wbBook to look for.
 		void BookReady()
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			auto* av = player->AsActorValueOwner();
-			// A pool for her master-tier spells (Hurricane, Rebirth: service/skyrim_balance.py prices them as Blizzard and
+			// A pool for their master-tier spells (Hurricane, Rebirth: service/skyrim_balance.py prices them as Blizzard and
 			// Dead Thrall), which a new game's magicka cannot pay.
 			if (const float max = av->GetPermanentActorValue(RE::ActorValue::kMagicka); max < 1500.0f) {
 				av->SetBaseActorValue(RE::ActorValue::kMagicka, av->GetBaseActorValue(RE::ActorValue::kMagicka) + 1500.0f - max);
@@ -252,7 +502,7 @@ namespace SelfTest
 						"__wbBookFrame:SetScript('OnEvent', function() __wbBook = (__wbBook or '') .. arg1 .. '|' end) return 1 end)()");
 		}
 
-		// Whether General (ChatFrame1, where she reads her fights) shows a line containing the text.
+		// Whether General (ChatFrame1, where the player reads their fights) shows a line containing the text.
 		bool GeneralHas(const char* a_text)
 		{
 			return WowUi::Eval(std::format("(function() for i = 1, ChatFrame1:GetNumMessages() do local t = ChatFrame1:GetMessageInfo(i) "
@@ -282,7 +532,7 @@ namespace SelfTest
 			return false;
 		}
 
-		// The nearest living person not hostile to her, made her follower (green, in her party).
+		// The nearest living person not hostile to the player, made their follower (green, in their party).
 		RE::Actor* BookFollower()
 		{
 			auto*      player = RE::PlayerCharacter::GetSingleton();
@@ -299,7 +549,7 @@ namespace SelfTest
 				}
 			}
 			if (best) {
-				best->MoveTo(player);
+				Teleport(best, player);
 				best->GetActorRuntimeData().boolBits.set(RE::Actor::BOOL_BITS::kPlayerTeammate);
 			}
 			return best;
@@ -308,6 +558,16 @@ namespace SelfTest
 		// The Skyrim menus opened since last cleared. One that stops play also stops the steps, so a menu in g_closeOnOpen
 		// is closed again as soon as it opens (a UI task: those run while play is stopped).
 		std::set<std::string> g_closeOnOpen;
+		// Skyrim's pausing menus no step asked for (a stray Escape opened the Journal in a suite, October 16: the
+		// game and the steps stood paused for 46 minutes until a person closed it). A step that uses one claims it
+		// in g_keepOpen for its time (the level choice: Stats; the item probe: Inventory; map, tween, book, journal
+		// steps: theirs) - also the one it opens by key, since the sink sees every opening.
+		std::set<std::string> g_keepOpen;
+		extern bool g_stepActive;   // defined with the suite loop: the guard acts only while a step runs
+		extern double g_stepStart;
+		std::map<std::string, int> g_menuClaims;   // ClaimMenu: Console's helpers, outside any step's g_keepOpen
+		const std::set<std::string> kStrayMenus{ "Journal Menu", "MapMenu", "TweenMenu", "StatsMenu", "MagicMenu",
+			"InventoryMenu", "FavoritesMenu", "Sleep/Wait Menu", "Crafting Menu" };
 		std::atomic<bool> g_levelChoiceProbe = false;
 		std::mutex g_levelChoiceLock;
 		json g_levelChoiceEvidence;
@@ -393,8 +653,12 @@ namespace SelfTest
 					if (a_event && a_event->opening) {
 						std::string name = a_event->menuName.c_str();
 						opened.insert(name);
-						// A Skyrim tutorial box (her magicka low, the first time) stops play and so the steps: closed as it opens.
-						if (g_closeOnOpen.contains(name) || name == RE::TutorialMenu::MENU_NAME) {
+						// A Skyrim tutorial box (their magicka low, the first time) stops play and so the steps: closed as it opens.
+						const bool claimed = g_keepOpen.contains(name) || g_closeOnOpen.contains(name) ||
+							(g_menuClaims.contains(name) && g_menuClaims[name] > 0);
+						const bool stray = Config::Get().autorun && g_stepActive && kStrayMenus.contains(name) && !claimed;
+						if (g_closeOnOpen.contains(name) || name == RE::TutorialMenu::MENU_NAME || stray) {
+							if (stray) logger::warn("selftest: stray {} opened during the suite; closing it", name);
 							SKSE::GetTaskInterface()->AddUITask([name] {
 								RE::UIMessageQueue::GetSingleton()->AddMessage(name, RE::UI_MESSAGE_TYPE::kHide, nullptr);
 							});
@@ -633,6 +897,70 @@ namespace SelfTest
 			return true;
 		}
 
+		json NativeSkillProgress()
+		{
+			auto* player=RE::PlayerCharacter::GetSingleton();
+			auto* skills=player ? player->GetInfoRuntimeData().skills : nullptr;
+			if (!skills || !skills->data) return nullptr;
+			const auto& data=*skills->data;
+			json result={{"xp",data.xp},{"threshold",data.levelThreshold},{"skills",json::array()},{"base",json::array()}};
+			for (std::size_t i=0;i<18;++i) {
+				const auto& skill=data.skills[i];
+				result["skills"].push_back({skill.level,skill.xp,skill.levelThreshold,data.legendaryLevels[i]});
+				result["base"].push_back(player->AsActorValueOwner()->GetBaseActorValue(static_cast<RE::ActorValue>(static_cast<int>(RE::ActorValue::kOneHanded)+i)));
+			}
+			return result;
+		}
+
+		// A carried copy's identity, which its base form alone cannot tell apart: enchantment, temper, name, poison, owner.
+		json InstanceIdentity(RE::ExtraDataList* a_list)
+		{
+			const auto* enchantment=a_list ? a_list->GetByType<RE::ExtraEnchantment>() : nullptr;
+			const auto* health=a_list ? a_list->GetByType<RE::ExtraHealth>() : nullptr;
+			const auto* text=a_list ? a_list->GetByType<RE::ExtraTextDisplayData>() : nullptr;
+			const auto* poison=a_list ? a_list->GetByType<RE::ExtraPoison>() : nullptr;
+			const auto* owner=a_list ? a_list->GetByType<RE::ExtraOwnership>() : nullptr;
+			return json::array({enchantment && enchantment->enchantment ? enchantment->enchantment->GetFormID() : 0u,
+				health ? health->health : 1.f,text && text->displayName.c_str() ? std::string(text->displayName.c_str()) : std::string(),
+				poison && poison->poison ? poison->poison->GetFormID() : 0u,owner && owner->owner ? owner->owner->GetFormID() : 0u});
+		}
+
+		// Every carried copy of a base form, counted by identity (bare copies are plain); worn state is not identity.
+		json InstanceCounts(RE::Actor* a_actor,RE::TESBoundObject* a_form)
+		{
+			json counts=json::object();
+			auto add=[&](const json& identity,int n) { const auto key=identity.dump(); counts[key]=counts.value(key,0)+n; };
+			for (const auto& [form,entry] : a_actor->GetInventory()) if (form==a_form) {
+				int listed=0;
+				if (entry.second && entry.second->extraLists) for (auto* list : *entry.second->extraLists) if (list) {
+					listed+=list->GetCount(); add(InstanceIdentity(list),list->GetCount());
+				}
+				if (entry.first>listed) add(InstanceIdentity(nullptr),entry.first-listed);
+			}
+			return counts;
+		}
+
+		// The carried, unworn copies with this identity (none: only bare copies, if any).
+		std::vector<RE::ExtraDataList*> UnwornInstances(RE::Actor* a_actor,RE::TESBoundObject* a_form,const json& a_identity)
+		{
+			std::vector<RE::ExtraDataList*> lists;
+			for (const auto& [form,entry] : a_actor->GetInventory()) if (form==a_form && entry.second && entry.second->extraLists)
+				for (auto* list : *entry.second->extraLists)
+					if (list && !list->HasType<RE::ExtraWorn>() && !list->HasType<RE::ExtraWornLeft>() && InstanceIdentity(list)==a_identity) lists.push_back(list);
+			return lists;
+		}
+
+		// What a hand holds: the form and, for a carried item, the identity of the exact worn copy.
+		json HandInstance(RE::Actor* a_actor,bool a_left)
+		{
+			auto* object=a_actor->GetEquippedObject(a_left);
+			RE::ExtraDataList* worn=nullptr;
+			if (object) for (const auto& [form,entry] : a_actor->GetInventory()) if (form==object && entry.second && entry.second->extraLists)
+				for (auto* list : *entry.second->extraLists)
+					if (list && (a_left ? list->HasType<RE::ExtraWornLeft>() : list->HasType<RE::ExtraWorn>())) worn=list;
+			return {{"form",object ? object->GetFormID() : 0u},{"identity",InstanceIdentity(worn)}};
+		}
+
 		// The form probes reuse the talent audit's full restoration, including resources,
 		// learned ranks, native level, action layout and runtime auras on other actors.
 		void BeginFormProbe()
@@ -640,9 +968,12 @@ namespace SelfTest
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			auto* av = player->AsActorValueOwner();
 			g_restoreTalentCast = Cast::PreserveForTesting();
+			auto* skills=player->GetInfoRuntimeData().skills;
+			g_formSavedSkills=skills && skills->data ? std::make_unique<RE::PlayerCharacter::PlayerSkills::Data>(*skills->data) : nullptr;
 			g_ctx["saved"] = {{"level",player->GetLevel()},{"progression",Progression::SnapshotForTesting()},
 				{"cast",Cast::Snapshot()},{"forms",Forms::SnapshotForTesting()},
 				{"target",Bridge::Target() ? Bridge::Target()->GetFormID() : 0},
+				{"native_skills",NativeSkillProgress()},
 				{"magicka_base",av->GetBaseActorValue(RE::ActorValue::kMagicka)},
 				{"heal_rate",av->GetBaseActorValue(RE::ActorValue::kHealRate)},
 				{"magicka_rate",av->GetBaseActorValue(RE::ActorValue::kMagickaRate)},{"damage",json::object()}};
@@ -662,6 +993,7 @@ namespace SelfTest
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			auto* av = player->AsActorValueOwner();
 			if (!g_ctx.contains("finish_result")) {
+				if (g_ctx.contains("tauren_result")) a_result = g_ctx["tauren_result"];   // the probe step's own result (its later polls carry an empty one)
 				a_result["talents"] = g_ctx.value("results", json::object());
 				a_result["allocation"] = Character::Caster()["talents"];
 				if (g_ctx.contains("wait")) a_result["wait"] = g_ctx["wait"];
@@ -671,7 +1003,7 @@ namespace SelfTest
 				if (saved.contains("position")) {
 					const auto& p=saved["position"]; player->SetPosition({p[0].get<float>(),p[1].get<float>(),p[2].get<float>()},true);
 				}
-				for (const auto key : {"enemy", "follower"}) if (g_ctx.contains(key))
+				for (const auto key : {"enemy", "follower", "follower_second", "follower_outside", "roar_second", "roar_outside"}) if (g_ctx.contains(key))
 					if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_ctx[key].get<RE::FormID>())) {
 						actor->StopCombat(); actor->Disable();
 					}
@@ -705,12 +1037,38 @@ namespace SelfTest
 				{"form", Forms::Current() == saved["forms"]["form"].get<std::string>()}, {"actions", actions}};
 			const bool resources = TalentFormStateRestored(saved["forms"]);
 			a_result["restored"]["resources"] = resources;
+            if (!resources) {
+                const auto actual=Forms::SnapshotForTesting();
+                for (const auto key : {"form","power","rage","energy","combos","next_swing","prowling","prowl_spell","shadowmeld","sneaking","aquatic_in_water","energy_in","decay_in","no_decay_in","rage_auras"})
+                    if (actual[key]!=saved["forms"][key]) a_result["restore_difference"][key]={{"expected",saved["forms"][key]},{"actual",actual[key]}};
+            }
 			bool native = std::abs(av->GetBaseActorValue(RE::ActorValue::kMagicka) - saved["magicka_base"].get<float>()) < .01f;
 			for (const auto& [name, value] : {std::pair{"health", RE::ActorValue::kHealth}, {"magicka", RE::ActorValue::kMagicka}, {"stamina", RE::ActorValue::kStamina}})
 				native = native && std::abs(saved["damage"][name].get<float>() - player->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kDamage, value)) < .01f;
 			a_result["restored"]["native_resources"] = native;
+			if (saved.contains("native_skills")) {
+				const auto current=NativeSkillProgress();
+				a_result["native_skills_changed_by_probe"]=current!=saved["native_skills"];
+				json changes=json::object();
+				if (!current.is_null() && !saved["native_skills"].is_null()) {
+					for (const auto key : {"xp","threshold"}) if (current[key]!=saved["native_skills"][key])
+						changes[key]={{"before",saved["native_skills"][key]},{"after",current[key]}};
+					for (std::size_t i=0;i<18;++i) if (current["skills"][i]!=saved["native_skills"]["skills"][i] || current["base"][i]!=saved["native_skills"]["base"][i])
+						changes[std::to_string(i)]={{"before",saved["native_skills"]["skills"][i]},{"after",current["skills"][i]}};
+				}
+				a_result["native_skill_changes"]=std::move(changes);
+				auto* data=player->GetInfoRuntimeData().skills;
+				if (g_formSavedSkills && data && data->data) {
+					for (std::size_t i=0;i<18;++i)
+						av->SetBaseActorValue(static_cast<RE::ActorValue>(static_cast<int>(RE::ActorValue::kOneHanded)+i),saved["native_skills"]["base"][i].get<float>());
+					*data->data=*g_formSavedSkills;
+				}
+				g_formSavedSkills.reset();
+			}
+			const bool skills=!saved.contains("native_skills") || (!saved["native_skills"].is_null() && NativeSkillProgress()==saved["native_skills"]);
+			if (saved.contains("native_skills")) a_result["restored"]["native_skills"]=skills;
 			const bool restored = ready && player->GetLevel() == saved["level"] && a_result["restored"]["progression"] == true &&
-				a_result["restored"]["form"] == true && a_result["restored"]["cast"] == true && actions && resources && native;
+				a_result["restored"]["form"] == true && a_result["restored"]["cast"] == true && actions && resources && native && skills;
 			a_result["restored"]["pass"] = restored;
 			a_result["pass"] = a_result.value("pass", false) && restored;
 			return true;
@@ -720,6 +1078,2076 @@ namespace SelfTest
 		// legal lower-tier filler; native application uses the production carriers,
 		// timers, resource payment, proc lifecycle and TESHitEvent sink.
 
+        json TaurenLook()
+        {
+            const auto l=Character::Looks();
+            return json{l.race,l.sex,l.skin,l.face,l.hairStyle,l.hairColor,l.facialHair};
+        }
+
+        void BeginTaurenProbe()
+        {
+            auto* player=RE::PlayerCharacter::GetSingleton();
+            const auto look=Character::Looks();
+            const auto classId=Character::Get().classId;
+            const bool female=player->GetActorBase()->IsFemale(),offered=Character::CustomizationOffered();
+            auto* voice=player->GetActorBase()->voiceType;
+            const bool swimming=player->AsActorState()->IsSwimming();
+            // Unlike a Lua global, this literal survives the creation probe's save/reload.
+            // Keep every action field and the cursor, including a racial removed by a race change.
+            const bool cursor=Input::Active();
+            BeginFormProbe(); g_ctx["tauren_cursor"]=cursor;
+            const auto actions=WowUi::Eval(R"((function()
+                local function literal(v)
+                    if type(v)=='table' then local out='{' for k,x in pairs(v) do out=out..'['..literal(k)..']='..literal(x)..',' end return out..'}'
+                    elseif type(v)=='string' then return string.format('%q',v)
+                    elseif type(v)=='number' or type(v)=='boolean' then return tostring(v) end return 'nil'
+                end
+                return literal(__wbTalentAuditSaved)
+            end)())");
+            const auto p=player->GetPosition();
+            g_ctx["saved"]["position"]={p.x,p.y,p.z};
+            g_ctx["tauren_before"]={{"look",TaurenLook()},{"female",female},{"voice",voice ? voice->GetFormID() : 0u},
+                {"race",player->GetRace()->GetFormID()},{"class",classId},{"swimming",swimming},{"size",Sizes(player)},
+                {"reference_scale",player->GetReferenceRuntimeData().refScale/100.f}};
+            g_ctx["checks"]=json::object(); g_ctx["captures"]=json::array();
+            const float referenceScale=player->GetReferenceRuntimeData().refScale/100.f;
+            g_restoreTauren=[look,classId,female,voice,offered,swimming,actions,referenceScale] {
+                logger::info("selftest: tauren probe restore (class {} race {}) step {} t {:.1f}", classId, look.race, g_index < g_steps.size() ? g_steps[g_index].name : "?", Frame::Now() - g_stepStart);
+                WowUi::Eval("(function() if __WBCustomizeClose then __WBCustomizeClose() end "
+                    "if __wbTaurenHost then __WBCustomizeLook=__wbTaurenHost end __wbTaurenHost=nil __wbTaurenLook=nil "
+                    "HideUIPanel(CharacterFrame) HideUIPanel(DressUpFrame) HideUIPanel(SpellBookFrame) GameTooltip:Hide() return 1 end)()");
+                Cast::ResetForTesting();
+                Character::SetIdentity(classId,look,true); Character::OfferCustomization(offered);
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                player->GetActorBase()->SetFlagBit(RE::ACTOR_BASE_DATA::Flag::kFemale,female,true);
+                player->GetActorBase()->voiceType=voice;
+                if (std::abs(player->GetReferenceRuntimeData().refScale/100.f-referenceScale)>.005f) {   // their fixture's own size
+                    player->SetScale(referenceScale); player->DoReset3D(false);
+                }
+                player->AsActorState()->actorState1.swimming=swimming;
+                WowUi::Eval("(function() __wbTalentAuditSaved="+actions+" return 1 end)()");
+            };
+        }
+
+        // RunSuite calls this for success, errors and the budget timeout that skips poll().
+        // Reuse the form audit's full runtime/known-spell/resource restore after restoring the race.
+        bool FinishTaurenProbe(double t,json& r)
+        {
+            if (!g_ctx.contains("tauren_before")) return true; // precondition failed before any mutation
+            if (!g_ctx.contains("tauren_restoring")) {
+                // Never restore over an in-flight load. A refused/missing test save must still clean up.
+                if (g_ctx.contains("tauren_loads") && g_loads.loads.load()<=g_ctx["tauren_loads"].get<std::uint64_t>() &&
+                    (RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameLoading() || t-g_ctx["tauren_load_at"].get<double>()<2)) return false;
+                if (!WowUi::Ready() || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameLoading()) return false;
+                r["checks"]=g_ctx["checks"]; r["captures"]=g_ctx["captures"];
+                r["evidence"]=g_ctx;
+                logger::info("selftest: FinishTaurenProbe restoring at t {:.1f} (result pass {})", t, r.value("pass", false));
+                // The step's own result, kept here: later polls (RunSuite keeps a restoring step done) carry an empty
+                // one, and FinishDruidTalentTest must not capture that as the finish result.
+                g_ctx["tauren_result"]=r;
+                g_restoreTauren(); g_restoreTauren={}; g_ctx["tauren_restoring"]=true; g_ctx["tauren_body_at"]=t;
+            }
+            // Their original body back from another race takes seconds to load (wow_race_models ends on a Dwarf): wait
+            // for it, briefly, on the restore's own clock. (A gate keyed on their Looks held every Paladin step past its
+            // budget on October 16; the Druid talent restore below has its own readiness wait.)
+            if (!g_ctx.contains("tauren_body_seen")) {
+                const auto* body=Avatar::Data();
+                const bool back=body && !body->display && body->appearance.race==Character::Looks().race && body->appearance.sex==Character::Looks().sex;
+                if (!back && t-g_ctx.value("tauren_body_at",t)<8) return false;
+                g_ctx["tauren_body_seen"]=back;
+                logger::info("selftest: tauren probe body back {} after {:.1f}s", back, t-g_ctx.value("tauren_body_at",t));
+            }
+            if (!FinishDruidTalentTest(t,r)) return false;
+            auto* player=RE::PlayerCharacter::GetSingleton();
+            const auto& before=g_ctx["tauren_before"];
+            const auto& p=g_ctx["saved"]["position"];
+            const auto* data=Avatar::Data();
+            auto& restored=r["restored"];
+            restored["look"]=TaurenLook()==before["look"] && Character::Get().classId==before["class"].get<std::uint32_t>();
+            restored["surrogate"]=player->GetRace()->GetFormID()==before["race"] && player->GetActorBase()->IsFemale()==before["female"].get<bool>() &&
+                (player->GetActorBase()->voiceType ? player->GetActorBase()->voiceType->GetFormID() : 0u)==before["voice"] &&
+                std::abs(player->GetScale()-before["size"]["scale"].get<float>())<.005f &&
+                std::abs(player->GetHeight()-before["size"]["height"].get<float>())<1.f;
+            const auto at=player->GetPosition();
+            const float across=std::hypot(at.x-p[0].get<float>(),at.y-p[1].get<float>()), up=at.z-p[2].get<float>();
+            // Their place back; the character controller may settle the player a few units onto the ground (after a knockdown).
+            restored["position"]=across<1.f && std::abs(up)<4.f;
+            if (across>=1.f || std::abs(up)>=1.f) r["position_away"]={across,up};
+            restored["swimming"]=player->AsActorState()->IsSwimming()==before["swimming"].get<bool>();
+            restored["body"]=data && (Forms::Current()!="none" || data->appearance==Character::Looks());
+            for (const auto key : {"look","surrogate","position","swimming","body"})
+                if (restored[key]!=true) { restored["pass"]=false; r["pass"]=false; }
+            r["baseline_restored"]=restored["pass"];
+            Input::SetCursorMode(g_ctx.value("tauren_cursor",false));
+            WowUi::SaveVariables(); // put back actions removed by the temporary race, including on disk
+            return true;
+        }
+
+		RE::Actor* PaladinActor(const char* key)
+		{
+			return RE::TESForm::LookupByID<RE::Actor>(g_ctx.value(key, RE::FormID{}));
+		}
+		json PaladinCaster()
+		{
+			auto caster = Character::Caster(); Forms::Augment(caster); return caster;
+		}
+		json PaladinTarget(RE::Actor* actor)
+		{
+			if (!actor) return {{"kind", "self"}};
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			bool los = true;
+			json target = {{"kind", "unit"}, {"level", actor->GetLevel()}, {"alive", !actor->IsDead()},
+				{"reaction", Bridge::ReactionName(actor)}, {"attackable", Bridge::Attackable(actor)},
+				{"healable", Bridge::Healable(actor)}, {"friendly", Bridge::Healable(actor)},
+				{"distance_yd", player->GetPosition().GetDistance(actor->GetPosition()) / Avatar::kUnitsPerYard},
+				{"facing", true}, {"in_front", true}, {"los", player->HasLineOfSight(actor, los)}};
+			Cast::AugmentTarget(target, actor); return target;
+		}
+		void PaladinAsk(json request, const char* key = "reply")
+		{
+			g_ctx.erase(key);
+			Service::Request(std::move(request), [index = g_index, key = std::string(key)](const json& out) {
+				if (index == g_index && !g_ctx.contains("finish_result")) g_ctx[key] = out;
+			});
+		}
+		void PaladinResolve(std::uint32_t spell, RE::Actor* target = nullptr, const char* key = "reply")
+		{
+			PaladinAsk({{"op", "resolve"}, {"spell", spell}, {"caster", PaladinCaster()}, {"target", PaladinTarget(target)}, {"seed", 1}}, key);
+		}
+		json PaladinAura(std::uint32_t spell, RE::Actor* target = nullptr)
+		{
+			const auto id = target ? target->GetFormID() : RE::PlayerCharacter::GetSingleton()->GetFormID();
+			const auto state = Cast::TalentDiagnostics();
+			for (const auto& aura : state["auras"]) if (aura["spell"] == spell && aura["target"] == id) return aura;
+			return json::object();
+		}
+		bool PaladinFinish(json& result, const char* error = nullptr)
+		{
+			result = {{"pass", error == nullptr}, {"checks", g_ctx.value("checks", json::object())},
+				{"evidence", g_ctx.value("evidence", json::object())}};
+			if (error) result["error"] = error;
+			for (const auto& check : result["checks"]) if (check != true) result["pass"] = false;
+			return true;
+		}
+		// Paralysed as WoWBridge's stun/sleep carrier does it: a live paralysis effect on it (the carrier's value
+		// modifier leaves the Paralysis actor value negative, as wow_book_hibernate reads it too).
+		bool Paralyzed(RE::Actor* a_actor)
+		{
+			auto* effects = a_actor ? a_actor->GetActiveEffectList() : nullptr;
+			return effects && std::ranges::any_of(*effects, [](RE::ActiveEffect* e) {
+				const auto* base = e ? e->GetBaseObject() : nullptr;
+				return base && base->data.archetype == RE::EffectSetting::Archetype::kParalysis &&
+					!e->flags.any(RE::ActiveEffect::Flag::kInactive, RE::ActiveEffect::Flag::kDispelled); });
+		}
+		// Moves a fixture to the first of a few spots ahead of the player with a clear line of sight (a wall, a door or a cart
+		// beside the player blocked casts in some runs); true if one was clear.
+		bool PlaceInSight(RE::Actor* a_actor, std::initializer_list<std::pair<float, float>> a_spots)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!a_actor) return false;
+			const float h = player->GetHeading(false);
+			for (const auto& [ahead, right] : a_spots) {
+				a_actor->SetPosition(player->GetPosition() + RE::NiPoint3{std::sin(h) * ahead + std::cos(h) * right,
+					std::cos(h) * ahead - std::sin(h) * right, 0}, true);
+				bool los = true;
+				if (player->HasLineOfSight(a_actor, los)) return true;
+			}
+			return false;
+		}
+		void PaladinFixture(const json& talents, bool boss = false)
+		{
+			BeginTaurenProbe();
+			Character::SetIdentity(2, 1, 1, true);
+			RE::PlayerCharacter::GetSingleton()->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate, 0);
+			RE::PlayerCharacter::GetSingleton()->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kMagickaRate, 0);
+			Console::Execute("player.setlevel 60"); Bridge::ForgetLevel();
+			auto progress = Progression::SnapshotForTesting(); progress["talents"] = talents;
+			progress["known_spells"] = json::array({25292,19943,10310,20154,20293,20920,20349,20357,20164,20308,
+				20271,5573,1020,10278,10308,24239,10314,10318,10326,20924,25780,20928,10293,10301,19746,19900,19898,19896,20218,20914,20729,1044,20930,19752,25291,25916,1038,25895,20216});
+			Progression::RestoreForTesting(progress);
+			RE::Actor* wolf = nullptr;
+			if (boss) {
+				// A private level-63 wolf gives the real target snapshot a crushing-blow deficit; never edit EncWolf.
+				auto* base = RE::TESForm::LookupByID<RE::TESNPC>(0x23ABE);
+				auto* copy = base ? base->CreateDuplicateForm(false, nullptr) : nullptr;
+				auto* npc = copy ? copy->As<RE::TESNPC>() : nullptr;
+				if (npc) {
+					npc->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult, RE::ACTOR_BASE_DATA::Flag::kUsesTemplate);
+					npc->actorData.templateUseFlags.reset(RE::ACTOR_BASE_DATA::TEMPLATE_USE_FLAG::kStats);
+					npc->actorData.level = npc->actorData.calcLevelMin = npc->actorData.calcLevelMax = 63;
+					wolf = SpawnAhead(npc, 150, -35);
+				}
+			} else wolf = SpawnWolf(150, -35);
+			auto* followerBase = RE::TESForm::LookupByID<RE::TESNPC>(0xA91A0);
+			auto* followerCopy = followerBase ? followerBase->CreateDuplicateForm(false, nullptr) : nullptr;
+			auto* followerNPC = followerCopy ? followerCopy->As<RE::TESNPC>() : nullptr;
+			if (followerNPC) {
+				followerNPC->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult, RE::ACTOR_BASE_DATA::Flag::kUsesTemplate);
+				followerNPC->actorData.templateUseFlags.reset(RE::ACTOR_BASE_DATA::TEMPLATE_USE_FLAG::kStats);
+				followerNPC->actorData.level = followerNPC->actorData.calcLevelMin = followerNPC->actorData.calcLevelMax = 60;
+			}
+			auto* follower = followerNPC ? SpawnAhead(followerNPC, 150, 120) : nullptr;
+			PlaceInSight(follower, {{150.f, 120.f}, {180.f, -120.f}, {220.f, 0.f}, {120.f, 60.f}});   // their heals need sight of it
+			if (wolf) {
+				g_ctx["enemy"] = wolf->GetFormID();
+				auto* player = RE::PlayerCharacter::GetSingleton(); const float h = player->GetHeading(false);
+				wolf->SetPosition(player->GetPosition() + RE::NiPoint3{std::sin(h) * 150, std::cos(h) * 150, 0}, true);
+			}
+			if (follower) { g_ctx["follower"] = follower->GetFormID(); Console::Execute("setplayerteammate 1", follower); }
+			for (auto* actor : {wolf, follower}) if (actor) {
+				actor->EnableAI(false);
+				auto* av = actor->AsActorValueOwner(); av->SetBaseActorValue(RE::ActorValue::kHealth, 10000);
+				av->SetBaseActorValue(RE::ActorValue::kHealRate, 0); av->SetBaseActorValue(RE::ActorValue::kMagickaRate, 0);
+				av->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+			}
+			g_ctx["stage"] = 0; g_ctx["at"] = 0.; g_ctx["case"] = 0; g_ctx["evidence"] = json::object();
+		}
+		bool PaladinEquipment()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			const auto left = HandInstance(player, true), right = HandInstance(player, false);
+			std::vector<std::pair<RE::TESBoundObject*, bool>> items;
+			RE::TESBoundObject* shield = nullptr; RE::TESBoundObject* sword = nullptr;
+			for (const auto& item : Armory::Items()) {
+				if (!shield && item.look.inventoryType == 14) shield = item.form;
+				if (!sword && item.look.itemClass == 2 && item.look.subclass == 7 && item.look.inventoryType == 13) sword = item.form;
+			}
+			if (!shield || !sword) return false;
+			for (auto* form : {sword, shield}) {
+				const bool added = player->GetItemCount(form) == 0;
+				if (added) player->AddObjectToContainer(form, nullptr, 1, nullptr);
+				items.emplace_back(form, added);
+				RE::ActorEquipManager::GetSingleton()->EquipObject(player, form, nullptr, 1, nullptr, false, true, false);
+			}
+			g_restorePaladinEquipment = [left, right, items] {
+				auto* player = RE::PlayerCharacter::GetSingleton(); auto* equip = RE::ActorEquipManager::GetSingleton();
+				for (const auto& [form, added] : items) {
+					equip->UnequipObject(player, form, nullptr, 1, nullptr, false, false, false, true);
+					if (added) {
+						const auto lists = UnwornInstances(player, form, InstanceIdentity(nullptr));
+						player->RemoveItem(form, 1, RE::ITEM_REMOVE_REASON::kRemove, lists.empty() ? nullptr : lists.front(), nullptr);
+					}
+				}
+				for (const bool isLeft : {false, true}) {
+					const auto& hand = isLeft ? left : right;
+					auto* old = RE::TESForm::LookupByID(hand.value("form", 0u));
+					auto* slot = RE::BGSDefaultObjectManager::GetSingleton()->GetObject<RE::BGSEquipSlot>(isLeft ? RE::DEFAULT_OBJECT::kLeftHandEquip : RE::DEFAULT_OBJECT::kRightHandEquip);
+					if (auto* form = old ? old->As<RE::TESBoundObject>() : nullptr) {
+						const auto lists = UnwornInstances(player, form, hand["identity"]);
+						equip->EquipObject(player, form, lists.empty() ? nullptr : lists.front(), 1, isLeft ? slot : nullptr, false, true, false);
+					} else if (auto* spell = old ? old->As<RE::SpellItem>() : nullptr) equip->EquipSpell(player, spell, slot);
+				}
+			};
+			return true;
+		}
+
+		bool PaladinHeals(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			const std::array<std::uint32_t, 3> spells{25292, 19943, 10310};
+			if (t == 0) { PaladinFixture(json::object()); return false; }
+			auto* follower = PaladinActor("follower"); auto* enemy = PaladinActor("enemy");
+			if (!enemy || !follower) return PaladinFinish(result, "missing heal fixtures");
+			if (!Progression::Ready() || !follower->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"]; const auto spell = spells[i];
+			auto* who = i == 2 ? follower : static_cast<RE::Actor*>(player); auto* av = who->AsActorValueOwner();
+			if (stage == 0) {
+				Cast::RefreshCooldownsForTesting(); BookReady();
+				av->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				const float maximum = av->GetPermanentActorValue(RE::ActorValue::kHealth) + who->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kHealth);
+				av->DamageActorValue(RE::ActorValue::kHealth, maximum * .6f);
+				g_ctx["health_before"] = av->GetActorValue(RE::ActorValue::kHealth); g_ctx["maximum"] = maximum;
+				g_ctx["mana_before"] = Cast::Mana();
+				if (i == 2) {
+					av->SetBaseActorValue(RE::ActorValue::kMagicka, 250); av->RestoreActorValue(RE::ActorValue::kMagicka, 10000);
+					av->DamageActorValue(RE::ActorValue::kMagicka, 200); g_ctx["target_mana_before"] = av->GetActorValue(RE::ActorValue::kMagicka);
+				}
+				PaladinResolve(spell, i == 2 ? follower : nullptr); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				const auto out = g_ctx["reply"];
+				if (!out.value("ok", false)) return PaladinFinish(result, "heal service request failed");
+				float expected = 0;
+				for (const auto& e : out["events"]) if (e.value("type", "") == "heal") {
+					expected = e.contains("caster_max_health") ? e.value("caster_max_health", 1.f) *
+						(player->AsActorValueOwner()->GetPermanentActorValue(RE::ActorValue::kHealth) + player->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kHealth)) : e.value("amount", 0.f);
+				}
+				g_ctx["expected"] = std::min(g_ctx["maximum"].get<float>(), g_ctx["health_before"].get<float>() + expected);
+				g_ctx["evidence"][std::to_string(spell)] = out;
+				Cast::BeginForTesting(spell, out, i == 2 ? follower : nullptr);
+				g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (Cast::Casting() || t - g_ctx["at"].get<double>() < .4) return false;
+			g_ctx["checks"]["heal_" + std::to_string(spell)] = std::abs(av->GetActorValue(RE::ActorValue::kHealth) - g_ctx["expected"].get<float>()) < 1.f;
+			if (i == 2) {
+				g_ctx["checks"]["lay_hands_spends_all_mana"] = Cast::Mana() == 0 && g_ctx["reply"].value("use_all_mana", false);
+				float mana = 0; for (const auto& e : g_ctx["reply"]["events"]) if (e.value("type", "") == "power" && e.value("power", "") == "mana") mana += e.value("amount", 0.f);
+				g_ctx["checks"]["lay_hands_target_mana"] = mana > 0 && std::abs(av->GetActorValue(RE::ActorValue::kMagicka) - std::min(250.f, g_ctx["target_mana_before"].get<float>() + mana)) < 1.f;
+				g_ctx["checks"]["lay_hands_no_forbearance"] = PaladinAura(25771).empty() && PaladinAura(25771, follower).empty();
+				return PaladinFinish(result);
+			}
+			g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+		}
+
+		bool PaladinPartyBuff(RE::Actor* member, std::uint32_t spell)
+		{
+			return WowUi::Eval(std::format(R"((function()
+				for i=1,4 do if __WB.tokens['party'..i]=={} then
+					for _,a in ipairs(__WB.units[{}].buffs or {{}}) do if a.spell=={} then return UnitBuff('party'..i,1) and 1 or 0 end end
+				end end return 0 end)())", member->GetFormID(), member->GetFormID(), spell)) == "1";
+		}
+
+		bool PaladinPartyAuras(double t, json& result)
+		{
+			const std::array<std::uint32_t, 7> spells{10293,10301,19746,19900,19898,19896,20218};
+			if (t == 0) { PaladinFixture({{"1401",5},{"1407",5},{"1403",5},{"1464",3},{"1631",2},{"1409",1}}); return false; }
+			auto* member = PaladinActor("follower"); auto* enemy = PaladinActor("enemy");
+			if (!member || !enemy) return PaladinFinish(result, "missing party aura fixtures");
+			if (!Progression::Ready() || !member->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"]; const auto spell = spells[i];
+			const auto key = std::to_string(spell);
+			const auto av = i == 3 ? RE::ActorValue::kResistFire : i == 4 ? RE::ActorValue::kResistFrost :
+				i == 5 ? RE::ActorValue::kResistMagic : RE::ActorValue::kDamageResist;
+			if (stage == 0) {
+				Cast::ResetForTesting(); BookReady();
+				g_ctx["native_before"] = member->AsActorValueOwner()->GetActorValue(av);
+				PaladinResolve(spell); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "party aura resolve failed");
+				Cast::ApplyForTesting(spell, g_ctx["reply"]); g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (t - g_ctx["at"].get<double>() < 2.5) return false;
+			if (stage == 2) {
+				const auto state = Cast::TalentDiagnostics();
+				g_ctx["evidence"][key] = state.value("party_aura", json::object());
+				g_ctx["checks"]["member_" + key] = !PaladinAura(spell, member).empty() &&
+					std::ranges::any_of(PaladinTarget(member)["auras"], [spell](const json& id) { return id == spell; });
+				g_ctx["checks"]["party_frame_" + key] = PaladinPartyBuff(member, spell);
+				float expected = 0;
+				for (const auto& a : state.value("party_aura", json::object()).value("auras", json::array())) for (const auto& e : a.value("skyrim", json::array())) {
+					const auto* base = RE::TESForm::LookupByID<RE::EffectSetting>(e.value("mgef", 0u));
+					if (base && base->data.primaryAV == av) expected += e.value("magnitude", 0.f);
+				}
+				g_ctx["checks"]["native_" + key] = std::abs(member->AsActorValueOwner()->GetActorValue(av) - g_ctx["native_before"].get<float>() - expected) < .1f;
+				if (i == 1) {
+					g_ctx["enemy_health"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+					Cast::WeaponHitForTesting(enemy, member, 2.f);
+				}
+				g_ctx["at"] = t; g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				if (i == 1) {
+					int shield = 0;
+					for (const auto& a : g_ctx["evidence"][key].value("auras", json::array())) if (a.value("type", "") == "damage_shield") shield = a.value("amount", 0);
+					g_ctx["checks"]["retribution_melee_attacker"] = shield > 0 && std::abs(g_ctx["enemy_health"].get<float>() - enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - shield) < 1.f;
+				}
+				member->SetPosition(RE::PlayerCharacter::GetSingleton()->GetPosition() + RE::NiPoint3{4000,0,0}, true);
+				g_ctx["at"] = t; g_ctx["stage"] = 4; return false;
+			}
+			if (stage == 4) {
+				g_ctx["checks"]["out_of_range_" + key] = PaladinAura(spell, member).empty() && !PaladinPartyBuff(member, spell) &&
+					std::abs(member->AsActorValueOwner()->GetActorValue(av) - g_ctx["native_before"].get<float>()) < .1f;
+				member->SetPosition(RE::PlayerCharacter::GetSingleton()->GetPosition() + RE::NiPoint3{150,120,0}, true);
+				g_ctx["at"] = t; g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				g_ctx["checks"]["reenter_" + key] = !PaladinAura(spell, member).empty();
+				Cast::CancelAura(spell); g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			g_ctx["checks"]["caster_lost_" + key] = PaladinAura(spell, member).empty() && !PaladinPartyBuff(member, spell);
+			if (i == 6) return PaladinFinish(result);
+			g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+		}
+
+		bool PaladinGreaterBlessing(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (t == 0) {
+				PaladinFixture(json::object());
+				if (auto* member = PaladinActor("follower")) {
+					for (const auto& [key, offset] : {std::pair{"follower_second", -120.f}, {"follower_outside", 240.f}}) {
+						if (auto* actor = SpawnAhead(member->GetActorBase(), 200, offset)) {
+							g_ctx[key] = actor->GetFormID();
+							Console::Execute("setplayerteammate 1", actor); actor->EnableAI(false);
+						}
+					}
+				}
+				return false;
+			}
+			auto* member = PaladinActor("follower"); auto* second = PaladinActor("follower_second");
+			auto* outside = PaladinActor("follower_outside");
+			if (!member || !second || !outside) return PaladinFinish(result, "missing Greater Blessing followers");
+			if (!Progression::Ready()) return false;
+			const int stage = g_ctx["stage"];
+			if (stage == 0) {
+				if (!member->Is3DLoaded() || !second->Is3DLoaded() || !outside->Is3DLoaded()) return false;
+				const auto reagent = Character::Reagents().find(21177);
+				auto* form = reagent != Character::Reagents().end() ? RE::TESDataHandler::GetSingleton()->LookupForm(reagent->second, "WoWBridge.esp") : nullptr;
+				auto* symbol = form ? form->As<RE::TESBoundObject>() : nullptr;
+				if (!symbol) return PaladinFinish(result, "missing Symbol of Kings form");
+				const int count = Gear::ReagentCounts()[21177];
+				// FinishTaurenProbe runs this even when the step fails or times out.
+				g_restoreTauren = [restore = std::move(g_restoreTauren), symbol, count] {
+					restore();
+					const int delta = count - Gear::ReagentCounts()[21177];
+					if (delta > 0) RE::PlayerCharacter::GetSingleton()->AddObjectToContainer(symbol, nullptr, delta, nullptr);
+					else if (delta < 0) Gear::Consume(21177, -delta);
+				};
+				if (count < 2) player->AddObjectToContainer(symbol, nullptr, 2 - count, nullptr);
+				Cast::ResetForTesting(); BookReady(); PaladinResolve(25291, member);
+				g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "lesser Might resolve failed");
+				// Seed prior lesser blessings so the paid Greater cast must replace each member's blessing.
+				for (auto* actor : {member, second, static_cast<RE::Actor*>(nullptr)}) Cast::ApplyForTesting(25291, g_ctx["reply"], actor);
+				auto caster = PaladinCaster(); caster["reagents"] = {{"21177", Gear::ReagentCounts()[21177]}};
+				PaladinAsk({{"op", "resolve"}, {"spell", 25916}, {"caster", caster}, {"target", PaladinTarget(member)}, {"seed", 1}});
+				g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				if (!g_ctx.contains("reply")) return false;
+				const auto& reply = g_ctx["reply"];
+				if (!reply.value("ok", false)) return PaladinFinish(result, "Greater Might resolve failed");
+				const auto greater = reply.value("greater_blessing", json::object());
+				const float radius = greater.value("class_radius_yd", 0.f) * Avatar::kUnitsPerYard;
+				g_ctx["evidence"]["greater_blessing"] = greater;
+				g_ctx["checks"]["party_contract"] = greater.value("applies_to", "") == "party" &&
+					greater.value("status", "") == "party_as_one_class" && radius > 0;
+				if (g_ctx["checks"]["party_contract"] != true) return PaladinFinish(result, "service needs D3 party contract");
+				outside->SetPosition(player->GetPosition() + RE::NiPoint3{radius + 5 * Avatar::kUnitsPerYard, 0, 0}, true);
+				g_ctx["checks"]["fixture_range"] = member->IsPlayerTeammate() && second->IsPlayerTeammate() && outside->IsPlayerTeammate() &&
+					member->GetPosition().GetDistance(player->GetPosition()) < radius && second->GetPosition().GetDistance(player->GetPosition()) < radius &&
+					outside->GetPosition().GetDistance(player->GetPosition()) > radius;
+				g_ctx["symbols"] = Gear::ReagentCounts()[21177];
+				Bridge::SetTarget(member); Cast::RefreshCooldownsForTesting(); BookReady(); Cast::Use(25916);
+				g_ctx["at"] = t; g_ctx["stage"] = 3; return false;
+			}
+			if (t - g_ctx["at"].get<double>() < 2 || Cast::Casting()) return false;
+			if (stage == 3 || stage == 5) {
+				const auto key = stage == 3 ? "follower_cast" : "self_cast";
+				const auto state = Cast::TalentDiagnostics(); g_ctx["evidence"][key] = state["auras"];
+				for (auto* actor : {member, second, static_cast<RE::Actor*>(nullptr)}) {
+					const auto id = actor ? actor->GetFormID() : player->GetFormID();
+					g_ctx["checks"][std::format("{}_member_{}", key, id)] = !PaladinAura(25916, actor).empty() && PaladinAura(25291, actor).empty() &&
+						std::ranges::count_if(state["auras"], [id](const json& a) { return a["target"] == id && a.value("stack", "") == "Blessing"; }) == 1;
+				}
+				g_ctx["checks"][std::string(key) + "_outside_excluded"] = PaladinAura(25916, outside).empty();
+				g_ctx["checks"][std::string(key) + "_one_symbol"] = Gear::ReagentCounts()[21177] == g_ctx["symbols"].get<int>() - 1;
+				if (stage == 5) return PaladinFinish(result);
+				Bridge::SetTarget(member); Cast::RefreshCooldownsForTesting(); BookReady(); Cast::Use(25291);
+				g_ctx["at"] = t; g_ctx["stage"] = 4; return false;
+			}
+			g_ctx["evidence"]["lesser_cast"] = Cast::TalentDiagnostics()["auras"];
+			g_ctx["checks"]["lesser_replaces_only_target"] = !PaladinAura(25291, member).empty() && PaladinAura(25916, member).empty() &&
+				!PaladinAura(25916, second).empty() && !PaladinAura(25916).empty() && PaladinAura(25291, second).empty() && PaladinAura(25291).empty() &&
+				PaladinAura(25291, outside).empty() && PaladinAura(25916, outside).empty();
+			g_ctx["checks"]["lesser_no_symbol"] = Gear::ReagentCounts()[21177] == g_ctx["symbols"].get<int>() - 1;
+			// Remove the other Greater blessings so a self-cast must reach both the player and the second follower anew.
+			Cast::EndAura(25916); Cast::EndAura(25916, second);
+			g_ctx["symbols"] = Gear::ReagentCounts()[21177];
+			Bridge::SetTarget(player); Cast::RefreshCooldownsForTesting(); BookReady(); Cast::Use(25916);
+			g_ctx["at"] = t; g_ctx["stage"] = 5; return false;
+		}
+
+		bool PaladinPartyHits(double t, json& result)
+		{
+			if (t == 0) { PaladinFixture({{"1421",5},{"1422",5},{"1423",5},{"1425",2},{"1630",3},{"1431",1}}); return false; }
+			auto* member = PaladinActor("follower"); auto* enemy = PaladinActor("enemy"); auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!member || !enemy) return PaladinFinish(result, "missing party hit fixtures");
+			if (!Progression::Ready() || !member->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"];
+			const auto spell = i == 0 || i == 1 || i == 4 || i == 6 || i == 7 ? 20914u : 20729u;
+			if (stage == 0) {
+				Cast::ResetForTesting(); BookReady();
+				for (auto* actor : {static_cast<RE::Actor*>(player), member, enemy}) actor->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				PaladinResolve(spell, member);
+				if (i == 3) PaladinResolve(1020, nullptr, "shield");
+				g_ctx["tick"] = 0; g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply") || (i == 3 && !g_ctx.contains("shield"))) return false;
+				if (!g_ctx["reply"].value("ok", false) || (i == 3 && !g_ctx["shield"].value("ok", false))) return PaladinFinish(result, "party blessing resolve failed");
+				Cast::ApplyForTesting(spell, g_ctx["reply"], member);
+				if (i == 3) Cast::ApplyForTesting(1020, g_ctx["shield"]);
+				g_ctx["member_health"] = member->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["player_health"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["enemy_health"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				if (i == 4) Cast::WeaponHitForTesting(enemy, member, 30);
+				else if (i == 5) Carriers::NativeHitForTesting(enemy, member, 30);
+				else if (i == 6) Cast::WeaponHitForTesting(enemy, member, 0, true);
+				else if (i >= 7) g_ctx["requests"] = Cast::TalentDiagnostics().value("party_hit_requests", 0);
+				else Cast::PartyHitForTesting(member, enemy, i == 6 ? 0.f : 30.f, i == 1 || i == 6);
+				g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (i >= 7 && t - g_ctx["at"].get<double>() < .3) {
+				// Many sub-flat native slices, spread across real frames, must consume only one blessing budget.
+				for (int n = 0; n < 5; ++n) Carriers::NativeHitForTesting(enemy, member, .5f);
+				return false;
+			}
+			const auto state = Cast::TalentDiagnostics();
+			if (!state.contains("party_hit") || t - g_ctx["at"].get<double>() < .5 ||
+				(i >= 7 && state.value("party_hit_requests", 0) <= g_ctx["requests"].get<int>())) return false;
+			const auto hit = state["party_hit"], out = hit["reply"];
+			if (i >= 7 && (hit["request"]["attack"].value("kind", "") != "spell" || hit.value("serial", 0) <= g_ctx["requests"].get<int>())) return false;
+			const auto key = std::to_string(i) + (i >= 7 ? "_tick_" + std::to_string(g_ctx["tick"].get<int>()) : "");
+			if (!out.value("ok", false)) return PaladinFinish(result, "party_hit service request failed");
+			g_ctx["evidence"][key] = hit;
+			g_ctx["checks"]["member_damage_" + key] = std::abs(g_ctx["member_health"].get<float>() - member->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - out.value("member_damage", -1000.f)) < .1f;
+			float transferred = 0, procDamage = 0;
+			for (const auto& e : out.value("events", json::array())) if (e.value("type", "") == "damage_transfer") transferred += e.value("amount", 0.f);
+			for (const auto& proc : out.value("procs", json::array())) for (const auto& e : proc.value("events", json::array())) if (e.value("type", "") == "damage") procDamage += e.value("amount", 0.f);
+			g_ctx["checks"]["unmitigated_transfer_" + key] = std::abs(g_ctx["player_health"].get<float>() - player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - transferred) < .1f;
+			if (i == 1 || i == 6) g_ctx["checks"]["sanctuary_block_attacker_" + key] = procDamage > 0 && std::abs(g_ctx["enemy_health"].get<float>() - enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - procDamage) < 1.f;
+			if (i == 2) g_ctx["checks"]["sacrifice_transfers"] = transferred > 0;
+			if (i == 3) g_ctx["checks"]["immune_caster_no_transfer"] = transferred == 0 && out.value("member_damage", 0.f) == 30.f;
+			if (i == 4) g_ctx["checks"]["native_weapon_party_hit"] = hit["request"]["attack"]["kind"] == "melee" && !hit.value("synchronous", true);
+			if (i == 5) g_ctx["checks"]["native_spell_synchronous"] = hit.value("synchronous", false) && hit.value("snapshot_matches", false);
+			if (i == 6) g_ctx["checks"]["sanctuary_full_block"] = out.value("member_damage", -1.f) == 0 && procDamage > 0;
+			if (i >= 7) {
+				g_ctx["checks"]["one_party_request_" + key] = state.value("party_hit_requests", 0) == g_ctx["requests"].get<int>() + 1;
+				g_ctx["checks"]["stream_deals_damage_" + key] = out.value("member_damage", 0.f) > 0;
+				g_ctx["checks"]["stream_snapshot_" + key] = hit.value("snapshot_matches", false);
+				if (g_ctx["tick"] == 0) {
+					g_ctx["tick"] = 1; g_ctx["at"] = t;
+					g_ctx["requests"] = state.value("party_hit_requests", 0);
+					g_ctx["member_health"] = member->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+					g_ctx["player_health"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+					return false;
+				}
+				if (i == 8) return PaladinFinish(result);
+			}
+			g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+		}
+
+		bool PaladinFreedom(double t, json& result)
+		{
+			if (t == 0) { PaladinFixture(json::object()); return false; }
+			auto* follower = PaladinActor("follower");
+			if (!follower) return PaladinFinish(result, "missing Freedom follower");
+			if (!Progression::Ready() || !follower->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"];
+			auto* who = i == 0 ? static_cast<RE::Actor*>(RE::PlayerCharacter::GetSingleton()) : follower;
+			const auto key = std::to_string(i);
+			if (stage == 0) {
+				Cast::ResetForTesting(); BookReady();
+				g_ctx["speed"] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult);
+				Carriers::NativeForTesting(who, "Paladin purge fixture", RE::ActorValue::kSpeedMult, -20, 30);
+				if (i == 1) Cast::ApplyForTesting(339, {{"name", "Root fixture"}, {"auras", json::array({{{"type", "root"}, {"duration_ms", 30000}}})}}, who);
+				else Carriers::Root(who, 30);
+				PaladinResolve(1044, i == 0 ? nullptr : who); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "Freedom resolve failed");
+				Cast::ApplyForTesting(1044, g_ctx["reply"], i == 0 ? nullptr : who);
+				g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (t - g_ctx["at"].get<double>() < .5) return false;
+			if (stage == 2) {
+				g_ctx["checks"]["purged_" + key] = Cast::MovementImmune(who) && PaladinAura(339, who).empty() && std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult) - g_ctx["speed"].get<float>()) < .1f;
+				Carriers::NativeForTesting(who, "Paladin purge fixture", RE::ActorValue::kSpeedMult, -20, 3);
+				Carriers::Root(who, 3);
+				if (i == 1) Cast::ApplyForTesting(339, {{"name", "Root fixture"}, {"auras", json::array({{{"type", "root"}, {"duration_ms", 3000}}})}}, who);
+				g_ctx["at"] = t; g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				g_ctx["checks"]["refused_" + key] = PaladinAura(339, who).empty() && std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult) - g_ctx["speed"].get<float>()) < .1f;
+				g_ctx["stage"] = 4; return false;
+			}
+			if (t - g_ctx["at"].get<double>() < 10.5) return false;
+			if (stage == 4) {
+				g_ctx["checks"]["expired_without_speed_drift_" + key] = !Cast::MovementImmune(who) && std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult) - g_ctx["speed"].get<float>()) < .1f;
+				Carriers::NativeForTesting(who, "Paladin purge fixture", RE::ActorValue::kSpeedMult, -20, 3);
+				g_ctx["at"] = t - 10; g_ctx["stage"] = 5; return false;
+			}
+			g_ctx["checks"]["slow_after_freedom_" + key] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult) < g_ctx["speed"].get<float>() - 10;
+			Carriers::ClearNativeForTesting(who);
+			if (i == 1) return PaladinFinish(result);
+			g_ctx["case"] = 1; g_ctx["stage"] = 0; return false;
+		}
+
+		const json& PaladinHolyTalents()
+		{
+			static const json talents = {{"1433",1},{"1461",5},{"1449",5},{"1450",5},{"1432",5},
+				{"1463",5},{"1435",1},{"1443",2},{"1444",1},{"1502",1}};
+			return talents;
+		}
+
+		bool PaladinHolyShock(double t, json& result)
+		{
+			if (t == 0) { PaladinFixture(PaladinHolyTalents()); return false; }
+			auto* follower = PaladinActor("follower"); auto* enemy = PaladinActor("enemy"); auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!follower || !enemy) return PaladinFinish(result, "missing Holy Shock fixtures");
+			if (!Progression::Ready() || !follower->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"];
+			auto* who = i == 0 ? static_cast<RE::Actor*>(player) : i == 1 || i == 3 ? follower : enemy;
+			if (stage == 0) {
+				Cast::ResetForTesting(); BookReady();
+				who->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				if (i != 2 && i != 4) who->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kHealth, 60);
+				g_ctx["health_before"] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				if (i < 3) { PaladinResolve(20930, i == 0 ? nullptr : who); g_ctx["stage"] = 1; }
+				// The real cast: the earlier cases started Holy Shock's 30-second cooldown.
+				else { Cast::RefreshCooldownsForTesting(); Bridge::SetTarget(who); Cast::Use(20930); g_ctx["at"] = t; g_ctx["stage"] = 2; }
+				return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				const auto out = g_ctx["reply"];
+				if (!out.value("ok", false) || out.value("procs", json::array()).empty()) return PaladinFinish(result, "Holy Shock payload missing");
+				g_ctx["evidence"][std::to_string(i)] = out;
+				Cast::BeginForTesting(20930, out, i == 0 ? nullptr : who);
+				g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (Cast::Casting() || t - g_ctx["at"].get<double>() < .5) return false;
+			const auto state = Cast::TalentDiagnostics();
+			json proc;
+			for (const auto& p : state.value("paladin_procs", json::array())) if (p.contains("holy_shock")) proc = p;
+			if (proc.is_null()) return PaladinFinish(result, "Holy Shock did not reach proc application");
+			float amount = 0;
+			for (const auto& e : proc.value("events", json::array())) if (e.value("type", "") == "heal" || e.value("type", "") == "damage") amount += e.value("amount", 0.f);
+			if ((i == 2 || i == 4) && amount <= 0) {
+				g_ctx["shock_retries"] = g_ctx.value("shock_retries", 0) + 1;
+				if (g_ctx["shock_retries"].get<int>() > 20) return PaladinFinish(result, "Holy Shock damage never landed");
+				if (i == 2) {
+					PaladinAsk({{"op", "resolve"}, {"spell", 20930}, {"caster", PaladinCaster()}, {"target", PaladinTarget(who)}, {"seed", g_ctx["shock_retries"]}});
+					g_ctx["stage"] = 1;
+				} else g_ctx["stage"] = 0;
+				return false;
+			}
+			const bool heal = i == 0 || i == 1 || i == 3;
+			const float delta = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - g_ctx["health_before"].get<float>();
+			g_ctx["checks"]["holy_shock_target_" + std::to_string(i)] = proc.value("holy_shock", "") == (heal ? "heal" : "damage") &&
+				std::abs(delta - (heal ? std::min(60.f, amount) : -amount)) < 1.f;
+			if (!heal) g_ctx["checks"]["holy_shock_strikes_" + std::to_string(i)] = amount > 0;
+			g_ctx["evidence"]["applied_" + std::to_string(i)] = {{"proc", proc}, {"delta", delta}};
+			if (i == 4) return PaladinFinish(result);
+			g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+		}
+
+		bool PaladinTalentAuras(double t, json& result)
+		{
+			if (t == 0) {
+				PaladinFixture({{"1411",5},{"1401",5},{"1407",5},{"1403",5},{"1464",3},{"1631",2},{"1402",5},{"1633",3}});
+				g_ctx["attempt"] = 0; return false;
+			}
+			auto* enemy = PaladinActor("enemy"); auto* follower = PaladinActor("follower"); auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!enemy || !follower) return PaladinFinish(result, "missing talent aura fixtures");
+			if (!Progression::Ready() || !follower->Is3DLoaded()) return false;
+			const int stage = g_ctx["stage"];
+			if (stage == 0) {
+				if (g_ctx["attempt"].get<int>() > 600) return PaladinFinish(result, "talent procs not observed in 601 rolls");
+				// Their target: the interface keeps a unit's debuffs (Vindication's) only for a unit it shows.
+				if (Bridge::Target() != enemy) Bridge::SetTarget(enemy);
+				PaladinAsk({{"op", "melee"}, {"caster", PaladinCaster()}, {"target", PaladinTarget(enemy)}, {"seed", g_ctx["attempt"]}});
+				g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				const auto out = g_ctx["reply"];
+				if (!out.value("ok", false)) return PaladinFinish(result, "talent swing refused");
+				Cast::MeleeEffects(out, enemy);
+				for (const auto& proc : out.value("procs", json::array())) for (const auto& a : proc.value("auras", json::array())) {
+					if (a.value("type", "") == "stat_percent") { g_ctx["vindication"] = proc["spell"]; g_ctx["evidence"]["vindication"] = proc; }
+					if (a.value("type", "") == "damage_done_percent") { g_ctx["vengeance"] = proc["spell"]; g_ctx["evidence"]["vengeance"] = proc; }
+				}
+				if (!g_ctx.contains("vindication") || !g_ctx.contains("vengeance") ||
+					PaladinAura(g_ctx["vindication"].get<std::uint32_t>(), enemy).empty() || PaladinAura(g_ctx["vengeance"].get<std::uint32_t>()).empty()) {
+					g_ctx["attempt"] = g_ctx["attempt"].get<int>() + 1; g_ctx["stage"] = 0; return false;
+				}
+				g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				if (t - g_ctx["at"].get<double>() < .5) return false;
+				const auto vindication = g_ctx["vindication"].get<std::uint32_t>(), vengeance = g_ctx["vengeance"].get<std::uint32_t>();
+				g_ctx["checks"]["vindication_debuff"] = PaladinAura(vindication, enemy).value("effects", json::array()).size() == 2;
+				g_ctx["checks"]["vindication_target_roundtrip"] = std::ranges::any_of(PaladinTarget(enemy)["auras"], [vindication](const json& id) { return id == vindication; });
+				g_ctx["checks"]["vengeance_caster_roundtrip"] = std::ranges::any_of(PaladinCaster()["auras"], [vengeance](const json& id) { return id == vengeance; });
+				g_ctx["checks"]["talent_auras_visible"] = WowUi::Eval(std::format(R"((function()
+					local debuff,buff=false,false
+					for _,a in ipairs((__WB.units[{}] or {{}}).debuffs or {{}}) do if a.spell=={} then debuff=true end end
+					for _,a in ipairs((__WB.units[__WB.tokens.player] or {{}}).buffs or {{}}) do if a.spell=={} then buff=true end end
+					return debuff and buff and 1 or 0 end)())", enemy->GetFormID(), vindication, vengeance)) == "1";
+				g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				if (t - g_ctx["at"].get<double>() < 10.5) return false;
+				g_ctx["checks"]["talent_procs_expire"] = PaladinAura(g_ctx["vindication"].get<std::uint32_t>(), enemy).empty() && PaladinAura(g_ctx["vengeance"].get<std::uint32_t>()).empty();
+				Cast::ResetForTesting();
+				auto progress = Progression::SnapshotForTesting(); progress["talents"] = PaladinHolyTalents(); Progression::RestoreForTesting(progress);
+				g_ctx["case"] = 0; g_ctx["stage"] = 4; return false;
+			}
+			const int i = g_ctx["case"]; auto* who = i == 0 ? follower : static_cast<RE::Actor*>(player);
+			if (stage == 4) {
+				Cast::ResetForTesting(); BookReady();
+				g_ctx["armor_before"] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kDamageResist);
+				PaladinResolve(10310, i == 0 ? who : nullptr); g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "talented Lay on Hands refused");
+				Cast::BeginForTesting(10310, g_ctx["reply"], i == 0 ? who : nullptr);
+				g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			if (t - g_ctx["at"].get<double>() < .5) return false;
+			if (stage == 6) {
+				json proc;
+				for (const auto& p : g_ctx["reply"].value("procs", json::array())) if (std::ranges::any_of(p.value("auras", json::array()), [](const json& a) { return a.value("type", "") == "armor_from_items_percent"; })) proc = p;
+				if (proc.is_null()) return PaladinFinish(result, "Improved Lay on Hands payload missing");
+				g_ctx["evidence"]["lay_hands_" + std::to_string(i)] = proc;
+				const auto spell = proc.value("spell", 0u);
+				g_ctx["checks"]["item_armor_aura_" + std::to_string(i)] = !PaladinAura(spell, i == 0 ? who : nullptr).empty();
+				g_ctx["armor_buffed"] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kDamageResist);
+				float worn = 0;
+				for (const auto& [form, data] : who->GetInventory([](RE::TESBoundObject& item) { return item.IsArmor(); })) if (data.second && data.second->IsWorn())
+					worn += who == player ? player->GetArmorValue(data.second.get()) : form->As<RE::TESObjectARMO>()->GetArmorRating();
+				g_ctx["checks"]["item_armor_native_" + std::to_string(i)] = std::abs(g_ctx["armor_buffed"].get<float>() - g_ctx["armor_before"].get<float>() - worn * .3f) < .1f;
+				Cast::TalentEffects(g_ctx["reply"], i == 0 ? who : nullptr);
+				g_ctx["at"] = t; g_ctx["stage"] = 7; return false;
+			}
+			g_ctx["checks"]["item_armor_refresh_no_drift_" + std::to_string(i)] = std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kDamageResist) - g_ctx["armor_buffed"].get<float>()) < .1f;
+			Cast::ResetForTesting();
+			g_ctx["checks"]["item_armor_removed_" + std::to_string(i)] = std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kDamageResist) - g_ctx["armor_before"].get<float>()) < .1f;
+			if (i == 1) return PaladinFinish(result);
+			g_ctx["case"] = 1; g_ctx["stage"] = 4; return false;
+		}
+
+		bool PaladinSeals(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			const std::array<std::uint32_t, 7> seals{20154, 20293, 20920, 20349, 20357, 20164, 20308};
+			const std::array<const char*, 7> kinds{"damage", "damage", "damage", "heal", "power", "stun", "passive"};
+			if (t == 0) { PaladinFixture({{"1407", 5}, {"1403", 5}, {"1481", 1}}); return false; }
+			auto* enemy = PaladinActor("enemy");
+			if (!enemy) return PaladinFinish(result, "missing seal wolf");
+			if (!Progression::Ready() || !enemy->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"]; const auto seal = seals[i];
+			const auto key = std::to_string(seal);
+			if (stage == 0) {
+				Cast::RefreshCooldownsForTesting(); BookReady(); PaladinResolve(seal); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "seal service request failed");
+				Cast::BeginForTesting(seal, g_ctx["reply"]); g_ctx["at"] = t; g_ctx["attempt"] = 0; g_ctx["stage"] = 2;
+				player->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				player->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kHealth, 15);
+				player->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kMagicka, 100);
+				return false;
+			}
+			if (stage == 2) {
+				if (t - g_ctx["at"].get<double>() < .15) return false;
+				int count = 0; const auto state = Cast::TalentDiagnostics(); for (const auto& a : state["auras"]) if (a.value("stack", "") == "Seal") ++count;
+				g_ctx["checks"]["one_seal_" + key] = count == 1 && !PaladinAura(seal).empty();
+				const int seed = g_ctx["attempt"]; if (seed > 220) return PaladinFinish(result, "seal proc not observed in 221 rolls");
+				PaladinAsk({{"op", "melee"}, {"caster", PaladinCaster()}, {"target", PaladinTarget(enemy)}, {"seed", seed}});
+				g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				if (!g_ctx.contains("reply")) return false;
+				const auto out = g_ctx["reply"];
+				if (!out.value("ok", false)) return PaladinFinish(result, "seal swing refused");
+				bool proc = i == 6;
+				for (const auto& p : out.value("procs", json::array())) if (p.value("source_spell", 0u) == seal) {
+					for (const auto& e : p.value("events", json::array())) if (e.value("type", "") == kinds[i]) proc = true;
+					if (i == 5 && !p.value("auras", json::array()).empty()) { proc = true; enemy->EnableAI(true); }
+				}
+				if (!proc) { g_ctx["attempt"] = g_ctx["attempt"].get<int>() + 1; g_ctx["stage"] = 2; return false; }
+				g_ctx["evidence"][key]["swing"] = out;
+				g_ctx["hp_before"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["mp_before"] = Cast::Mana(); g_ctx["victim_before"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Melee::CompletionForTesting(enemy)(out);
+				if (i == 0) g_ctx["base_delay"] = out["delay_ms"];
+				if (i == 6) g_ctx["checks"]["crusader_faster_swings"] = out.value("delay_ms", 2000) < g_ctx["base_delay"].get<int>();
+				g_ctx["at"] = t; g_ctx["stage"] = 4; return false;
+			}
+			if (stage == 4) {
+				if (t - g_ctx["at"].get<double>() < .35) return false;
+				g_ctx["checks"]["white_hit_" + key] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) < g_ctx["victim_before"].get<float>();
+				if (i == 3) g_ctx["checks"]["light_heals_caster"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) > g_ctx["hp_before"].get<float>();
+				if (i == 4) g_ctx["checks"]["wisdom_restores_mana"] = Cast::Mana() > g_ctx["mp_before"].get<int>();
+				if (i == 5) {
+					bool stunned = false; const auto state = Cast::TalentDiagnostics(); for (const auto& a : state["auras"]) if (a["target"] == enemy->GetFormID() && a.value("stun", false)) stunned = true;
+					g_ctx["evidence"]["justice_stun"] = {{"aura", stunned}, {"paralysis", enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kParalysis)}, {"auras", state["auras"]}};
+					g_ctx["checks"]["justice_stuns"] = stunned && Paralyzed(enemy);
+					enemy->EnableAI(false);
+				}
+				const auto caster = PaladinCaster();
+				for (const auto& p : g_ctx["evidence"][key]["swing"].value("procs", json::array())) if (p.value("source_spell", 0u) == seal && p.value("cooldown_ms", 0) > 0)
+					g_ctx["checks"]["proc_cooldown_" + key] = caster["proc_cooldowns"].value(key, 0) > 0;
+				Cast::RefreshCooldownsForTesting(); PaladinResolve(20271, enemy); g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "Judgement refused");
+				g_ctx["evidence"][key]["judgement"] = g_ctx["reply"];
+				Cast::BeginForTesting(20271, g_ctx["reply"], enemy); g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			if (stage == 6) {
+				if (t - g_ctx["at"].get<double>() < .3) return false;
+				g_ctx["checks"]["judgement_consumes_" + key] = i == 0 ? !PaladinAura(seal).empty() : PaladinAura(seal).empty();
+				const auto target = PaladinTarget(enemy);
+				g_ctx["checks"]["one_judgement_" + key] = target["judgements"].size() <= 1;
+				if (i >= 3) {
+					if (target["judgements"].size() != 1) return PaladinFinish(result, "judgement debuff missing");
+					if (i == 3) {
+						const float health = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+						player->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kHealth, health * .5f);
+					}
+					if (i == 4) player->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kMagicka, 100);
+					g_ctx["judged"] = target["judgements"][0]; g_ctx["judge_attempt"] = 1;
+					PaladinAsk({{"op", "melee"}, {"caster", PaladinCaster()}, {"target", target}, {"seed", 1}});
+					g_ctx["stage"] = 7; return false;
+				}
+				g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+			}
+			if (stage == 7) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false) || !g_ctx["reply"].value("refresh_judgements", false)) return PaladinFinish(result, "judgement refresh swing failed");
+				if (i == 3 || i == 4) {
+					const auto source = g_ctx["judged"].get<std::uint32_t>();
+					bool proc = false; for (const auto& p : g_ctx["reply"].value("procs", json::array())) if (p.value("source_spell", 0u) == source) proc = true;
+					if (!proc) {
+						const int seed = g_ctx["judge_attempt"].get<int>() + 1; g_ctx["judge_attempt"] = seed;
+						if (seed > 60) return PaladinFinish(result, "judgement proc not observed");
+						PaladinAsk({{"op", "melee"}, {"caster", PaladinCaster()}, {"target", PaladinTarget(enemy)}, {"seed", seed}}); return false;
+					}
+					g_ctx["hp_before"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth); g_ctx["mp_before"] = Cast::Mana();
+				}
+				Melee::CompletionForTesting(enemy)(g_ctx["reply"]);
+				if (i == 3) g_ctx["checks"]["judged_light_heals"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) > g_ctx["hp_before"].get<float>();
+				if (i == 4) g_ctx["checks"]["judged_wisdom_mana"] = Cast::Mana() > g_ctx["mp_before"].get<int>();
+				g_ctx["checks"]["refresh_" + key] = PaladinAura(g_ctx["judged"].get<std::uint32_t>(), enemy).value("remaining", 0.) > 9.9;
+				if (i == 5) g_ctx["checks"]["justice_prevents_fleeing"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kConfidence) >= 4;
+				if (i == 6) return PaladinFinish(result);
+				g_ctx["case"] = i + 1; g_ctx["stage"] = 0;
+			}
+			return false;
+		}
+
+		bool PaladinImmunity(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton(); auto* av = player->AsActorValueOwner();
+			const std::array<std::uint32_t, 4> spells{5573, 1020, 10278, 10278};
+			if (t == 0) { PaladinFixture(json::object()); return false; }
+			auto* enemy = PaladinActor("enemy"); auto* follower = PaladinActor("follower");
+			if (!enemy || !follower) return PaladinFinish(result, "missing immunity fixtures");
+			if (!Progression::Ready() || !enemy->Is3DLoaded() || !follower->Is3DLoaded()) return false;
+			const int i = g_ctx["case"], stage = g_ctx["stage"]; const auto spell = spells[i];
+			auto* who = i == 3 ? follower : static_cast<RE::Actor*>(player);
+			const auto key = std::to_string(spell) + (i == 3 ? "_follower" : "_self");
+			if (stage == 0) {
+				Cast::ResetForTesting(); BookReady(); av->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				g_ctx["native_attack_speed"] = av->GetActorValue(RE::ActorValue::kWeaponSpeedMult);
+				Carriers::NativeForTesting(who, "Paladin purge fixture", RE::ActorValue::kSpeedMult, -20, 30);
+				PaladinResolve(spell, i == 3 ? follower : nullptr); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "protection service request failed");
+				g_ctx["evidence"][key]["cast"] = g_ctx["reply"];
+				Cast::BeginForTesting(spell, g_ctx["reply"], i == 3 ? follower : nullptr); g_ctx["cast_at"] = t; g_ctx["at"] = t;
+				g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				if (t - g_ctx["at"].get<double>() < .4) return false;
+				const auto protection = PaladinAura(spell, i == 3 ? follower : nullptr), forbearance = PaladinAura(25771, i == 3 ? follower : nullptr);
+				g_ctx["checks"]["separate_timers_" + key] = protection.value("remaining", 0.) > 0 && protection.value("remaining", 60.) <= 12 && forbearance.value("remaining", 0.) > 58;
+				if (i == 1) g_ctx["checks"]["shield_native_half_speed"] = std::abs(av->GetActorValue(RE::ActorValue::kWeaponSpeedMult) - (g_ctx["native_attack_speed"].get<float>() - .5f)) < .01f;
+				g_ctx["checks"]["immunity_mask_" + key] = protection.value("immunity", 0u) == (i < 2 ? 127u : 1u);
+				bool purged = true;
+				if (auto* effects = who->GetActiveEffectList()) for (auto* e : *effects) if (e && e->spell && e->spell->GetName() &&
+					std::string_view(e->spell->GetName()) == "Paladin purge fixture" && !e->flags.any(RE::ActiveEffect::Flag::kDispelled)) purged = false;
+				g_ctx["checks"]["purges_hostile_" + key] = purged;
+				Melee::Start(enemy);
+				g_ctx["checks"]["pacify_" + key] = i == 1 || i == 3 ? Melee::Attacking() : !Melee::Attacking(); Melee::Stop();
+				const auto timers = Cast::Snapshot()["cooldowns"];
+				bool shared = true; for (const auto& id : g_ctx["evidence"][key]["cast"].value("category_spells", json::array())) if (timers.value(std::to_string(id.get<std::uint32_t>()), 0.) <= 0) shared = false;
+				g_ctx["checks"]["category_cooldowns_" + key] = shared;
+				for (const auto blocked : {5573u, 1020u, 10278u}) PaladinResolve(blocked, i == 3 ? follower : nullptr, std::to_string(blocked).c_str());
+				if (i == 1) {
+					auto caster = PaladinCaster(); PaladinAsk({{"op", "melee"}, {"caster", caster}, {"target", PaladinTarget(enemy)}, {"seed", 1}}, "shield_swing");
+					caster["auras"] = json::array(); PaladinAsk({{"op", "melee"}, {"caster", caster}, {"target", PaladinTarget(enemy)}, {"seed", 1}}, "plain_swing");
+				}
+				g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				for (const auto blocked : {5573u, 1020u, 10278u}) {
+					const auto k = std::to_string(blocked); if (!g_ctx.contains(k)) return false;
+					g_ctx["checks"]["forbearance_" + key + "_" + k] = g_ctx[k].value("error", "") == "SPELL_FAILED_TARGET_AURASTATE";
+				}
+				if (i == 1) {
+					if (!g_ctx.contains("shield_swing") || !g_ctx.contains("plain_swing")) return false;
+					g_ctx["checks"]["divine_shield_double_delay"] = g_ctx["shield_swing"].value("delay_ms", 0) == 2 * g_ctx["plain_swing"].value("delay_ms", -1);
+				}
+				g_ctx["health_before"] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Cast::WeaponHitForTesting(enemy, who, 2);
+				g_ctx["checks"]["pre_damage_zero_" + key] = std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - g_ctx["health_before"].get<float>()) < .01f;
+				g_ctx["at"] = t; g_ctx["stage"] = 4; return false;
+			}
+			if (stage == 4) {
+				if (t - g_ctx["at"].get<double>() < .5) return false;
+				const auto state = Cast::TalentDiagnostics();
+				if (i != 3 && !state.contains("incoming")) return false;
+				g_ctx["checks"]["physical_immune_" + key] = std::abs(who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) - g_ctx["health_before"].get<float>()) < .01f;
+				if (i != 3) g_ctx["checks"]["wow_immune_reply_" + key] = state["incoming"]["reply"].value("defense", json::object()).value("outcome", "") == "immune";
+				g_ctx["health_before"] = who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Carriers::NativeHitForTesting(enemy, who, 2); g_ctx["at"] = t; g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				if (t - g_ctx["at"].get<double>() < .6) return false;
+				const float lost = g_ctx["health_before"].get<float>() - who->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["checks"]["school_filter_" + key] = i < 2 ? std::abs(lost) < .01f : lost > 0;
+				enemy->EnableAI(true); enemy->StopCombat(); enemy->StartCombat(who);
+				g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			if (stage == 6) {
+				if (t - g_ctx["at"].get<double>() < .6) return false;
+				auto* combat = enemy->GetActorRuntimeData().combatController;
+				g_ctx["checks"]["suppressed_threat_" + key] = combat && combat->targetHandle.get().get() == (i == 3 ? static_cast<RE::Actor*>(player) : follower);
+				enemy->EnableAI(false); enemy->StopCombat(); follower->StopCombat();
+				g_ctx["evidence"][key]["state"] = Cast::TalentDiagnostics();
+				g_ctx["stage"] = 7;
+			}
+			if (i == 1 && t - g_ctx["cast_at"].get<double>() < 12.3) return false;
+			if (i == 1) g_ctx["checks"]["forbearance_outlasts_shield"] = PaladinAura(1020).empty() && PaladinAura(25771).value("remaining", 0.) > 45;
+			if (i == 3) return PaladinFinish(result);
+			g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+		}
+
+		RE::Actor* PaladinCreature(const char* keyword, float forward, float right)
+		{
+			for (auto* base : RE::TESDataHandler::GetSingleton()->GetFormArray<RE::TESNPC>()) {
+				if (!base || !base->race || base->IsUnique() || base->IsEssential() || base->IsProtected() ||
+					!base->race->HasKeywordString(keyword) || base->race->HasKeywordString("ActorTypeNPC")) continue;
+				// Not a storm atronach: its floating body never gives the player a clear line of sight (Holy Wrath skipped it).
+				if (const char* name = base->GetName(); name && std::string_view(name).find("Storm") != std::string_view::npos) continue;
+				auto* actor = SpawnAhead(base, forward, right);
+				// A hostile one: an area spell's targets are their foes (a summoned or merchant daedra is not).
+				if (actor && Bridge::Reaction(actor) > 2) { actor->Disable(); continue; }
+				if (actor) {
+					actor->EnableAI(false); actor->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth, 10000);
+					actor->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate, 0);
+					actor->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				}
+				return actor;
+			}
+			return nullptr;
+		}
+		bool PaladinControl(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			const std::array<std::uint32_t, 7> spells{10308, 24239, 10314, 10326, 10318, 20924, 25780};
+			if (t == 0) {
+				PaladinFixture({{"1450",5},{"1449",5},{"1435",1}});
+				auto* undead = PaladinCreature("ActorTypeUndead", 220, -120); auto* demon = PaladinCreature("ActorTypeDaedra", 260, 160);
+				if (undead) g_ctx["roar_second"] = undead->GetFormID(); if (demon) g_ctx["roar_outside"] = demon->GetFormID();
+				return false;
+			}
+			auto* enemy = PaladinActor("enemy"); auto* follower = PaladinActor("follower");
+			auto* undead = PaladinActor("roar_second"); auto* demon = PaladinActor("roar_outside");
+			if (!enemy || !follower || !undead || !demon) return PaladinFinish(result, "missing wolf, follower, Undead or Demon fixture");
+			if (!Progression::Ready() || !enemy->Is3DLoaded() || !undead->Is3DLoaded() || !demon->Is3DLoaded()) return false;
+			if (std::string_view(Bridge::CreatureTypeName(undead)) != "Undead" || std::string_view(Bridge::CreatureTypeName(demon)) != "Demon") return PaladinFinish(result, "native creature-type fixture mismatch");
+			const int i = g_ctx["case"], stage = g_ctx["stage"]; const auto spell = spells[i]; const auto key = std::to_string(spell);
+			auto* target = i < 2 ? enemy : i < 4 ? undead : nullptr;
+			if (stage == 0) {
+				Cast::RefreshCooldownsForTesting(); BookReady();
+				if (i == 0) enemy->EnableAI(true);
+				if (i == 1) {
+					enemy->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+					enemy->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kHealth, 8000);
+					PaladinResolve(spell, enemy, "rejected");
+					enemy->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kHealth, 1);
+				}
+				if (i == 2) PaladinResolve(spell, enemy, "rejected");
+				if (i == 3) PaladinResolve(spell, demon, "rejected");
+				PaladinResolve(spell, target); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply") || (i > 0 && i < 4 && !g_ctx.contains("rejected"))) return false;
+				const auto out = g_ctx["reply"];
+				if (!out.value("ok", false)) return PaladinFinish(result, "control service request failed");
+				if (i > 0 && i < 4) g_ctx["checks"]["gate_" + key] = g_ctx["rejected"].value("error", "") == (i == 1 ? "SPELL_FAILED_TARGET_AURASTATE" : "SPELL_FAILED_BAD_TARGETS");
+				g_ctx["evidence"][key]["cast"] = out;
+				g_ctx["victim_before"] = target ? target->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) : 0;
+				g_ctx["wolf_before"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Cast::BeginForTesting(spell, out, target); g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				const double elapsed = t - g_ctx["at"].get<double>();
+				if (i == 4 && elapsed > .7 && !g_ctx.value("demon_moved", false)) {
+					// In front of the player within Holy Wrath's 20 yards, in sight (an actor or a wall between them blocks it).
+					PlaceInSight(demon, {{260.f, 160.f}, {240.f, -160.f}, {300.f, 0.f}, {180.f, 120.f}});
+					g_ctx["demon_moved"] = true;
+				}
+				if (Cast::Casting() || elapsed < .4) return false;
+				if (i == 0) {
+					g_ctx["evidence"]["hammer_stun"] = {{"aura", PaladinAura(spell, enemy)}, {"paralysis", enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kParalysis)}};
+					g_ctx["checks"]["hammer_justice_stun"] = PaladinAura(spell, enemy).value("stun", false) && Paralyzed(enemy);
+					g_ctx["checks"]["target_stunned_roundtrip"] = PaladinTarget(enemy).value("stunned", false);
+					Cast::Damaged(enemy, 1);
+					g_ctx["checks"]["hammer_stun_survives_damage"] = !PaladinAura(spell, enemy).empty(); enemy->EnableAI(false);
+				} else if (i == 1 || i == 2) {
+					// Hammer of Wrath flies (35 yd/s): its damage lands with the missile, after the cast.
+					if (target->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) >= g_ctx["victim_before"].get<float>() && elapsed < 3) return false;
+					g_ctx["evidence"][key]["health_after"] = target->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+					g_ctx["evidence"][key]["health_before"] = g_ctx["victim_before"];
+					g_ctx["checks"]["damage_" + key] = target->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) < g_ctx["victim_before"].get<float>();
+				}
+				else if (i == 3) {
+					g_ctx["checks"]["turn_is_fear"] = PaladinAura(spell, undead).value("fear", false) && !PaladinAura(spell, undead).value("stun", false);
+					bool native = false; if (auto* effects = undead->GetActiveEffectList()) for (auto* e : *effects) {
+						const auto* base = e ? e->GetBaseObject() : nullptr;
+						if (base && base->data.archetype == RE::EffectSetting::Archetype::kDemoralize && !e->flags.any(RE::ActiveEffect::Flag::kDispelled)) native = true;
+					}
+					g_ctx["checks"]["turn_native_fear"] = native;
+					const int damage = std::max(50, (25 * undead->GetLevel() - 150 + 3) / 4);
+					Carriers::Damage(undead, static_cast<float>(damage)); Cast::Damaged(undead, damage);
+					g_ctx["stage"] = 6; g_ctx["at"] = t; return false;
+				} else if (i == 4) {
+					const auto state = Cast::TalentDiagnostics(); if (!state.contains("holy_wrath_results")) return false;
+					bool hitsUndead = false, hitsDemon = false, hitsWolf = false;
+					for (const auto& hit : state["holy_wrath_results"]) {
+						if (hit.value("type", "") != "damage") continue;
+						hitsUndead |= hit["id"] == undead->GetFormID(); hitsDemon |= hit["id"] == demon->GetFormID(); hitsWolf |= hit["id"] == enemy->GetFormID();
+					}
+					g_ctx["checks"]["holy_wrath_impact_targets"] = hitsUndead && hitsDemon && !hitsWolf;
+					g_ctx["checks"]["holy_wrath_spares_beast"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) == g_ctx["wolf_before"].get<float>();
+					g_ctx["evidence"][key]["impact"] = state["holy_wrath_results"];
+					g_ctx["evidence"][key]["impact_targets"] = state.value("holy_wrath_targets", json::array());
+					{   // why a fixture is or is not among them
+						bool los = true; const bool sees = player->HasLineOfSight(demon, los); bool high = false;
+						for (auto& h : RE::ProcessLists::GetSingleton()->highActorHandles) if (h.get().get() == demon) high = true;
+						g_ctx["evidence"][key]["demon_state"] = {{"name", demon->GetDisplayFullName()}, {"loaded", demon->Is3DLoaded()},
+							{"dead", demon->IsDead()}, {"disabled", demon->IsDisabled()}, {"reaction", Bridge::Reaction(demon)},
+							{"distance_yd", demon->GetPosition().GetDistance(player->GetPosition()) / Avatar::kUnitsPerYard},
+							{"los", sees}, {"high_process", high}, {"teammate", demon->IsPlayerTeammate()}};
+					}
+					g_ctx["evidence"][key]["ids"] = {{"undead", undead->GetFormID()}, {"demon", demon->GetFormID()}, {"wolf", enemy->GetFormID()}};
+				} else if (i == 5) {
+					const auto state = Cast::TalentDiagnostics(); if (state["ground_areas"].empty()) return PaladinFinish(result, "Consecration area missing");
+					g_ctx["ground_at"] = state["ground_areas"][0]["at"];
+					g_ctx["checks"]["consecration_not_channel"] = state.value("channel_end", 0.) == 0 && !Cast::Casting();
+					player->SetPosition(player->GetPosition() + RE::NiPoint3{400,0,0}, true);
+					PaladinResolve(25292, nullptr, "heal_quote"); g_ctx["stage"] = 3; return false;
+				} else {
+					// Back where the player stood before Consecration's walk, the undead in sight.
+					player->SetPosition(player->GetPosition() - RE::NiPoint3{400,0,0}, true);
+					PlaceInSight(undead, {{220.f, -120.f}, {200.f, 100.f}, {260.f, 0.f}, {160.f, -60.f}});
+					PaladinResolve(10314, undead, "fury_hit"); g_ctx["stage"] = 4; return false;
+				}
+				g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+			}
+			if (stage == 6) {
+				// The break is the service's damage_taken answer: wait for it (up to two seconds), not one fixed moment.
+				if (t - g_ctx["at"].get<double>() < .3 || (!PaladinAura(10326, undead).empty() && t - g_ctx["at"].get<double>() < 2)) return false;
+				g_ctx["checks"]["turn_breaks_on_damage"] = PaladinAura(10326, undead).empty();
+				g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+			}
+			if (stage == 3) {
+				if (!g_ctx.contains("heal_quote")) return false;
+				if (!g_ctx.value("heal_started", false)) {
+					if (!g_ctx["heal_quote"].value("ok", false)) return PaladinFinish(result, "concurrent Holy Light quote failed");
+					Cast::BeginForTesting(25292, g_ctx["heal_quote"]); g_ctx["heal_started"] = true;
+				}
+				const auto state = Cast::TalentDiagnostics();
+				if (!state["ground_areas"].empty()) {
+					g_ctx["checks"]["consecration_fixed_ground"] = state["ground_areas"][0]["at"] == g_ctx["ground_at"];
+					if (Cast::Casting() && state["ground_areas"][0].value("tick", 0) > 0) g_ctx["checks"]["ticks_during_heal"] = true;
+					return false;
+				}
+				if (t - g_ctx["at"].get<double>() < 8.5) return false;
+				g_ctx["checks"]["consecration_eight_ticks"] = state.value("ground_tick", json::object()).value("tick", 0) == 8;
+				g_ctx["checks"]["consecration_damages"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) < g_ctx["wolf_before"].get<float>();
+				g_ctx["case"] = i + 1; g_ctx["stage"] = 0; return false;
+			}
+			if (stage == 4) {
+				if (!g_ctx.contains("fury_hit")) return false;
+				if (!g_ctx["fury_hit"].value("ok", false)) return PaladinFinish(result, "Righteous Fury damage quote failed");
+				g_ctx["checks"]["fury_holy_multiplier"] = g_ctx["fury_hit"].value("threat_multiplier", 1.f) > 1;
+				undead->StopCombat(); undead->StartCombat(follower);
+				g_ctx["redirects"] = Forms::TalentDiagnostics().value("feral_threat_redirects", 0); g_ctx["attempt"] = 0; g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				Cast::ApplyForTesting(10314, g_ctx["fury_hit"], undead);
+				if (Forms::TalentDiagnostics().value("feral_threat_redirects", 0) > g_ctx["redirects"].get<int>()) {
+					g_ctx["checks"]["fury_attracts_pursuer"] = true; return PaladinFinish(result);
+				}
+				g_ctx["attempt"] = g_ctx["attempt"].get<int>() + 1;
+				if (g_ctx["attempt"].get<int>() > 25) return PaladinFinish(result, "Righteous Fury threat transfer not observed");
+			}
+			return false;
+		}
+
+		// Coverage-audit regressions use real service payloads but skip payment when only testing delivery.
+		bool PaladinMechanics(double t, json& result)
+		{
+			if (t == 0) {
+				PaladinFixture({{"1450",5},{"1449",5},{"1628",2},{"1422",5},{"1421",5},{"1423",5},{"1626",3}});
+				g_ctx["sample"] = 0; return false;
+			}
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!Progression::Ready()) return false;
+			const auto state = Cast::TalentDiagnostics();
+			const auto mechanics = state["mechanics"];
+			using A = RE::EffectSetting::Archetype;
+			const std::array<A,3> types{A::kDemoralize,A::kParalysis,A::kStagger};
+			const int stage = g_ctx["stage"], which = g_ctx["case"];
+			if (stage == 0) {
+				if (!state.value("mechanic_profile_ready",false)) return false;
+				g_ctx["checks"]["service_unyielding_faith"] = state["mechanic_profile"].value("fear",0.f) == 10 &&
+					state["mechanic_profile"].value("disoriented",0.f) == 10;
+				g_ctx["evidence"]["profile"] = state["mechanic_profile"];
+				g_ctx["at"] = t; g_ctx["stage"] = 1;
+			}
+			if (g_ctx["stage"] == 1) {
+				const int mechanic = which == 0 ? 5 : which == 1 ? 12 : 2;
+				g_ctx["before"] = mechanics[std::to_string(mechanic)];
+				Carriers::ClearMechanicsForTesting(player);
+				Carriers::MechanicForTesting(player,types[which]);
+				g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				const int mechanic = which == 0 ? 5 : which == 1 ? 12 : 2;
+				const auto current = mechanics[std::to_string(mechanic)], before = g_ctx["before"];
+				const int rolls = current.value("rolls",0) - before.value("rolls",0);
+				if (rolls == 0 && t-g_ctx["at"].get<double>() < 1) return false;
+				if (rolls != 1) return PaladinFinish(result,"native mechanic Start hook did not roll exactly once");
+				const bool resisted = current.value("resisted",0) > before.value("resisted",0);
+				bool live = false;
+				if (auto* effects = player->GetActiveEffectList()) for (auto* e : *effects) if (e && e->spell && e->spell->GetName() &&
+					std::string_view(e->spell->GetName()).starts_with("Paladin mechanic fixture") &&
+					!e->flags.any(RE::ActiveEffect::Flag::kInactive,RE::ActiveEffect::Flag::kDispelled)) live = true;
+				const auto key = std::to_string(which);
+				if (!g_ctx["evidence"].contains(key)) g_ctx["evidence"][key] = {{"samples",0},{"resisted",0}};
+				auto& evidence = g_ctx["evidence"][key];
+				evidence["samples"] = evidence.value("samples",0)+1;
+				evidence["resisted"] = evidence.value("resisted",0)+(resisted ? 1 : 0);
+				if (which != 2 && live == resisted) return PaladinFinish(result,"resist did not match native effect removal");
+				// Keep the first failed application alive for several frames: no retry until it succeeds.
+				if (!resisted && g_ctx["sample"] == 0 && t-g_ctx["at"].get<double>() < .3) {
+					evidence["samples"] = evidence.value("samples",0)-1; return false;
+				}
+				Carriers::ClearMechanicsForTesting(player);
+				g_ctx["sample"] = g_ctx["sample"].get<int>()+1;
+				// A stun never rolls their way: one paralysis (a second one waits for the player to get up before it starts).
+				if (g_ctx["sample"].get<int>() < (which == 1 ? 1 : 240)) { g_ctx["stage"] = 1; return false; }
+				const int successes = evidence["resisted"];
+				// Fear and disorient at Unyielding Faith's 10%; paralysis is a stun, never resisted by the player.
+				if (which == 1) g_ctx["checks"]["paralysis_stun_not_resisted"] = successes == 0;
+				else g_ctx["checks"]["native_application_10_percent_"+key] = successes > 3 && successes < 65;
+				g_ctx["sample"] = 0; g_ctx["case"] = which+1;
+				if (which < 2) { g_ctx["stage"] = 1; return false; }
+				PaladinResolve(19746); g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"Concentration Aura quote failed");
+				Cast::ApplyForTesting(19746,g_ctx["reply"]);
+				g_ctx["evidence"]["concentration"] = g_ctx["reply"]["auras"];
+				g_ctx["stage"] = 4; return false;
+			}
+			if (stage == 4) {
+				g_ctx["checks"]["service_concentration_mechanics"] = mechanics["9"]["percent"] == 15 && mechanics["26"]["percent"] == 15;
+				int kept = 0;
+				for (int n=0;n<400;++n) {
+					Cast::BeginForTesting(25292,{{"cast_ms",60000},{"interrupt_flags",16}});
+					Cast::Interrupt(); if (Cast::Casting()) ++kept;
+				}
+				g_ctx["checks"]["interrupt_resistance_roll"] = kept > 15 && kept < 110;
+				g_ctx["evidence"]["interrupts"] = {{"samples",400},{"resisted",kept}};
+				Cast::Stop(); Cast::EndAura(19746);
+				Cast::BeginForTesting(25292,{{"cast_ms",60000},{"interrupt_flags",16}}); Cast::Interrupt();
+				g_ctx["checks"]["aura_end_removes_interrupt_resistance"] = !Cast::Casting();
+				// Deterministic endpoint: exercise native dispelling at 100%, separately from the actual 10/15% data.
+				Cast::ApplyForTesting(19746,{{"auras",json::array({
+					{{"type","mechanic_resistance"},{"mechanic",5},{"amount",100},{"duration_ms",5000}},
+					{{"type","mechanic_resistance"},{"mechanic",2},{"amount",100},{"duration_ms",5000}},
+					{{"type","mechanic_resistance"},{"mechanic",26},{"amount",100},{"duration_ms",5000}}})}});
+				for (const auto type : types) Carriers::MechanicForTesting(player,type);
+				Cast::BeginForTesting(25292,{{"cast_ms",60000},{"interrupt_flags",16}}); Cast::Interrupt();
+				g_ctx["checks"]["100_percent_keeps_cast"] = Cast::Casting();
+				Cast::Stop();
+				// Damage cancelling a cast is no mechanic: even full interrupt resistance does not keep it
+				// (Unit::InterruptOrDelaySpell).
+				Cast::BeginForTesting(25292,{{"cast_ms",60000},{"interrupt_flags",16}}); Cast::OnHit(false);
+				g_ctx["checks"]["damage_cancel_not_resisted"] = !Cast::Casting();
+				Cast::Stop(); g_ctx["at"] = t; g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				if (t-g_ctx["at"].get<double>() < .3) return false;
+				// Fear (and the instant stagger) gone at 100%; the paralysis, a stun, stays.
+				bool fear = false, paralysis = false;
+				if (auto* effects = player->GetActiveEffectList()) for (auto* e : *effects) if (e && e->spell && e->spell->GetName() &&
+					!e->flags.any(RE::ActiveEffect::Flag::kDispelled)) {
+					const std::string_view name = e->spell->GetName();
+					if (name == std::format("Paladin mechanic fixture {}", static_cast<int>(A::kDemoralize))) fear = true;
+					if (name == std::format("Paladin mechanic fixture {}", static_cast<int>(A::kParalysis))) paralysis = true;
+				}
+				g_ctx["checks"]["100_percent_dispels_native_effects"] = !fear;
+				g_ctx["evidence"]["paralysis_at_100_percent"] = paralysis;   // starts once the player is up again
+				Carriers::ClearMechanicsForTesting(player); Cast::EndAura(19746);
+				UiPass::RequestCapture("wow_paladin_mechanics"); g_ctx["stage"] = 6; return false;
+			}
+			if (stage == 6) {
+				const auto capture = UiPass::TakeCapture("wow_paladin_mechanics"); if (!capture.done) return false;
+				g_ctx["checks"]["capture"] = capture.width > 0 && capture.height > 0;
+				g_ctx["captures"].push_back("wow_paladin_mechanics"); g_ctx["at"] = t; g_ctx["stage"] = 7; return false;
+			}
+			if (stage == 7) {   // the last paralysis knocked the player down: restore their place once the player is up (10 s at most)
+				const bool down = player->IsInRagdollState() || player->AsActorState()->GetKnockState() != RE::KNOCK_STATE_ENUM::kNormal;
+				if (down) g_ctx["up_at"] = json();
+				else if (!g_ctx.contains("up_at") || g_ctx["up_at"].is_null()) g_ctx["up_at"] = t;
+				const bool settled = !down && t - g_ctx["up_at"].get<double>() >= .5;
+				if (!settled && t - g_ctx["at"].get<double>() < 10) return false;
+				return PaladinFinish(result);
+			}
+			return false;
+		}
+
+		// Every body the start interface offers, unclothed (their gear comes off for the step and back on after), each
+		// beside an Imperial guard from the chase camera and from the front in WoW's customization window: their model is
+		// the race's own M2 at the client's size (Stand bounds x CreatureDisplayInfo/CreatureModelData scale, 64 Skyrim
+		// units a yard: a yard is 0.9144 m either way). Captures wow_race_<race>_<sex> and wow_race_<race>_<sex>_front.
+		bool RaceModels(double t, json& result)
+		{
+			struct Body { std::uint32_t cls, race, sex; const char* m2; };
+			static constexpr Body kBodies[]{
+				{11,4,1,R"(Character\NightElf\Female\NightElfFemale.m2)"}, {11,4,0,R"(Character\NightElf\Male\NightElfMale.m2)"},
+				{11,6,1,R"(Character\Tauren\Female\TaurenFemale.m2)"}, {11,6,0,R"(Character\Tauren\Male\TaurenMale.m2)"},
+				{2,1,1,R"(Character\Human\Female\HumanFemale.m2)"}, {2,1,0,R"(Character\Human\Male\HumanMale.m2)"},
+				{2,3,1,R"(Character\Dwarf\Female\DwarfFemale.m2)"}, {2,3,0,R"(Character\Dwarf\Male\DwarfMale.m2)"}};
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			auto* equip = RE::ActorEquipManager::GetSingleton();
+			const auto next = [&](int a_stage) { g_ctx["stage"] = a_stage; g_ctx["at"] = t; };
+			if (t == 0) {
+				BeginTaurenProbe();
+				std::vector<RE::FormID> worn;
+				for (const auto& [form, data] : player->GetInventory([](RE::TESBoundObject& o) { return o.IsArmor() || o.IsWeapon(); }))
+					if (data.second && data.second->IsWorn()) worn.push_back(form->GetFormID());
+				for (const auto id : worn) if (auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(id))
+					equip->UnequipObject(player, form, nullptr, 1, nullptr, false, true, false, true);
+				g_ctx["worn"] = worn;
+				g_restoreRaceModels = [worn] {
+					WowUi::Eval("(function() if __WBCustomizeClose then __WBCustomizeClose() end return 1 end)()");
+					auto* player = RE::PlayerCharacter::GetSingleton();
+					for (const auto id : worn) if (auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(id))
+						RE::ActorEquipManager::GetSingleton()->EquipObject(player, form, nullptr, 1, nullptr, false, false, false, true);
+				};
+				g_ctx["body"] = 0; next(0);
+				return false;
+			}
+			const auto index = g_ctx["body"].get<std::size_t>();
+			if (index >= std::size(kBodies)) return PaladinFinish(result);
+			const auto& body = kBodies[index];
+			const auto key = std::format("{}_{}", body.race, body.sex);
+			const int stage = g_ctx["stage"];
+			const double since = t - g_ctx["at"].get<double>();
+			const auto done = [&] { g_ctx["body"] = index + 1; next(0); return false; };
+			if (stage == 0) {
+				if (!Character::SetIdentity(body.cls, body.race, body.sex, true)) { g_ctx["checks"]["identity_" + key] = false; return done(); }
+				next(1); return false;
+			}
+			const auto* data = Avatar::Data();
+			if (stage == 1) {   // their new body loaded (seconds: its M2, skins and textures), with nothing on
+				const bool loaded = data && !data->display && data->appearance == Character::Looks() && data->look.body == body.m2;
+				if (data && !data->items.empty() && t - g_ctx.value("stripped_at", 0.0) > 1) {   // their weapon comes back after a change
+					for (const auto& [form, entry] : player->GetInventory([](RE::TESBoundObject& o) { return o.IsArmor() || o.IsWeapon(); }))
+						if (entry.second && entry.second->IsWorn()) equip->UnequipObject(player, form, nullptr, 1, nullptr, false, true, false, true);
+					g_ctx["stripped_at"] = t;
+				}
+				if ((!loaded || !data->items.empty()) && since < 25) return false;
+				g_ctx["checks"]["model_" + key] = loaded;
+				g_ctx["checks"]["unclothed_" + key] = data && data->items.empty();
+				if (data && !data->items.empty()) {   // evidence: what the player still wears, WoW's and Skyrim's view
+					json items = json::array(), skyrim = json::array();
+					for (const auto& i : data->items) items.push_back({ i.slot, i.displayId, i.sheath });
+					for (const auto& [form, entry] : player->GetInventory([](RE::TESBoundObject&) { return true; }))
+						if (entry.second && entry.second->IsWorn()) skyrim.push_back(std::format("{:08X} {}", form->GetFormID(), form->GetName()));
+					g_ctx["evidence"]["still_worn_" + key] = { { "wow", items }, { "skyrim", skyrim } };
+				}
+				if (!loaded) return done();
+				// A guard placed fresh beside the player (moving a placed one did not), facing as the player does.
+				if (auto* old = RE::TESForm::LookupByID<RE::Actor>(g_ctx.value("enemy", RE::FormID{}))) old->Disable();
+				auto* guard = SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0xAA8FC), 20.f, 110.f);   // EncGuardImperialM05MaleGuard
+				if (!guard) return PaladinFinish(result, "could not place the reference guard");
+				guard->EnableAI(false);
+				guard->SetAngle({ 0.f, 0.f, player->GetHeading(false) });
+				g_ctx["enemy"] = guard->GetFormID();   // the probe's restore disables it
+				next(2); return false;
+			}
+			auto* guard = RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+			if (!guard) return PaladinFinish(result, "the reference guard is gone");
+			if (stage == 2) {   // the surrogate's 3D rebuilt at their size, the camera on their head, the guard drawn
+				if ((since < 2 || !guard->Is3DLoaded()) && since < 10) return false;
+				const auto size = Surrogate::ClientSize(body.race, body.sex);
+				const float scale = Surrogate::DrawScale(body.race, body.sex).value_or(0);
+				const float drawn = size ? size->height / size->modelScale * scale * Avatar::kUnitsPerYard : 0;
+				g_ctx["checks"]["client_scale_" + key] = data && size && std::abs(data->look.scale - scale) < .001f;
+				g_ctx["checks"]["surrogate_scale_" + key] = std::abs(player->GetReferenceRuntimeData().refScale / 100.f -
+					Surrogate::ReferenceScale(body.race, body.sex).value_or(0)) < .011f;
+				g_ctx["evidence"][key] = { { "drawn_units", drawn }, { "drawn_m", drawn * .9144f / Avatar::kUnitsPerYard },
+					{ "surrogate_units", player->GetHeight() }, { "guard_units", guard->GetHeight() },
+					{ "guard_m", guard->GetHeight() * .9144f / Avatar::kUnitsPerYard }, { "scale", data ? data->look.scale : 0 },
+					{ "guard_right_units", (guard->GetPosition() - player->GetPosition()).Length() } };
+				g_ctx["snap"] = Snap("wow_race_" + key); g_ctx["captures"].push_back("wow_race_" + key);
+				next(3); return false;
+			}
+			if (stage == 3) {   // then from the front: their figure in WoW's customization window
+				if (!Settled(g_ctx["snap"].get<int>())) return false;
+				WowUi::Run("__WBCustomizeAppearance()");
+				next(4); return false;
+			}
+			if (stage == 4) {
+				if (since < 2) return false;
+				g_ctx["checks"]["front_" + key] = WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible() and WBCustomizeModel:IsVisible()) and 1 or 0") == "1";
+				g_ctx["snap"] = Snap("wow_race_" + key + "_front"); g_ctx["captures"].push_back("wow_race_" + key + "_front");
+				next(5); return false;
+			}
+			if (stage == 5) {
+				if (!Settled(g_ctx["snap"].get<int>())) return false;
+				WowUi::Eval("(function() if __WBCustomizeClose then __WBCustomizeClose() end return 1 end)()");
+				return done();
+			}
+			return false;
+		}
+
+		// Measurements for their size (explicit): their own Skyrim skeleton standing as a male and as a female Night Elf
+		// (whose surrogate keeps their native scale) - its head node above the player's feet, per unit of scale - and each 1.12
+		// body's Helm (11), Head (20) and name (18) attachments in its Stand pose.
+		bool ScaleProbe(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			const auto next = [&](int a_stage) { g_ctx["stage"] = a_stage; g_ctx["at"] = t; };
+			if (t == 0) { BeginTaurenProbe(); next(0); return false; }
+			const int stage = g_ctx["stage"];
+			const double since = t - g_ctx["at"].get<double>();
+			if (stage == 0 || stage == 2) {
+				if (!Character::SetIdentity(11, 4, stage == 0 ? 0 : 1, true)) return PaladinFinish(result, "Night Elf identity unavailable");
+				player->DoReset3D(false);   // their skeleton follows the sex only when their 3D is rebuilt
+				next(stage + 1); return false;
+			}
+			if (stage == 1 || stage == 3) {
+				if (since < 4) return false;   // their surrogate's 3D rebuilt and standing
+				const auto head = Portrait::HeadPosition(player);
+				const bool female = player->GetActorBase()->IsFemale();
+				g_ctx["evidence"][female ? "female" : "male"] = { { "head_z", head ? head->z - player->GetPosition().z : 0 },
+					{ "scale", player->GetScale() }, { "ref_scale", player->GetReferenceRuntimeData().refScale / 100.f },
+					{ "base_height", player->GetActorBase()->GetHeight() }, { "race", player->GetRace()->GetFormEditorID() },
+					{ "height", player->GetHeight() }, { "head_per_scale", head ? (head->z - player->GetPosition().z) / player->GetScale() : 0 } };
+				if (stage == 1) { next(2); return false; }
+				try {
+					const wowcore::Mpq mpq(Config::ClientData());
+					const auto models = wowcore::Dbc::load(mpq, R"(DBFilesClient\CreatureModelData.dbc)");
+					for (const auto race : { 1u, 3u, 4u, 6u }) for (const auto sex : { 0u, 1u }) {
+						const auto size = Surrogate::ClientSize(race, sex);
+						const auto m = size && models ? models->rowOf(size->model) : std::nullopt;
+						const auto model = m ? wowcore::loadModel(mpq, models->str(*m, 2)) : std::nullopt;
+						if (!model) continue;
+						std::vector<glm::mat4> bones;
+						wowcore::poseBones(*model, wowcore::findSequence(*model, 0), 0, 0, bones);
+						json row = { { "scale", size->modelScale }, { "bounds_yd", size->height } };
+						for (const auto id : { 11u, 20u, 18u }) if (const auto at = wowcore::attachmentMatrix(*model, bones, id))
+							row[std::format("att{}_yd", id)] = (*at)[3].z * size->modelScale;
+						g_ctx["evidence"]["wow"][std::format("{}_{}", race, sex)] = row;
+					}
+				} catch (const std::exception& e) { g_ctx["evidence"]["wow_error"] = e.what(); }
+				return PaladinFinish(result);
+			}
+			return false;
+		}
+
+		// The stall guard's proof (explicit): Skyrim's Journal opened by its key as a stray step might (a wrong Escape did
+		// on October 16, pausing a suite for 46 minutes). The sink closes it as it opens; the step then sees the game
+		// running and the Journal gone. No g_keepOpen: the menu is the stray one.
+		bool StrayMenu(double t, json& result)
+		{
+			auto* ui = RE::UI::GetSingleton();
+			if (t == 0) {
+				MenusOpened().clear();
+				// Opened as Skyrim's J does (the WoW interface may take the key itself): the stray-menu sink closes it.
+				RE::UIMessageQueue::GetSingleton()->AddMessage(RE::JournalMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kShow, nullptr);
+				g_ctx["stage"] = 0; return false;
+			}
+			if (t < 1.5) return false;
+			result = { { "journal_opened", MenusOpened().contains("Journal Menu") }, { "journal_open_now", ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) },
+				{ "paused", ui->GameIsPaused() }, { "frames_advance", true } };
+			result["pass"] = result["journal_opened"] == true && result["journal_open_now"] == false && result["paused"] == false;
+			return true;
+		}
+
+		bool PaladinTreasure(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			const auto ref = [](const char* key) { return RE::TESForm::LookupByID<RE::TESObjectREFR>(g_ctx.value(key,RE::FormID{})); };
+			const auto seen = [](const char* key) {
+				return WowUi::Eval(std::format("(function() for _,b in ipairs(__WB.minimap and __WB.minimap.blips or {{}}) do if b.guid=={} and b.resource==6 then return 1 end end return 0 end)()",g_ctx.value(key,RE::FormID{}))) == "1";
+			};
+			if (t == 0) {
+				if (!player->GetParentCell() || player->GetParentCell()->IsInteriorCell() || player->GetParentCell()->GetOwner()) {
+					result={{"pass",false},{"error","treasure fixture needs an unowned exterior cell"}}; return true;
+				}
+				PaladinFixture(json::object()); Character::SetIdentity(2,3,1,true);   // {} would be null: a service BAD_REQUEST
+				auto* base = RE::TESForm::LookupByID<RE::TESObjectCONT>(0xF8478);
+				auto* gold = RE::TESForm::LookupByID<RE::TESBoundObject>(0xF);
+				auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESFaction>();
+				auto* faction = factory ? factory->Create() : nullptr;
+				std::vector<RE::ObjectRefHandle> refs;
+				for (const auto& [key,yards] : std::vector<std::pair<const char*,float>>{
+					{"treasure",30},{"treasure_owned",25},{"treasure_merchant",35},{"treasure_empty",40},{"treasure_disabled",45},{"treasure_distant",201}}) {
+					const auto placed = base ? player->PlaceObjectAtMe(base,false) : RE::NiPointer<RE::TESObjectREFR>{};
+					if (!placed) continue;
+					refs.push_back(placed->CreateRefHandle()); g_ctx[key] = placed->GetFormID();
+					placed->SetPosition(player->GetPosition()+RE::NiPoint3{yards*Avatar::kUnitsPerYard,0,0});
+					placed->SetDisplayName(key,true);
+					if (gold && std::string_view(key) != "treasure_empty") placed->AddObjectToContainer(gold,nullptr,3,nullptr);
+				}
+				if (ref("treasure_owned")) ref("treasure_owned")->SetOwner(player->GetActorBase());
+				if (faction) faction->vendorData.merchantContainer = ref("treasure_merchant");
+				if (ref("treasure_disabled")) ref("treasure_disabled")->Disable();
+				const auto zoom = WowUi::Eval("Minimap:GetZoom()"), rotate = WowUi::Eval("GetCVar('rotateMinimap')");
+				g_restorePaladinTreasure = [refs,faction,zoom,rotate] {
+					if (faction) faction->vendorData.merchantContainer = nullptr;
+					for (const auto& handle : refs) if (const auto placed = handle.get()) placed->Disable();
+					WowUi::Run(std::format("Minimap:SetZoom({}); SetCVar('rotateMinimap',{})",zoom,LuaQuote(rotate)));
+				};
+				if (refs.size() != 6 || !gold || !faction) return PaladinFinish(result,"could not place treasure fixtures");
+				return false;
+			}
+			ProbeWait("wow_paladin_treasure", t, { { "stage", g_ctx["stage"] }, { "progression", Progression::Ready() },
+				{ "loaded", ref("treasure") && ref("treasure")->Is3DLoaded() }, { "disabled", ref("treasure") && ref("treasure")->IsDisabled() } });
+			if (!Progression::Ready()) return false;
+			const int stage = g_ctx["stage"];
+			if (stage == 0) {
+				if (!ref("treasure") || !ref("treasure")->Is3DLoaded()) return false;
+				BookReady(); Cast::Use(2481); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (Cast::ResourceTrackingMask() != 32 || !seen("treasure")) return false;
+				g_ctx["checks"]["resource_aura_and_icon"] = Cast::TrackingMask() == 0 && WowUi::Eval("GetTrackingTexture()==__WB.spellInfo(2481).icon and 1 or 0") == "1";
+				g_ctx["checks"]["treasure_only"] = !seen("treasure_owned") && !seen("treasure_merchant") && !seen("treasure_empty") && !seen("treasure_disabled") && !seen("treasure_distant");
+				WowUi::Run("Minimap:SetZoom(0); SetCVar('rotateMinimap',0)");
+				g_ctx["snap"] = Snap("wow_paladin_treasure_0"); g_ctx["captures"].push_back("wow_paladin_treasure_0");
+				g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				if (!Settled(g_ctx["snap"])) return false;
+				const int which = g_ctx["case"];
+				if (which < 2) {
+					g_ctx["case"] = which+1;
+					WowUi::Run(which == 0 ? "Minimap:SetZoom(4)" : "Minimap:SetZoom(0); SetCVar('rotateMinimap',1)");
+					const auto name = "wow_paladin_treasure_"+std::to_string(which+1);
+					g_ctx["snap"] = Snap(name); g_ctx["captures"].push_back(name); return false;
+				}
+				if (auto* chest = ref("treasure")) chest->RemoveItem(RE::TESForm::LookupByID<RE::TESBoundObject>(0xF),3,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+				g_ctx["at"] = t; g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				if (t-g_ctx["at"].get<double>() < .5 || seen("treasure")) return false;
+				g_ctx["checks"]["emptying_removes_blip"] = true;
+				ref("treasure")->AddObjectToContainer(RE::TESForm::LookupByID<RE::TESBoundObject>(0xF),nullptr,3,nullptr);
+				g_ctx["stage"] = 4; return false;
+			}
+			if (stage == 4) {
+				if (!seen("treasure")) return false;
+				WowUi::Run("this=MiniMapTrackingFrame; arg1='RightButton'; this:GetScript('OnMouseUp')(); this=nil; arg1=nil");
+				g_ctx["at"] = t; g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				if (t-g_ctx["at"].get<double>() < .5 || Cast::ResourceTrackingMask() || seen("treasure")) return false;
+				g_ctx["checks"]["cancel_removes_blips"] = WowUi::Eval("GetTrackingTexture()==nil and 1 or 0") == "1";
+				return PaladinFinish(result);
+			}
+			return false;
+		}
+
+		bool PaladinCoverage(double t, json& result)
+		{
+			if (t == 0) { PaladinFixture({{"1449",5},{"1450",5},{"1432",5},{"1461",5},{"1433",1},{"1465",3}}); return false; }
+			auto* player = RE::PlayerCharacter::GetSingleton(); auto* av = player->AsActorValueOwner();
+			auto* follower = PaladinActor("follower"); auto* enemy = PaladinActor("enemy");
+			if (!follower || !enemy) return PaladinFinish(result, "missing coverage fixtures");
+			if (!Progression::Ready() || !follower->Is3DLoaded()) return false;
+			const int stage = g_ctx["stage"];
+			if (stage == 0) {
+				BookReady(); auto caster = PaladinCaster(); caster["auras"].push_back(20216); // Divine Favor guarantees the heal crit.
+				PaladinAsk({{"op","resolve"},{"spell",19943},{"caster",caster},{"target",{{"kind","self"}}},{"seed",1}});
+				g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				const auto out = g_ctx["reply"]; if (!out.value("ok",false)) return PaladinFinish(result,"Illumination quote failed");
+				json proc; float mana = 0;
+				for (const auto& p : out.value("procs",json::array())) if (p.value("spell",0u) == 20272) {
+					proc = p; for (const auto& e : p["events"]) if (e.value("type","") == "power") mana += e.value("amount",0.f);
+				}
+				if (proc.is_null() || mana <= 0) return PaladinFinish(result,"Illumination mana payload absent");
+				av->RestoreActorValue(RE::ActorValue::kMagicka,100000); av->DamageActorValue(RE::ActorValue::kMagicka,mana+10);
+				const float before = av->GetActorValue(RE::ActorValue::kMagicka);
+				Cast::TalentEffects({{"procs",json::array({proc})}},nullptr);
+				g_ctx["checks"]["illumination_native_mana"] = std::abs(av->GetActorValue(RE::ActorValue::kMagicka)-before-mana)<.05f;
+				g_ctx["evidence"]["illumination"] = proc;
+				g_ctx["case"] = 0; g_ctx["stage"] = 2;
+			}
+			if (g_ctx["stage"] == 2) {
+				const int i = g_ctx["case"];
+				auto caster = PaladinCaster(); if (i == 1) for (const auto& [id, rank] : json{{"1422",5},{"1421",5},{"1423",5},{"1626",3}}.items()) caster["talents"][id] = rank;
+				PaladinAsk({{"op","resolve"},{"spell",19746},{"caster",caster},{"target",{{"kind","self"}}},{"seed",1}});
+				g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"Concentration quote failed");
+				Cast::ApplyForTesting(19746,g_ctx["reply"]);
+				// A long pushback-eligible cast lets us roll repeatedly without it completing between samples.
+				Cast::BeginForTesting(25292,{{"cast_ms",60000},{"interrupt_flags",2}});
+				const int before = Cast::TalentDiagnostics().value("pushbacks_resisted",0);
+				for (int n=0;n<200;++n) Cast::OnHit(false);
+				const int resisted = Cast::TalentDiagnostics().value("pushbacks_resisted",0)-before;
+				const int i = g_ctx["case"]; const int expected = i == 0 ? 35 : 50;
+				g_ctx["checks"]["concentration_chance_"+std::to_string(expected)] = resisted > 20 && resisted < 170 &&
+					std::abs(PaladinAura(19746).value("pushback_resist",0.f)-expected)<.01f;
+				g_ctx["evidence"]["concentration_"+std::to_string(expected)] = {{"resisted",resisted},{"samples",200}};
+				Cast::Stop(); Cast::EndAura(19746);
+				if (i == 0) { g_ctx["case"] = 1; g_ctx["stage"] = 2; return false; }
+				// Barkskin's amount 100 still resists every pushback (the shared aura path).
+				Cast::ApplyForTesting(22812,{{"auras",json::array({{{"type","pushback_immunity"},{"amount",100},{"duration_ms",12000}}})}});
+				Cast::BeginForTesting(25292,{{"cast_ms",60000},{"interrupt_flags",2}});
+				const int bark = Cast::TalentDiagnostics().value("pushbacks_resisted",0);
+				for (int n=0;n<20;++n) Cast::OnHit(false);
+				g_ctx["checks"]["barkskin_still_immune"] = Cast::TalentDiagnostics().value("pushbacks_resisted",0)-bark == 20;
+				Cast::Stop(); Cast::EndAura(22812); g_ctx["case"] = 0; g_ctx["stage"] = 4;
+			}
+			if (g_ctx["stage"] == 4) {
+				const std::array<std::uint32_t,3> spells{25291,25916,20308}; const auto spell = spells[g_ctx["case"].get<int>()];
+				g_ctx["damage_mult"] = av->GetActorValue(RE::ActorValue::kAttackDamageMult);
+				g_ctx["onehand"] = av->GetActorValue(RE::ActorValue::kOneHandedModifier);
+				auto caster = PaladinCaster(); caster["reagents"]["21177"] = 1; // Quote only: no inventory is spent by ApplyForTesting.
+				PaladinAsk({{"op","resolve"},{"spell",spell},{"caster",caster},{"target",{{"kind","self"}}},{"seed",1}});
+				g_ctx["stage"] = 5; return false;
+			}
+			if (stage == 5) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"AP aura quote failed");
+				const std::array<std::uint32_t,3> spells{25291,25916,20308}; const auto spell = spells[g_ctx["case"].get<int>()];
+				Cast::ApplyForTesting(spell,g_ctx["reply"]); g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			if (stage == 6) {
+				if (t-g_ctx["at"].get<double>()<.35) return false;
+				const std::array<std::uint32_t,3> spells{25291,25916,20308}; const int i = g_ctx["case"]; const auto spell = spells[i];
+				g_ctx["checks"]["ap_single_carrier_"+std::to_string(spell)] =
+					std::abs(av->GetActorValue(RE::ActorValue::kAttackDamageMult)-g_ctx["damage_mult"].get<float>())<.001f &&
+					av->GetActorValue(RE::ActorValue::kOneHandedModifier)>g_ctx["onehand"].get<float>();
+				Cast::EndAura(spell);
+				if (i < 2) { g_ctx["case"] = i+1; g_ctx["stage"] = 4; return false; }
+				g_ctx["case"] = 0; g_ctx["stage"] = 7;
+			}
+			if (g_ctx["stage"] == 7) {
+				const auto seal = g_ctx["case"] == 0 ? 20349u : 20357u;
+				PaladinResolve(seal); g_ctx["stage"] = 8; return false;
+			}
+			if (stage == 8) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"judgement seal quote failed");
+				Cast::ApplyForTesting(g_ctx["case"] == 0 ? 20349 : 20357,g_ctx["reply"]);
+				PaladinResolve(20271,enemy); g_ctx["stage"] = 9; return false;
+			}
+			if (stage == 9) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"lasting judgement quote failed");
+				Cast::ApplyForTesting(20271,g_ctx["reply"],enemy);
+				const auto target = PaladinTarget(enemy);
+				if (target["judgements"].size()!=1) return PaladinFinish(result,"lasting judgement aura absent");
+				g_ctx["judged"] = target["judgements"][0]; g_ctx["at"] = t; g_ctx["stage"] = 10; return false;
+			}
+			if (stage == 10) {
+				if (t-g_ctx["at"].get<double>()<1) return false;
+				Cast::MeleeEffects({{"refresh_judgements",true}},enemy);
+				const auto aura = PaladinAura(g_ctx["judged"].get<std::uint32_t>(),enemy);
+				g_ctx["checks"]["lasting_judgement_full_"+std::to_string(g_ctx["case"].get<int>())] = aura.value("remaining",0.)>39.9 && aura.value("duration",0.)==40;
+				auto* fav = follower->AsActorValueOwner(); fav->SetBaseActorValue(RE::ActorValue::kMagicka,250);
+				fav->RestoreActorValue(RE::ActorValue::kMagicka,10000); fav->DamageActorValue(RE::ActorValue::kMagicka,200);
+				fav->DamageActorValue(RE::ActorValue::kHealth,500);
+				g_ctx["follower_health"] = fav->GetActorValue(RE::ActorValue::kHealth); g_ctx["follower_mana"] = fav->GetActorValue(RE::ActorValue::kMagicka);
+				g_ctx["player_mana"] = Cast::Mana(); g_ctx["attempt"] = 0;
+				g_ctx["judged_before"] = Cast::TalentDiagnostics().value("judged_requests",0);
+				// Begin with the native damage hook, including its follower identity and attack-kind snapshot.
+				if (g_ctx["case"] == 0) Cast::WeaponHitForTesting(follower,enemy,10);
+				else Carriers::NativeHitForTesting(follower,enemy,10);
+				g_ctx["at"] = t; g_ctx["stage"] = 11; return false;
+			}
+			if (stage == 11) {
+				const auto state = Cast::TalentDiagnostics(); if (!state.contains("judged_hit") || state["judged_hit"].value("serial",0)<=g_ctx["judged_before"].get<int>()) return false;
+				const auto& request = state["judged_hit"]["request"];
+				g_ctx["checks"]["follower_native_route_"+std::to_string(g_ctx["case"].get<int>())] =
+					request["attack"]["kind"] == (g_ctx["case"] == 0 ? "melee" : "spell") && request["attacker"]["level"]==follower->GetLevel();
+				auto* fav = follower->AsActorValueOwner();
+				const bool delivered = g_ctx["case"] == 0 ? fav->GetActorValue(RE::ActorValue::kHealth)>g_ctx["follower_health"].get<float>() :
+					fav->GetActorValue(RE::ActorValue::kMagicka)>g_ctx["follower_mana"].get<float>();
+				if (!delivered) {
+					if (t-g_ctx["at"].get<double>()<.1) return false;
+					const int seed = g_ctx["attempt"].get<int>()+1; if (seed>60) return PaladinFinish(result,"follower judgement proc not observed");
+					g_ctx["attempt"] = seed; g_ctx["judged_before"] = state.value("judged_requests",0);
+					Cast::JudgedHit(follower,enemy,10,g_ctx["case"] == 0 ? "melee" : "spell",seed); g_ctx["at"] = t; return false;
+				}
+				g_ctx["checks"]["judged_proc_on_follower_"+std::to_string(g_ctx["case"].get<int>())] = delivered && Cast::Mana()==g_ctx["player_mana"].get<int>();
+				g_ctx["evidence"]["follower_"+std::to_string(g_ctx["case"].get<int>())] = state["judged_hit"];
+				Cast::EndAura(g_ctx["judged"].get<std::uint32_t>(),enemy);
+				if (g_ctx["case"] == 0) { g_ctx["case"] = 1; g_ctx["stage"] = 7; return false; }
+				{   // in front of the player, in sight (the earlier cases' spot may be behind cover)
+					const float h = player->GetHeading(false);
+					follower->SetPosition(player->GetPosition() + RE::NiPoint3{std::sin(h) * 200 - std::cos(h) * 120, std::cos(h) * 200 + std::sin(h) * 120, 0}, true);
+				}
+				PaladinResolve(1038,follower); g_ctx["stage"] = 12; return false;
+			}
+			if (stage == 12) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"Salvation quote failed");
+				Cast::ApplyForTesting(1038,g_ctx["reply"],follower);
+				enemy->StopCombat(); enemy->StartCombat(follower); g_ctx["at"] = t; g_ctx["stage"] = 13; return false;
+			}
+			if (stage == 13) {
+				if (Cast::TalentDiagnostics().value("salvation_redirects",0)==0) {
+					if (t-g_ctx["at"].get<double>()>35) return PaladinFinish(result,"follower Salvation redirect not observed"); return false;
+				}
+				g_ctx["checks"]["salvation_follower_threat"] = true;
+				Cast::EndAura(1038,follower); PaladinResolve(1038); g_ctx["stage"] = 14; return false;
+			}
+			if (stage == 14) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok",false)) return PaladinFinish(result,"self Salvation quote failed");
+				Cast::ApplyForTesting(1038,g_ctx["reply"]);
+				g_ctx["redirects_before"] = Forms::TalentDiagnostics().value("feral_threat_redirects",0);
+				enemy->StopCombat(); enemy->StartCombat(player); g_ctx["at"] = t; g_ctx["stage"] = 15; return false;
+			}
+			if (stage == 15) {
+				// Their damaging hits under Salvation carry its multiplier (the aura's 0.7), as the service's damage replies do;
+				// once the enemy has the player as its combat target (StartCombat takes effect over the next frames), each hit may
+				// leave the follower beside it on top (30% a hit): until one does, or eighty hits.
+				auto* combat = enemy->GetActorRuntimeData().combatController;
+				if ((!combat || combat->targetHandle.get().get() != player) && t - g_ctx["at"].get<double>() < 3) return false;
+				float salvation = 1.f;
+				for (const auto& a : g_ctx["reply"].value("auras",json::array())) if (a.value("type","")=="threat") salvation = a.value("multiplier",1.f);
+				const json hit = {{"threat_multiplier",salvation}};
+				const int before = g_ctx["redirects_before"].get<int>();
+				for (int n=0;n<80 && Forms::TalentDiagnostics().value("feral_threat_redirects",0)==before;++n) Forms::AttackThreat(hit,enemy);
+				g_ctx["evidence"]["salvation_multiplier"] = salvation;
+				g_ctx["checks"]["salvation_player_damage_threat"] = salvation<1 &&
+					Forms::TalentDiagnostics().value("feral_threat_redirects",0)>before;
+				// A Holy proc omitting its multiplier must inherit Salvation as well as Righteous Fury.
+				Cast::TalentEffects({{"procs",json::array({{{"spell",25997},{"target","target"},{"school",1},
+					{"events",json::array({{{"type","damage"},{"amount",1},{"school",1}}})}}})}},enemy);
+				g_ctx["checks"]["salvation_holy_proc"] = Cast::TalentDiagnostics()["paladin_procs"].back().value("threat_multiplier",1.f)<1;
+				return PaladinFinish(result);
+			}
+			return false;
+		}
+
+		bool PaladinNativeProcs(double t, json& result)
+		{
+			if (t==0) { PaladinFixture({{"1401",5},{"1407",5},{"1403",5},{"1632",2},{"1421",5},{"1422",5},{"1423",5},{"1425",2},{"1630",3},{"1431",1}}); return false; }
+			auto* player = RE::PlayerCharacter::GetSingleton(); auto* enemy = PaladinActor("enemy");
+			if (!enemy) return PaladinFinish(result,"missing native spell fixture");
+			if (!Progression::Ready() || !enemy->Is3DLoaded()) return false;
+			auto* av = player->AsActorValueOwner(); const int stage = g_ctx["stage"];
+			if (stage==0) {
+				av->RestoreActorValue(RE::ActorValue::kHealth,100000);
+				g_ctx["health_before"] = av->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["enemy_before"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["requests"] = Cast::TalentDiagnostics().value("native_spell_requests",0);
+				for (int n=0;n<10;++n) Carriers::NativeHitForTesting(enemy,player,3);
+				g_ctx["at"] = t; g_ctx["stage"] = 1; return false;
+			}
+			if (stage==1) {
+				if (t-g_ctx["at"].get<double>()<.15) return false;
+				g_ctx["health_after"] = av->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["checks"]["native_spell_synchronous"] = g_ctx["health_after"].get<float>() < g_ctx["health_before"].get<float>() &&
+					Cast::TalentDiagnostics().value("native_spell_requests",0)==g_ctx["requests"].get<int>();
+				g_ctx["stage"] = 2;
+			}
+			if (g_ctx["stage"]==2) {
+				const auto state = Cast::TalentDiagnostics();
+				if (!state.contains("native_spell") || state["native_spell"].value("serial",0)<=g_ctx["requests"].get<int>()) return false;
+				const auto incoming = state["native_spell"];
+				if (!incoming["reply"].value("ok",false)) return PaladinFinish(result,"native spell incoming_hit failed");
+				g_ctx["checks"]["native_spell_coalesced"] = state.value("native_spell_requests",0)==g_ctx["requests"].get<int>()+1 &&
+					incoming["request"]["attack"]["kind"]=="spell" && incoming["request"]["weapon_hit"]==false;
+				g_ctx["checks"]["native_spell_proc_units"] = std::abs(incoming["reply"]["defense"].value("damage",0.f)-(g_ctx["health_before"].get<float>()-g_ctx["health_after"].get<float>()))<.1f;
+				g_ctx["checks"]["native_spell_never_replayed"] = std::abs(av->GetActorValue(RE::ActorValue::kHealth)-g_ctx["health_after"].get<float>())<.01f;
+				bool eye = false;
+				for (const auto& proc : incoming["reply"].value("procs",json::array())) if (proc.value("spell",0u)==25997 &&
+					std::ranges::any_of(proc.value("events",json::array()),[](const json& e) { return e.value("type","")=="damage" && e.value("amount",0.f)>=1; })) eye = true;
+				if (!eye) {
+					if (g_ctx["case"].get<int>()>=200) return PaladinFinish(result,"Eye for an Eye not observed on native spell crit");
+					g_ctx["case"] = g_ctx["case"].get<int>()+1; g_ctx["stage"] = 0; return false;
+				}
+				g_ctx["evidence"]["native_spell"] = incoming; g_ctx["at"] = t; g_ctx["stage"] = 3; return false;
+			}
+			if (stage==3) {
+				if (t-g_ctx["at"].get<double>()<.3) return false;
+				g_ctx["checks"]["eye_native_proc"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)<g_ctx["enemy_before"].get<float>();
+				const auto incoming = g_ctx["evidence"]["native_spell"];
+				// Exercise the service's cap in native health even when its proc exceeds their maximum.
+				const float maximum = av->GetPermanentActorValue(RE::ActorValue::kHealth)+player->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kTemporary,RE::ActorValue::kHealth);
+				auto proc = incoming["reply"]["procs"][0];
+				for (const auto& p : incoming["reply"]["procs"]) if (p.value("spell",0u)==25997) proc = p;
+				for (auto& e : proc["events"]) if (e.value("type","")=="damage") e["amount"] = maximum*10;
+				g_ctx["enemy_before"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth); g_ctx["maximum"] = maximum;
+				Cast::TalentEffects({{"procs",json::array({proc})}},enemy); g_ctx["at"] = t; g_ctx["stage"] = 4; return false;
+			}
+			if (stage==4) {
+				if (t-g_ctx["at"].get<double>()<.3) return false;
+				const float dealt = g_ctx["enemy_before"].get<float>()-enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["checks"]["eye_native_maximum_cap"] = std::abs(dealt-std::floor(g_ctx["maximum"].get<float>()*.5f))<1;
+				// Compare their native spell health loss with the same native damage stream under Sanctuary.
+				g_ctx["unblessed_damage"] = g_ctx["health_before"].get<float>() - g_ctx["health_after"].get<float>();
+				PaladinResolve(20914); g_ctx["stage"] = 5; return false;
+			}
+			if (stage==5) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "self Sanctuary quote failed");
+				Cast::ApplyForTesting(20914, g_ctx["reply"]);
+				float reduction = 0;
+				for (const auto& a : g_ctx["reply"].value("auras", json::array())) if (a.value("type", "") == "damage_taken") reduction -= a.value("native_per_hit", 0.f);
+				g_ctx["sanctuary_flat"] = reduction;
+				av->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				g_ctx["health_before"] = av->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["requests"] = Cast::TalentDiagnostics().value("native_spell_requests", 0);
+				for (int n=0;n<30;++n) Carriers::NativeHitForTesting(enemy, player, .5f);
+				g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			if (stage==6) {
+				if (t-g_ctx["at"].get<double>()<.2) return false;
+				g_ctx["health_after"] = av->GetActorValue(RE::ActorValue::kHealth);
+				const float dealt = g_ctx["health_before"].get<float>() - g_ctx["health_after"].get<float>();
+				g_ctx["checks"]["self_spell_sanctuary_synchronous"] = Cast::TalentDiagnostics().value("native_spell_requests", 0) == g_ctx["requests"].get<int>() &&
+					g_ctx["sanctuary_flat"].get<float>() > 0 && std::abs(dealt - std::max(0.f, g_ctx["unblessed_damage"].get<float>() * .5f - g_ctx["sanctuary_flat"].get<float>())) < .1f;
+				g_ctx["checks"]["self_spell_stream_not_immune"] = dealt > 0;
+				g_ctx["stage"] = 7; return false;
+			}
+			if (stage==7) {
+				const auto state = Cast::TalentDiagnostics();
+				if (state["native_spell"].value("serial", 0) <= g_ctx["requests"].get<int>()) return false;
+				const auto incoming = state["native_spell"], defense = incoming["reply"].value("defense", json::object());
+				g_ctx["evidence"]["self_sanctuary"] = incoming;
+				g_ctx["checks"]["self_spell_sanctuary_once"] = incoming["reply"].value("ok", false) &&
+					std::abs(defense.value("damage_reduced", 0.f) - g_ctx["sanctuary_flat"].get<float>()) < .03f &&
+					std::abs(defense.value("damage", -1.f) - (g_ctx["health_before"].get<float>() - g_ctx["health_after"].get<float>())) < .1f;
+				g_ctx["checks"]["self_spell_not_replayed"] = std::abs(av->GetActorValue(RE::ActorValue::kHealth)-g_ctx["health_after"].get<float>()) < .01f;
+				return PaladinFinish(result);
+			}
+			return false;
+		}
+
+		bool PaladinIntervention(double t, json& result)
+		{
+			if (t==0) { PaladinFixture(json::object()); return false; }
+			auto* follower = PaladinActor("follower"); auto* enemy = PaladinActor("enemy");
+			if (!follower || !enemy) return PaladinFinish(result,"missing Intervention fixtures");
+			if (!Progression::Ready() || !follower->Is3DLoaded()) return false;
+			const int stage = g_ctx["stage"];
+			if (stage==0) {
+				auto caster = PaladinCaster(); caster["reagents"]["17033"] = 1; // Payload quote only; the panel cast spends the actual Symbol.
+				PaladinAsk({{"op","resolve"},{"spell",19752},{"caster",caster},{"target",PaladinTarget(follower)},{"seed",1}});
+				g_ctx["stage"] = 1; return false;
+			}
+			if (stage==1) {
+				if (!g_ctx.contains("reply")) return false;
+				auto out = g_ctx["reply"]; if (!out.value("ok",false)) return PaladinFinish(result,"Intervention quote failed");
+				g_ctx["evidence"]["intervention"] = out;
+				g_ctx["checks"]["intervention_caster_death_event"] = std::ranges::any_of(out["events"],[](const json& e) {
+					return e.value("type","")=="instakill" && e.value("target","")=="caster"; });
+				// Keep the disposable player alive so the suite can restore without a death-menu reload. The same
+				// native instakill event dispatcher is exercised on the private wolf after checking the real caster event.
+				std::erase_if(out["events"].get_ref<json::array_t&>(),[](const json& e) { return e.value("type","")=="instakill"; });
+				enemy->StopCombat(); enemy->StartCombat(follower); follower->StartCombat(enemy);
+				Cast::ApplyForTesting(19752,out,follower); g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (stage==2) {
+				if (t-g_ctx["at"].get<double>()<.5) return false;
+				const auto aura = PaladinAura(19753,follower); const auto state = Cast::TalentDiagnostics();
+				const auto* combat = enemy->GetActorRuntimeData().combatController;
+				g_ctx["checks"]["intervention_three_minutes"] = aura.value("remaining",0.)>178 && aura.value("duration",0.)==180;
+				g_ctx["checks"]["intervention_all_schools"] = aura.value("immunity",0u)==127;
+				g_ctx["checks"]["intervention_stun"] = aura.value("stun",false) && Paralyzed(follower);
+				g_ctx["checks"]["intervention_unattackable"] = Cast::Unattackable(follower) && !Bridge::Attackable(follower) &&
+					(!combat || combat->targetHandle.get().get()!=follower);
+				const auto* held = follower->GetActorRuntimeData().combatController;
+				g_ctx["checks"]["intervention_sanctuary"] = !follower->IsInCombat() && (!held || !held->targetHandle) && state.value("sanctuary_target",0u)==follower->GetFormID();
+				g_ctx["health_before"] = follower->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Cast::WeaponHitForTesting(enemy,follower,10); Carriers::NativeHitForTesting(enemy,follower,10);
+				g_ctx["at"] = t; g_ctx["stage"] = 3; return false;
+			}
+			if (stage==3) {
+				if (t-g_ctx["at"].get<double>()<.3) return false;
+				g_ctx["checks"]["intervention_blocks_native_damage"] = follower->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)==g_ctx["health_before"].get<float>();
+				Cast::ApplyForTesting(19752,{{"events",json::array({{{"type","instakill"},{"target","target"}}})}},enemy);
+				g_ctx["at"] = t; g_ctx["stage"] = 4; return false;
+			}
+			if (stage==4) {
+				if (t-g_ctx["at"].get<double>()<.3) return false;
+				g_ctx["checks"]["intervention_instakill_native"] = enemy->IsDead();
+				Cast::EndAura(19753,follower); g_ctx["at"] = t; g_ctx["stage"] = 5; return false;
+			}
+			if (t-g_ctx["at"].get<double>()<.3) return false;
+			g_ctx["checks"]["intervention_cleanup"] = !Cast::Unattackable(follower) && Bridge::Attackable(follower) && !Paralyzed(follower);
+			return PaladinFinish(result);
+		}
+
+		bool PaladinDamagePipeline(double t, json& result)
+		{
+			if (t == 0) {
+				PaladinFixture({{"1401",5},{"1407",5},{"1403",5},{"1632",2}});
+				// Observe both the production world event and the actual Classic chat event it formats.
+				WowUi::Eval(R"((function()
+					__wbPaladinDamageOriginal=__WBCombatEvent
+					__wbPaladinDamageReports={} __wbPaladinDamageChat=0
+					__WBCombatEvent=function(e)
+						if e.kind=='swing' and e.target and e.target.category=='self' then tinsert(__wbPaladinDamageReports,e) end
+						__wbPaladinDamageOriginal(e)
+					end
+					__wbPaladinDamageFrame=CreateFrame('Frame')
+					for _,e in ipairs({'CHAT_MSG_COMBAT_CREATURE_VS_SELF_HITS','CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES'}) do
+						__wbPaladinDamageFrame:RegisterEvent(e)
+					end
+					__wbPaladinDamageFrame:SetScript('OnEvent',function() __wbPaladinDamageChat=__wbPaladinDamageChat+1 end)
+					return 1
+				end)())");
+				return false;
+			}
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			auto* enemy = PaladinActor("enemy"); auto* follower = PaladinActor("follower");
+			if (!enemy || !follower) return PaladinFinish(result, "missing damage pipeline fixtures");
+			if (!Progression::Ready() || !enemy->Is3DLoaded() || !follower->Is3DLoaded()) return false;
+			auto* av = player->AsActorValueOwner();
+			const int i = g_ctx["case"], stage = g_ctx["stage"];
+			const auto key = std::to_string(i);
+			const std::array<const char*, 10> outcomes{"miss", "dodge", "parry", "block", "immune", "hit", "block", "hit", "hit", "crit"};
+			const std::array<float, 10> damages{0, 0, 0, 0, 0, 2, 2, 5, 5, 4};
+			const std::array<const char*, 5> faults{"task", "queued", "reply", "throw", "late"};
+			if (stage == 0) {
+				Cast::ResetForTesting(); BookReady();
+				for (auto* actor : {static_cast<RE::Actor*>(player), enemy, follower}) actor->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000);
+				WowUi::Eval("(function() __wbPaladinDamageReports={} __wbPaladinDamageChat=0 return 1 end)()");
+				g_ctx["health_before"] = av->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["enemy_before"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["follower_before"] = follower->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				if (i < 10) {
+					Cast::ApplyForTesting(10301, {{"name", "Damage shield fixture"}, {"school", 1},
+						{"auras", json::array({{{"type", "damage_shield"}, {"amount", 3}, {"duration_ms", 60000}}})}});
+					if (i == 7 || i == 8) Cast::ApplyForTesting(25780, {{"name", "Absorb fixture"},
+						{"auras", json::array({{{"type", "absorb_shield"}, {"amount", i == 7 ? 5 : 2}, {"school_mask", 127}, {"duration_ms", 60000}}})}});
+					json defense = {{"kind", "melee"}, {"outcome", outcomes[i]}, {"school", 0}, {"damage", damages[i]}};
+					if (i == 3 || i == 6) { defense["blocked"] = i == 3 ? 5 : 3; defense["full_block"] = i == 3; }
+					// Only the returned roll is deterministic; HitData, the AV hook, TESHitEvent, service transport,
+					// completion, absorbs, shields and world log all take their production paths.
+					Cast::DefenseReplyForTesting({{"ok", true}, {"defense", defense}});
+					Cast::WeaponHitForTesting(enemy, player, 5);
+					g_ctx["checks"]["withheld_" + key] = av->GetActorValue(RE::ActorValue::kHealth) == g_ctx["health_before"].get<float>();
+				} else if (i == 10) {
+					Cast::ApplyForTesting(10301, {{"name", "Ally shield fixture"}, {"school", 1},
+						{"auras", json::array({{{"type", "damage_shield"}, {"amount", 3}, {"duration_ms", 60000}}})}});
+					Cast::WeaponHitForTesting(follower, player, 5);
+					g_ctx["checks"]["ally_weapon_not_withheld"] = av->GetActorValue(RE::ActorValue::kHealth) < g_ctx["health_before"].get<float>();
+					Carriers::NativeHitForTesting(follower, player, 5);
+				} else if (i < 16) {
+					Cast::DefenseFailureForTesting(enemy, 2, faults[i-11]);
+				} else if (i == 16) {
+					g_ctx["checks"]["pump_isolates_standard_and_unknown_exceptions"] = Service::CallbackIsolationForTesting();
+					Cast::PartyPollFailureForTesting();
+					const auto state = Cast::TalentDiagnostics();
+					g_ctx["checks"]["stuck_party_poll_released"] = !state.value("party_poll_busy", true) && state.value("party_poll_timeouts", 0) == 1;
+					PaladinResolve(10301); // a real aura must poll again after the expired request
+				} else if (i == 18) {
+					Cast::DefenseFailureForTesting(enemy, 2, "after_apply");
+				} else {
+					Cast::DefenseReplyForTesting({{"ok", true}, {"defense", {{"kind", "melee"}, {"school", 0}, {"outcome", "hit"}, {"damage", 1}}}});
+					Cast::WeaponHitForTesting(enemy, player, 5);
+				}
+				g_ctx["at"] = t; g_ctx["stage"] = 1; return false;
+			}
+			const auto state = Cast::TalentDiagnostics();
+			if (t - g_ctx["at"].get<double>() < .4) return false;
+			if (i < 10) {
+				if (!state.contains("incoming") || state.value("defense_busy", true)) return false;
+				if (stage == 1) { g_ctx["stage"] = 2; g_ctx["at"] = t; return false; } // let queued shield/log delivery settle after the reply
+				const float expected = damages[i] - (i == 7 ? 5 : i == 8 ? 2 : 0);
+				const float dealt = g_ctx["health_before"].get<float>() - av->GetActorValue(RE::ActorValue::kHealth);
+				const float retaliation = g_ctx["enemy_before"].get<float>() - enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				g_ctx["checks"]["resolved_damage_" + key] = std::abs(dealt - expected) < .05f;
+				g_ctx["checks"]["damage_shield_requires_damage_" + key] = std::abs(retaliation - (expected > 0 ? 3 : 0)) < .1f;
+				const auto outcome = i == 7 ? "absorb" : i == 6 ? "hit" : outcomes[i];
+				const auto logged = WowUi::Eval("(function() local e=__wbPaladinDamageReports[1] return e and e.outcome or '' end)()");
+				g_ctx["checks"]["classic_log_outcome_" + key] = logged == outcome &&
+					WowUi::Eval("table.getn(__wbPaladinDamageReports)") == "1" && WowUi::Eval("__wbPaladinDamageChat") == "1";
+				if (i == 6 || i == 8) g_ctx["checks"]["classic_log_trailer_" + key] =
+					WowUi::Eval(i == 6 ? "__wbPaladinDamageReports[1].blocked" : "__wbPaladinDamageReports[1].absorbed") == (i == 6 ? "3" : "2");
+				g_ctx["evidence"][key] = state["incoming"];
+			} else if (i == 10) {
+				if (t - g_ctx["at"].get<double>() < 1.5) return false;
+				g_ctx["checks"]["ally_no_defense_or_proc_request"] = !state.contains("incoming") && state.value("native_spell_requests", 0) == 0 &&
+					!state.value("defense_busy", true) && state.value("defense_queued", 1) == 0;
+				g_ctx["checks"]["ally_not_retaliated_against"] = follower->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) == g_ctx["follower_before"].get<float>() && Melee::ExtraAttacks() == 0;
+			} else if (i == 14 && stage == 2) {
+				if (!state.contains("incoming") || state.value("defense_busy", true)) return false;
+				g_ctx["checks"]["queue_progresses_after_throw_without_reset"] =
+					std::abs(g_ctx["health_before"].get<float>() - av->GetActorValue(RE::ActorValue::kHealth) - 3) < .05f;
+			} else if (i < 16) {
+				if (state.value("defense_busy", true) || state.value("defense_fallbacks", 0) < 1) return false;
+				if (i == 15 && state.value("defense_retired_replies", 0) < 1) return false;
+				g_ctx["checks"][std::string("original_damage_once_") + faults[i-11]] =
+					std::abs(g_ctx["health_before"].get<float>() - av->GetActorValue(RE::ActorValue::kHealth) - 2) < .05f && state.value("defense_fallbacks", 0) == 1;
+				if (i == 14) g_ctx["checks"]["throwing_defense_callback_times_out"] = state.value("defense_callback_threw", false) && state.value("defense_timeouts", 0) == 1;
+				g_ctx["evidence"][key] = state;
+				if (i == 14) {
+					Cast::DefenseReplyForTesting({{"ok", true}, {"defense", {{"kind", "melee"}, {"school", 0}, {"outcome", "hit"}, {"damage", 1}}}});
+					Cast::WeaponHitForTesting(enemy, player, 5);
+					g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+				}
+			} else if (i == 16) {
+				if (stage == 1) {
+					if (!g_ctx.contains("reply")) return false;
+					if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "party aura retry quote failed");
+					Cast::ApplyForTesting(10301, g_ctx["reply"]); g_ctx["stage"] = 2; return false;
+				}
+				if (!state.contains("party_aura")) return false;
+				g_ctx["checks"]["party_poll_retries"] = state["party_aura"].value("ok", false);
+			} else if (i == 18) {
+				if (state.value("defense_busy", true) || state.value("defense_timeouts", 0) < 1) return false;
+				g_ctx["checks"]["throw_after_damage_not_replayed"] = state.value("defense_fallbacks", 0) == 0 &&
+					std::abs(g_ctx["health_before"].get<float>() - av->GetActorValue(RE::ActorValue::kHealth) - 2) < .05f;
+				g_ctx["evidence"][key] = state;
+				return PaladinFinish(result);
+			} else {
+				if (!state.contains("incoming") || state.value("defense_busy", true)) return false;
+				g_ctx["checks"]["subsequent_weapon_hit_delivered"] = std::abs(g_ctx["health_before"].get<float>() - av->GetActorValue(RE::ActorValue::kHealth) - 1) < .05f;
+			}
+			g_ctx["case"] = i + 1; g_ctx["stage"] = 0;
+			return false;
+		}
+
+		bool PaladinDefense(double t, json& result)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (t == 0) {
+				PaladinFixture({{"1421",5},{"1423",5},{"1629",5},{"1424",3},{"1501",3},{"1431",1},{"1426",5},{"1521",3},{"1430",1}}, true);
+				if (!PaladinEquipment()) return PaladinFinish(result, "Armory one-handed sword and shield are required");
+				g_ctx["seen"] = json::object(); g_ctx["seed"] = 0; return false;
+			}
+			auto* enemy = PaladinActor("enemy");
+			if (!enemy) return PaladinFinish(result, "missing level-63 wolf");
+			if (!Progression::Ready() || !enemy->Is3DLoaded()) return false;
+			const int stage = g_ctx["stage"];
+			if (stage == 0) {
+				const auto shield = Character::InSlot(16), sword = Character::InSlot(15);
+				if (!shield || shield->inventoryType != 14 || !sword || sword->itemClass != 2) return false;
+				if (enemy->GetLevel() != 63) return PaladinFinish(result, "private wolf did not retain level 63");
+				const auto state = Cast::TalentDiagnostics();
+				g_ctx["checks"]["native_hooks_installed"] = state.value("native_block_hook", false) && state.value("physical_hit_hook", false);
+				PaladinResolve(20928); g_ctx["stage"] = 1; return false;
+			}
+			if (stage == 1) {
+				if (!g_ctx.contains("reply")) return false;
+				if (!g_ctx["reply"].value("ok", false)) return PaladinFinish(result, "Holy Shield request failed");
+				Cast::BeginForTesting(20928, g_ctx["reply"]); g_ctx["at"] = t; g_ctx["stage"] = 2; return false;
+			}
+			if (stage == 2) {
+				if (t - g_ctx["at"].get<double>() < .3) return false;
+				g_ctx["checks"]["holy_shield_four_charges"] = PaladinAura(20928).value("charges", 0) == 4;
+				g_ctx["health_before"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Cast::WeaponHitForTesting(enemy, player, 1);
+				g_ctx["checks"]["native_damage_waits_for_service"] = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) == g_ctx["health_before"].get<float>();
+				g_ctx["stage"] = 3; return false;
+			}
+			if (stage == 3) {
+				const auto state = Cast::TalentDiagnostics(); if (!state.contains("incoming")) return false;
+				g_ctx["checks"]["native_block_bypassed"] = state["native_hit"].value("percent_blocked", 1.f) == 0 && !state["native_hit"].value("blocked", true);
+				g_ctx["evidence"]["native"] = state["incoming"];
+				g_ctx["stage"] = 4;
+			}
+			if (g_ctx["stage"] == 4) {
+				const auto state = Cast::TalentDiagnostics();
+				g_ctx["count"] = state.value("defense_history", json::array()).size();
+				g_ctx["shield_charges"] = PaladinAura(20928).value("charges", 0);
+				g_ctx["redoubt_charges"] = PaladinAura(20134).value("charges", 0);
+				g_ctx["victim_before"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+				Cast::DefenseForTesting(enemy, .2f, g_ctx["seed"].get<std::uint32_t>());
+				g_ctx["stage"] = 5; return false;
+			}
+			if (g_ctx["stage"] == 5) {
+				const auto state = Cast::TalentDiagnostics();
+				if (state.value("defense_history", json::array()).size() <= g_ctx["count"].get<std::size_t>()) return false;
+				const auto incoming = state["incoming"], out = incoming["reply"], defense = out["defense"];
+				const auto outcome = defense.value("outcome", ""); g_ctx["seen"][outcome] = defense;
+				if (outcome == "block" && g_ctx["shield_charges"].get<int>() > 0) {
+					g_ctx["checks"]["holy_shield_spends_charges"] = PaladinAura(20928).value("charges", 0) == g_ctx["shield_charges"].get<int>() - 1;
+					g_ctx["checks"]["holy_shield_block_damage"] = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) < g_ctx["victim_before"].get<float>();
+					if (g_ctx["shield_charges"].get<int>() == 1) g_ctx["checks"]["holy_shield_expires_on_fourth"] = PaladinAura(20928).empty();
+				}
+				if (g_ctx["redoubt_charges"].get<int>() > 0) {
+					g_ctx["checks"]["redoubt_block_chance"] = defense["chances"].value("block", 0.f) >= 30;
+					if (outcome == "block") g_ctx["checks"]["redoubt_spends_charges"] = PaladinAura(20134).value("charges", 0) == g_ctx["redoubt_charges"].get<int>() - 1;
+				}
+				if (outcome == "crit") {
+					g_ctx["checks"]["redoubt_from_crit"] = PaladinAura(20134).value("charges", 0) == 5;
+					g_ctx["checks"]["reckoning_from_crit"] = Melee::ExtraAttacks() > 0;
+				}
+				g_ctx["checks"]["reckoning_never_over_five"] = Melee::ExtraAttacks() <= 5;
+				g_ctx["seed"] = g_ctx["seed"].get<int>() + 1;
+				if (g_ctx["seed"].get<int>() < 230) { g_ctx["stage"] = 4; return false; }
+				for (const char* name : {"miss", "dodge", "parry", "block", "crit", "crush", "hit"}) g_ctx["checks"][std::string("roll_") + name] = g_ctx["seen"].contains(name);
+				g_ctx["checks"]["reckoning_reaches_cap"] = Melee::ExtraAttacks() == 5;
+				g_ctx["evidence"]["rolls"] = g_ctx["seen"];
+				g_ctx["swings_before"] = state.value("paladin_swings", 0);
+				Melee::Start(enemy); g_ctx["at"] = t; g_ctx["stage"] = 6; return false;
+			}
+			if (g_ctx["stage"] == 6) {
+				if (Melee::ExtraAttacks() > 0) {
+					if (t - g_ctx["at"].get<double>() > 8) return PaladinFinish(result, "Reckoning extra attacks did not drain");
+					return false;
+				}
+				Melee::Stop();
+				g_ctx["checks"]["reckoning_swings_delivered"] = Cast::TalentDiagnostics().value("paladin_swings", 0) >= g_ctx["swings_before"].get<int>() + 5;
+				g_ctx["count"] = Cast::TalentDiagnostics()["defense_history"].size();
+				Cast::DefenseForTesting(enemy, .2f, 111, false); g_ctx["stage"] = 7; return false;
+			}
+			if (g_ctx["stage"] == 7) {
+				const auto state = Cast::TalentDiagnostics(); if (state["defense_history"].size() <= g_ctx["count"].get<std::size_t>()) return false;
+				const auto chances = state["incoming"]["reply"]["defense"]["chances"];
+				g_ctx["checks"]["behind_no_active_defense"] = chances.value("dodge", 1.f) == 0 && chances.value("parry", 1.f) == 0 && chances.value("block", 1.f) == 0;
+				PaladinResolve(25292, nullptr, "cast_quote"); g_ctx["stage"] = 8; return false;
+			}
+			if (g_ctx["stage"] == 8) {
+				if (!g_ctx.contains("cast_quote")) return false;
+				if (!g_ctx["cast_quote"].value("ok", false)) return PaladinFinish(result, "defense casting quote failed");
+				Cast::BeginForTesting(25292, g_ctx["cast_quote"]);
+				g_ctx["count"] = Cast::TalentDiagnostics()["defense_history"].size();
+				Cast::DefenseForTesting(enemy, .2f, 112); g_ctx["stage"] = 9; return false;
+			}
+			if (g_ctx["stage"] == 9) {
+				const auto state = Cast::TalentDiagnostics(); if (state["defense_history"].size() <= g_ctx["count"].get<std::size_t>()) return false;
+				const auto chances = state["incoming"]["reply"]["defense"]["chances"];
+				g_ctx["checks"]["casting_no_active_defense"] = state["incoming"]["request"]["ctx"].value("casting", false) &&
+					chances.value("dodge", 1.f) == 0 && chances.value("parry", 1.f) == 0 && chances.value("block", 1.f) == 0;
+				Cast::Stop(); return PaladinFinish(result);
+			}
+			return false;
+		}
+
+        // Where Skyrim writes a save of this name: Documents\My Games\Skyrim Special Edition\<sLocalSavePath> (the test runner's
+        // own folder on a test PC). A step whose baseline save was refused (a menu, a scene) has nothing to restore.
+        std::filesystem::path SaveFile(const std::string& a_name) {
+            auto* ini=RE::INISettingCollection::GetSingleton();
+            const auto* setting=ini ? ini->GetSetting("sLocalSavePath:General") : nullptr;
+            const std::string folder=setting && setting->GetString() ? setting->GetString() : "Saves\\";
+            return logger::log_directory()->parent_path()/folder/(a_name+".ess");
+        }
         std::filesystem::path ColdFile() { return *logger::log_directory()/"WoWBridge_cold-persistence.json"; }
         std::string ColdSession() {
             static const auto session=std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
@@ -774,6 +3202,17 @@ namespace SelfTest
             }
             return out;
         }
+        json CustomizationLooks() {
+            const auto l=Character::Looks();
+            return {l.race,l.sex,l.skin,l.face,l.hairStyle,l.hairColor,l.facialHair};
+        }
+        json CustomizationSurrogate() {
+            auto* player=RE::PlayerCharacter::GetSingleton();
+            auto* base=player ? player->GetActorBase() : nullptr;
+            auto* race=player ? player->GetRace() : nullptr;
+            return {{"race",race ? race->GetFormID() : 0},{"female",base && base->IsFemale()},
+                {"voice",base && base->voiceType ? base->voiceType->GetFormID() : 0}};
+        }
         constexpr auto kOnboardingProbe="wow_onboarding_activation";
         json ReadOnboardingFixture() {
             // Explicit opt-in only. Never select a normal save or enumerate the user's saves.
@@ -794,14 +3233,15 @@ namespace SelfTest
         }
         void OnboardingActivationTests() {
             if (Config::Get().testOnly!=kOnboardingProbe) return;
-            g_steps.push_back({kOnboardingProbe,100,[](double t,json& r) {
+            g_steps.push_back({kOnboardingProbe,75,[](double t,json& r) {
                 auto* player=RE::PlayerCharacter::GetSingleton();
                 auto* ui=RE::UI::GetSingleton();
                 auto* controls=RE::ControlMap::GetSingleton();
                 if (t==0) g_ctx={{"stage",0},{"at",t},{"checks",json::object()}};
                 const int stage=g_ctx["stage"];
                 auto advance=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
-                if (t>85) { r={{"pass",false},{"error","controlled onboarding activation did not settle"},{"evidence",g_ctx}}; return true; }
+                if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
+                if (t>70) { r={{"pass",false},{"error","controlled onboarding activation did not settle"},{"evidence",g_ctx}}; return true; }
                 if (!player || !player->Is3DLoaded() || !ui || !controls || !g_loads.loads.load() ||
                     ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MainMenu::MENU_NAME)) return false;
                 ProbeWait(kOnboardingProbe,t,{{"stage",stage},{"active",Integration::Active()},
@@ -821,6 +3261,16 @@ namespace SelfTest
                     const auto fixture=ReadOnboardingFixture();
                     if (!fixture.is_object()) { r={{"pass",false},{"error","invalid disposable onboarding fixture"}}; return true; }
                     g_ctx["fixture"]=fixture; g_ctx["kit"]=json::object();
+                    // Read the fixture's pending LOOK while still inactive; no surrogate
+                    // change or activation, and the restored fixture applies the same record.
+                    Character::OnGameLoaded();
+                    g_ctx["original_looks"]=CustomizationLooks(); g_ctx["original_surrogate"]=CustomizationSurrogate();
+                    g_ctx["original_offer"]=Character::CustomizationOffered(); g_ctx["cursor"]=Input::Active();
+                    g_ctx["character_open"]=WowUi::Eval("(CharacterFrame and CharacterFrame:IsShown()) and 1 or 0")=="1";
+                    g_ctx["target"]=Bridge::Target() ? Bridge::Target()->GetFormID() : 0;
+                    g_ctx["original_active"]=Integration::Active();
+                    g_ctx["original_movement"]=controls->IsMovementControlsEnabled();
+                    g_ctx["original_fighting"]=controls->IsFightingControlsEnabled();
                     for (const auto& item : Character::Get().equipment) {
                         const auto found=Character::Gear().find(item.entry);
                         auto* raw=found==Character::Gear().end() ? nullptr : RE::TESDataHandler::GetSingleton()->LookupForm(found->second.form,"WoWBridge.esp");
@@ -833,13 +3283,20 @@ namespace SelfTest
                     g_ctx["checks"]["no_early_kit"]=!g_ctx["kit"].empty() && std::ranges::all_of(g_ctx["kit"],[](const json& n) { return n==0; });
                     g_ctx["checks"]["intro_name"]=Integration::PlayerName()==fixture["name"].get<std::string>();
                     g_ctx["snap"]=Snap("wow_onboarding_bound");
-                    Console::Execute("coc qasmoke"); advance(1); return false;
+                    TravelCell("coc qasmoke"); advance(1); return false;
                 }
                 if (stage==1) {
                     const auto* cell=player->GetParentCell();
                     const char* id=cell ? cell->GetFormEditorID() : nullptr;
                     if (!id || _stricmp(id,"QASmoke")!=0) return false;
                     Console::Execute("enableplayercontrols"); advance(2); return false;
+                }
+                // The reload brings the intro's own control lock back with the save, and the player rightly waits under it
+                // again: the controlled path lifts it once more, as at stage 1, before checking the reactivation.
+                if (stage==5 && g_loads.loads.load()>g_ctx["loads"].get<std::uint64_t>() && !g_ctx.contains("relifted") &&
+                    (!controls->IsMovementControlsEnabled() || !controls->IsFightingControlsEnabled())) {
+                    g_ctx["checks"]["deferred_after_load"]=!Integration::Active();
+                    Console::Execute("enableplayercontrols"); g_ctx["relifted"]=true; return false;
                 }
                 if (!Integration::Active() || !WowUi::Ready() || !Progression::Ready()) return false;
                 if (stage==2) {
@@ -848,6 +3305,37 @@ namespace SelfTest
                     for (const auto& [key,old] : g_ctx["kit"].items()) once=once && g_ctx["after"][key].get<int>()==old.get<int>()+1;
                     g_ctx["checks"]["one_kit_after_controls"]=once;
                     g_ctx["checks"]["chosen_preset"]=Character::Looks().sex==g_ctx["fixture"]["sex"].get<int>();
+                    g_ctx["before_accept"]=CustomizationLooks();
+                    g_ctx["checks"]["automatic_creation_window"]=Character::CustomizationOffered() &&
+                        WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible() and WBCustomizeModel:IsVisible()) and 1 or 0")=="1";
+                    g_ctx["snap"]=Snap("wow_onboarding_creation"); advance(6); return false;
+                }
+                if (stage==6) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    const auto before=Character::Looks();
+                    g_ctx["chosen_race"]=before.race==6 ? 4 : 6;
+                    g_ctx["chosen_sex"]=before.sex==1 ? 0 : 1;
+                    g_ctx["checks"]["real_controls"]=WowUi::Eval(std::format("(function() if not WBCustomizeFrame or not WBCustomizeFrame:IsVisible() then return 0 end "
+                        "WBCustomizeRace{}:Click() WBCustomizeGender{}:Click() return 1 end)()",
+                        g_ctx["chosen_race"].get<int>(),g_ctx["chosen_sex"].get<int>() ? "Female" : "Male"))=="1";
+                    advance(7); return false;
+                }
+                if (stage==7) {
+                    g_ctx["checks"]["preview_keeps_her_look"]=CustomizationLooks()==g_ctx["before_accept"];
+                    g_ctx["checks"]["accept_control"]=WowUi::Eval("(function() if not WBCustomizeFrame or not WBCustomizeFrame:IsVisible() then return 0 end WBCustomizeAccept:Click() return 1 end)()")=="1";
+                    advance(8); return false;
+                }
+                if (stage==8) {
+                    const auto look=Character::Looks();
+                    auto* voiceRace=look.race==6 ? RE::TESForm::LookupByID<RE::TESRace>(0x13747) : player->GetRace();
+                    auto* base=player->GetActorBase();
+                    g_ctx["accepted"]=CustomizationLooks(); g_ctx["surrogate"]=CustomizationSurrogate();
+                    g_ctx["checks"]["accepted_race_and_sex"]=look.race==g_ctx["chosen_race"].get<unsigned>() && look.sex==g_ctx["chosen_sex"].get<unsigned>();
+                    g_ctx["checks"]["accepted_surrogate"]=base && voiceRace && base->IsFemale()==(look.sex==1) &&
+                        look.sex<=1 && base->voiceType && base->voiceType==voiceRace->defaultVoiceTypes[look.sex] &&
+                        g_ctx["surrogate"]["race"]==g_ctx["original_surrogate"]["race"];
+                    g_ctx["checks"]["accept_answers_offer"]=!Character::CustomizationOffered();
+                    g_ctx["checks"]["accept_closes_window"]=WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible()) and 1 or 0")=="0";
                     Bridge::SetTarget(player); WowUi::Run("ToggleCharacter('PaperDollFrame')"); advance(3); return false;
                 }
                 if (stage==3) {
@@ -875,8 +3363,12 @@ namespace SelfTest
                 g_ctx["checks"]["no_duplicate_kit_after_load"]=counts()==g_ctx["after"];
                 g_ctx["checks"]["name_after_load"]=Integration::PlayerName()==g_ctx["fixture"]["name"].get<std::string>() &&
                     WowUi::Eval("UnitName('player')")==g_ctx["fixture"]["name"].get<std::string>();
-                g_ctx["checks"]["preset_after_load"]=Character::Looks().sex==g_ctx["fixture"]["sex"].get<int>();
+                g_ctx["checks"]["accepted_look_after_load"]=CustomizationLooks()==g_ctx["accepted"];
+                g_ctx["checks"]["surrogate_after_load"]=CustomizationSurrogate()==g_ctx["surrogate"];
+                g_ctx["checks"]["offer_answer_after_load"]=!Character::CustomizationOffered() &&
+                    WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible()) and 1 or 0")=="0";
                 r={{"controlled",true},{"natural_helgen_completion",false},{"checks",g_ctx["checks"]},
+                    {"accepted",g_ctx["accepted"]},{"surrogate",g_ctx["surrogate"]},
                     {"names",g_ctx["names"]},{"save",g_ctx["save"]},{"before",g_ctx["kit"]},{"after",g_ctx["after"]}};
                 r["pass"]=std::ranges::all_of(g_ctx["checks"],[](const json& b) { return b==true; });
                 return true;
@@ -1337,7 +3829,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				case 822: native = Forms::Current() == "cat" && Forms::Power() >= 40; break;
 				case 793: native = Forms::Current() == "moonkin" && Forms::TalentDiagnostics().value("moonkin_followers",0) > 0 &&
 					follower->AsActorValueOwner()->GetActorValue(RE::ActorValue::kDestructionPowerModifier) > g_ctx["follower_power"].get<float>() &&
-					av->GetActorValue(RE::ActorValue::kDamageResist) >= g_ctx["armor"].get<float>() + g_ctx["worn_armor"].get<float>() * 3.6f - .05f; break;
+					av->GetActorValue(RE::ActorValue::kDamageResist) >= g_ctx["armor"].get<float>() + g_ctx["worn_armor"].get<float>() *
+						Forms::TalentDiagnostics()["profile"].value("skyrim_armor_percent", 100.0f) / 100.0f - .05f; break;
 				case 829: native = g_ctx.value("reflection_observed", false); break;
 				case 827: native = enemy->AsActorValueOwner()->GetActorValue(RE::ActorValue::kAttackDamageMult) < g_ctx["attack"].get<float>() - .019f; break;
 				case 821: native = av->GetActorValue(RE::ActorValue::kDamageResist) > g_ctx["armor"].get<float>(); break;
@@ -1450,6 +3943,10 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					for (const auto& aura : Cast::TalentDiagnostics()["auras"]) if (aura["target"] != player->GetFormID()) {
 						r = {{"pass",false},{"error","wait for existing target auras to expire"}}; return true;
 					}
+					// From the suite's start: in a long run earlier steps can leave the player by a wall or a house, where native
+					// LOS rightly refuses the melee and charge probes (run suite-20261013-234342: five at 2-10 yards).
+					if (g_startPos && !g_ctx.contains("from_start")) { player->SetPosition(*g_startPos,true); g_ctx["from_start"] = t; return false; }
+					if (g_ctx.contains("from_start") && t - g_ctx["from_start"].get<double>() < 1) return false;
 					const auto p = player->GetPosition();
 					if (auto* skills = player->GetInfoRuntimeData().skills; skills && skills->data)
 						g_feralSavedSkills = std::make_unique<RE::PlayerCharacter::PlayerSkills::Data>(*skills->data);
@@ -1476,6 +3973,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					const double elapsed = Frame::Now()-g_ctx["restoring"].get<double>();
 					const bool ready = Progression::Ready() && Forms::TalentDiagnostics().value("profile_ready", false);
 					if (elapsed < 3 || (!ready && elapsed < 20)) return false;
+					if (!ready) r["restoration_pending"] = true;   // RunSuite stops: later steps would run on its leftovers
 					FinishFeralRestoration();
 					const bool resources = TalentFormStateRestored(g_ctx["saved"]["forms"]);
 					r["restored"] = player->GetLevel() == g_ctx["saved"]["level"] &&
@@ -1657,8 +4155,16 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 						} else if (!profile) {
 							Forms::Apply({{"events",{{{"type","power"},{"power",form == "bear" ? "rage" : "energy"},{"amount",id == 801 ? out.value("cost",0.f) : 100.f}}}}},nullptr);
 							if (id == 804) {
-								enemy->SetPosition(player->GetPosition()+RE::NiPoint3{10*Avatar::kUnitsPerYard,0,0},true);
-								enemy->Update3DPosition(true); // frozen fixture's skeleton must follow the reference
+								// Ten yards out where the player can see it: after earlier steps moved the player, a fixed heading can face a
+								// house or a rise (native LOS then rightly refuses the charge).
+								bool unused = true; int tries = 0;
+								for (; tries < 8; ++tries) {
+									const float angle = tries * RE::NI_PI / 4;
+									enemy->SetPosition(player->GetPosition()+RE::NiPoint3{std::cos(angle)*10*Avatar::kUnitsPerYard,std::sin(angle)*10*Avatar::kUnitsPerYard,0},true);
+									enemy->Update3DPosition(true); // frozen fixture's skeleton must follow the reference
+									if (player->HasLineOfSight(enemy,unused)) break;
+								}
+								result["charge_los_tries"] = tries;
 								g_ctx["charge_from"] = {player->GetPosition().x,player->GetPosition().y,player->GetPosition().z};
 							}
 							if (id == 1162) Carriers::Stealth(enemy,true);
@@ -1883,6 +4389,1151 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 
 		void WbTests()
 		{
+
+            for (const int mode : {0,1,2}) {
+            const bool lootOnly=mode==1, projectileOnly=mode==2;
+            const char* dragonProbe=lootOnly ? "wow_dragon_death_loot" : projectileOnly ? "wow_dragon_projectile" : "wow_dragon_combat";
+            if ((","+Config::Get().testOnly+",").find(std::string(",")+dragonProbe+",")==std::string::npos) continue;
+            g_steps.push_back({dragonProbe,210,[lootOnly,projectileOnly,dragonProbe](double t,json& r) {
+                if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
+                auto* player=RE::PlayerCharacter::GetSingleton(); auto* ui=RE::UI::GetSingleton();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto finish=[&](bool pass,const char* error=nullptr) {
+                    Melee::Stop(); Cast::Stop(); r={{"pass",pass},{"checks",g_ctx.value("checks",json::object())},{"evidence",g_ctx}};
+                    if (error) r["error"]=error; return true;
+                };
+                if (t==0) {
+                    const auto save=std::format("WBDragonTest_{}_baseline",std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+                    g_ctx={{"baseline",save},{"profile",WowUi::ProfileKey()},{"cursor",Input::Active()},{"stage",0},{"at",t},{"checks",json::object()}};
+                    Melee::Stop(); Cast::Stop(); WowUi::SaveVariables(); RE::BGSSaveLoadManager::GetSingleton()->Save(save.c_str()); return false;
+                }
+                const int stage=g_ctx["stage"]; const double elapsed=t-g_ctx["at"].get<double>();
+                if (ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || !WowUi::Ready() || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+                if (stage==0) { if (elapsed<2) return false; TravelCell("cow Tamriel 0 0"); next(1); return false; }
+                if (stage==1) {
+                    if (elapsed<3 || !player->Is3DLoaded()) return false;
+                    auto* cell=player->GetParentCell(); auto* grid=cell ? cell->GetCoordinates() : nullptr;
+                    if (!grid || grid->cellX!=0 || grid->cellY!=0) {
+                        if (elapsed<10) return false;
+                        return finish(false,"wilderness destination did not load; no dragon spawned");
+                    }
+                    // This disposable cell is a giant camp. Isolate nearby ordinary
+                    // placed actors so the dragon's flight/combat stays focused on the player.
+                    g_ctx["isolated_actors"]=json::array();
+                    for (const auto& handle : RE::ProcessLists::GetSingleton()->highActorHandles)
+                        if (auto actor=handle.get(); actor && actor.get()!=player && actor->GetFormID()<0xFF000000 &&
+                            actor->Is3DLoaded() && !actor->IsDisabled() && !actor->IsEssential() && !actor->IsProtected() &&
+                            actor->GetPosition().GetDistance(player->GetPosition())<16384) {
+                            g_ctx["isolated_actors"].push_back(actor->GetFormID()); actor->StopCombat(); actor->Disable();
+                        }
+                    Console::Execute("player.setlevel 60"); Bridge::ForgetLevel(); BookReady(); Cast::ResetForTesting();
+                    auto* av=player->AsActorValueOwner(); av->SetBaseActorValue(RE::ActorValue::kHealth,10000);
+                    av->RestoreActorValue(RE::ActorValue::kHealth,100000); av->SetBaseActorValue(RE::ActorValue::kMagickaRate,0);
+                    auto* dragon=SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0x1CA03),8*Avatar::kUnitsPerYard);
+                    if (!dragon || dragon->GetFormID()<0xFF000000 || dragon->IsEssential() || dragon->IsProtected())
+                        return finish(false,"disposable nonessential dragon unavailable");
+                    g_ctx["enemy"]=dragon->GetFormID(); dragon->EnableAI(false);
+                    auto* dav=dragon->AsActorValueOwner(); dav->SetBaseActorValue(RE::ActorValue::kHealth,lootOnly ? 20 : 5000);
+                    dav->SetBaseActorValue(RE::ActorValue::kHealRate,0); dav->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    g_ctx["ground_attempts"]=0; g_ctx["air_attempts"]=0; next(lootOnly ? 11 : 2); return false;
+                }
+                auto* dragon=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                if (!dragon) return finish(false,"generated dragon disappeared");
+                auto* dav=dragon->AsActorValueOwner();
+                const auto fly=dragon->AsActorState()->GetFlyState();
+                const float distance=dragon->GetPosition().GetDistance(player->GetPosition())/Avatar::kUnitsPerYard;
+                const bool airborne=(fly==RE::FLY_STATE::kCruising || fly==RE::FLY_STATE::kHovering) && dragon->GetPosition().z-player->GetPosition().z>128;
+                const float hp=dav->GetActorValue(RE::ActorValue::kHealth);
+                if (stage==4 || stage==14 || stage==15) { const auto to=dragon->GetPosition()-player->GetPosition();
+                    player->SetAngle({player->GetAngleX(),player->GetAngleY(),std::atan2(to.x,to.y)}); }
+                bool losDetail=true; const bool clear=player->HasLineOfSight(dragon,losDetail);
+                g_ctx["state"]={{"stage",stage},{"elapsed",elapsed},{"fly",static_cast<int>(fly)},{"distance_yd",distance},
+                    {"hp",hp},{"radius_yd",dragon->GetBoundRadius()/Avatar::kUnitsPerYard},{"los",clear},{"airborne",airborne},{"loaded",dragon->Is3DLoaded()},{"dead",dragon->IsDead()},
+                    {"cast",Cast::Casting()},{"error",WowUi::Eval("WBTestLastError")}};
+                ProbeWait(dragonProbe,t,g_ctx["state"]);
+                const auto moonfire=[&] {
+                    Bridge::SetTarget(dragon); ObserveCast(); g_ctx["hp_before"]=hp;
+                    WowUi::Eval("(function() __wbBook='' UseAction(__WBSlotOf(9835)) return 1 end)()");
+                };
+                const auto hit=[&] { return hp<g_ctx["hp_before"].get<float>() &&
+                    Cast::TalentDiagnostics().value("paid_spell",0)==9835 &&
+                    WowUi::Eval("UnitDebuff('target',1)")==R"(Interface\Icons\Spell_Nature_StarFall)"; };
+                if (stage==11) {
+                    if (elapsed<2 || !dragon->Is3DLoaded() || !Progression::Ready() || WowUi::Eval("UnitLevel('player')")!="60") return false;
+                    dragon->EnableAI(true); moonfire(); g_ctx["death_attempts"]=1; g_ctx["death_cast_at"]=t; next(12); return false;
+                }
+                if (stage==12) {
+                    if (dragon->IsDead()) {
+                        g_ctx["checks"]["spell_driven_death"]=hp<g_ctx["hp_before"].get<float>() && Cast::TalentDiagnostics().value("paid_spell",0)==9835;
+                        g_ctx["death_log"]=WowUi::Eval("__wbBook"); next(8); return false;
+                    }
+                    if (elapsed>15) return finish(false,"AI-enabled dragon death did not finalize");
+                    if (hp>0 && t-g_ctx["death_cast_at"].get<double>()>2.5 && g_ctx["death_attempts"].get<int>()<3) {
+                        moonfire(); g_ctx["death_attempts"]=g_ctx["death_attempts"].get<int>()+1; g_ctx["death_cast_at"]=t;
+                    }
+                    return false;
+                }
+                if (stage==2) {
+                    if (elapsed<2 || !dragon->Is3DLoaded() || !Progression::Ready() || WowUi::Eval("UnitLevel('player')")!="60") return false;
+                    if (projectileOnly) {
+                        dragon->EnableAI(true); Console::Execute("startcombat player",dragon);
+                        g_ctx["flight_at"]=t; g_ctx["projectile_attempts"]=0; next(14); return false;
+                    }
+                    if (dragon->AsActorState()->IsFlying()) return finish(false,"dragon did not settle for grounded cast");
+                    moonfire(); g_ctx["ground_attempts"]=g_ctx["ground_attempts"].get<int>()+1; next(3); return false;
+                }
+                if (stage==14) {
+                    if (t-g_ctx["flight_at"].get<double>()>75) return finish(false,"no completed airborne Wrath within 75 seconds");
+                    if (!airborne || !clear || !dragon->Is3DLoaded() || distance>22 || Cast::Casting() || elapsed<.5) return false;
+                    if (g_ctx["projectile_attempts"].get<int>()>=4) return finish(false,"four airborne Wrath attempts did not hit in flight");
+                    Cast::ResetForTesting(); Bridge::SetTarget(dragon); ObserveCast();
+                    g_ctx["projectile_start"]=g_ctx["state"]; g_ctx["hp_before"]=hp;
+                    g_ctx["projectile_attempts"]=g_ctx["projectile_attempts"].get<int>()+1;
+                    g_ctx["cast_seen"]=false; g_ctx["visuals_seen"]=false;
+                    WowUi::Eval("(function() __wbBook='' UseAction(__WBSlotOf(9912)) return 1 end)()"); next(15); return false;
+                }
+                if (stage==15) {
+                    if (Cast::Casting()) {
+                        g_ctx["cast_seen"]=true;
+                        if (SpellVisuals::Running()>0) g_ctx["visuals_seen"]=true;
+                        if (elapsed>1 && !g_ctx.contains("projectile_snap")) g_ctx["projectile_snap"]=Snap("wow_dragon_wrath_cast");
+                    }
+                    const auto diagnostic=Cast::TalentDiagnostics();
+                    const bool paid=diagnostic.value("paid_spell",0)==9912 && diagnostic.value("paid_cost",0.f)>0;
+                    const auto log=WowUi::Eval("__wbBook");
+                    if (hp<g_ctx["hp_before"].get<float>() && paid && log.find("Your Wrath")!=std::string::npos) {
+                        g_ctx["projectile_end"]=g_ctx["state"]; g_ctx["projectile_log"]=log;
+                        g_ctx["projectile_hit"]=g_ctx["hp_before"].get<float>()-hp; g_ctx["payment"]=diagnostic;
+                        if (airborne) {
+                            g_ctx["checks"]={{"airborne_cast",g_ctx["cast_seen"]},{"spell_visuals",g_ctx["visuals_seen"]},{"paid_airborne_hit",true}};
+                            g_ctx["projectile_impact_snap"]=Snap("wow_dragon_wrath_impact");
+                            return finish(g_ctx["cast_seen"]==true && g_ctx["visuals_seen"]==true);
+                        }
+                    }
+                    if (elapsed>6 || (!Cast::Casting() && elapsed>2.7)) {
+                        g_ctx["last_attempt"]={{"end",g_ctx["state"]},{"paid",paid},{"log",log},{"cast_seen",g_ctx["cast_seen"]}};
+                        Cast::ResetForTesting(); next(14);
+                    }
+                    return false;
+                }
+                if (stage==3) {
+                    if (elapsed<2) return false;
+                    if (!hit()) { if (g_ctx["ground_attempts"].get<int>()<3) { next(2); return false; }
+                        return finish(false,"grounded dragon Moonfire did not apply"); }
+                    g_ctx["checks"]["ground_cast_debuff"]=true; g_ctx["ground_hit"]=g_ctx["hp_before"].get<float>()-hp;
+                    g_ctx["ground_log"]=WowUi::Eval("__wbBook"); g_ctx["ground_snap"]=Snap("wow_dragon_ground");
+                    Cast::ResetForTesting(); dragon->EnableAI(true); Console::Execute("startcombat player",dragon);
+                    g_ctx["flight_at"]=t; next(4); return false;
+                }
+                if (stage==4) {
+                    if (t-g_ctx["flight_at"].get<double>()>75) return finish(false,"no usable airborne cast window within 75 seconds");
+                    if (airborne) g_ctx["checks"]["natural_flight_seen"]=true;
+                    if (!airborne || !clear || !dragon->Is3DLoaded() || distance>25 || Cast::Casting() || elapsed<2) return false;
+                    if (g_ctx["air_attempts"].get<int>()>=4) return finish(false,"four airborne Moonfire attempts did not apply");
+                    g_ctx["air_start"]=g_ctx["state"]; moonfire(); g_ctx["air_attempts"]=g_ctx["air_attempts"].get<int>()+1; next(5); return false;
+                }
+                if (stage==5) {
+                    if (elapsed<.7) return false;
+                    if (!airborne || !hit()) { Cast::ResetForTesting(); next(4); return false; }
+                    g_ctx["checks"]["air_cast_debuff"]=true; g_ctx["air_end"]=g_ctx["state"];
+                    g_ctx["air_hit"]=g_ctx["hp_before"].get<float>()-hp; g_ctx["air_log"]=WowUi::Eval("__wbBook");
+                    g_ctx["air_snap"]=Snap("wow_dragon_air"); Cast::ResetForTesting();
+                    g_ctx["landing_at"]=t; next(6); return false;
+                }
+                if (stage==6) {
+                    if (elapsed<.5) return false;
+                    const float reach=std::max(5.f,1.5f+std::max(1.5f,dragon->GetBoundRadius()/Avatar::kUnitsPerYard)+1.33f);
+                    if (!g_ctx.contains("melee_at") && airborne && distance>reach+2) {
+                        ObserveCast(); g_ctx["melee_hp"]=hp; g_ctx["melee_at"]=t; Melee::Start(dragon); return false;
+                    }
+                    if (g_ctx.contains("melee_at") && !g_ctx["checks"].contains("air_melee_range")) {
+                        if (t-g_ctx["melee_at"].get<double>()<.4) return false;
+                        Melee::Stop();
+                        g_ctx["checks"]["air_melee_range"]=distance>reach && hp==g_ctx["melee_hp"].get<float>() &&
+                            WowUi::Eval("WBTestLastError==ERR_BADATTACKPOS and 1 or 0")=="1";
+                    }
+                    if (fly!=RE::FLY_STATE::kNone) {
+                        if (t-g_ctx["landing_at"].get<double>()>55) return finish(false,"dragon did not land after airborne casting");
+                        return false;
+                    }
+                    g_ctx["checks"]["natural_landing"]=true; Melee::Stop(); dragon->EnableAI(false); Cast::ResetForTesting();
+                    dav->SetBaseActorValue(RE::ActorValue::kHealth,50); dav->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    auto to=dragon->GetPosition()-player->GetPosition(); to.z=0; to.Unitize();
+                    player->SetPosition(dragon->GetPosition()-to*(10*Avatar::kUnitsPerYard),true);
+                    Bridge::SetTarget(dragon); g_ctx["kill_attempts"]=0; next(7); return false;
+                }
+                if (stage==7) {
+                    if (dragon->IsDead()) { g_ctx["checks"]["spell_driven_death"]=true; next(8); return false; }
+                    if (elapsed>22) return finish(false,"bounded Wrath death phase did not finish");
+                    if (!Cast::Casting() && (!g_ctx.contains("kill_at") || t-g_ctx["kill_at"].get<double>()>2.5) && g_ctx["kill_attempts"].get<int>()<6) {
+                        WowUi::Eval("UseAction(__WBSlotOf(9912))"); g_ctx["kill_at"]=t; g_ctx["kill_attempts"]=g_ctx["kill_attempts"].get<int>()+1;
+                    }
+                    return false;
+                }
+                if (stage==8) {
+                    if (elapsed<2) return false;
+                    // Guarantee another row remains after taking the first stack,
+                    // so walking-away closure cannot pass merely because loot is empty.
+                    if (lootOnly) if (auto* recipe=RE::TESForm::LookupByID<RE::TESBoundObject>(0xF5CC5))
+                        dragon->AddObjectToContainer(recipe,nullptr,1,nullptr);
+                    auto* pick=RE::CrosshairPickData::GetSingleton(); pick->target=dragon->CreateRefHandle(); pick->targetActor=pick->target;
+                    WowUi::Eval("(function() __wbDragonLoot={opened=0,closed=0} local f=CreateFrame('Frame') __wbDragonLootFrame=f "
+                        "f:RegisterEvent('LOOT_OPENED') f:RegisterEvent('LOOT_CLOSED') f:SetScript('OnEvent',function() "
+                        "local p=__wbDragonLoot if event=='LOOT_OPENED' then p.opened=p.opened+1 else p.closed=p.closed+1 end end) return 1 end)()");
+                    g_ctx["saved_autoloot"]=WowUi::Eval("GetCVar('autoLootDefault')");
+                    WowUi::Eval("SetCVar('autoLootDefault',0)"); player->ActivatePickRef(); next(9); return false;
+                }
+                if (stage==9) {
+                    g_ctx["loot_opened"]=WowUi::Eval("__wbDragonLoot and __wbDragonLoot.opened or 0");
+                    g_ctx["loot_closed"]=WowUi::Eval("__wbDragonLoot and __wbDragonLoot.closed or 0");
+                    if (WowUi::Eval("LootFrame:IsShown()")!="1") {
+                        if (elapsed>.5 && g_ctx["loot_opened"]!="0" && g_ctx["loot_closed"]!="0")
+                            return finish(false,"dragon corpse loot opened then immediately closed");
+                        if (elapsed>8) return finish(false,"dragon corpse loot did not open"); return false;
+                    }
+                    if (lootOnly && distance<=6) {
+                        auto away=player->GetPosition()-dragon->GetPosition(); away.z=0; away.Unitize();
+                        if (away.Length()<.01f) away={1,0,0};
+                        player->SetPosition(dragon->GetPosition()+away*(7*Avatar::kUnitsPerYard),true);
+                        return false;
+                    }
+                    const auto slot=lootOnly ? std::strtoul(WowUi::Eval("(function() local first=0 for slot,item in pairs(__WB.lootItems or {}) do "
+                        "if item.form==15 then return slot end if item.form~=0xF5CC5 then first=slot end end return first end)()").c_str(),nullptr,10) : 1u;
+                    const auto id=std::strtoul(WowUi::Eval(std::format("__WB.lootItems and __WB.lootItems[{}] and __WB.lootItems[{}].form or 0",slot,slot)).c_str(),nullptr,10);
+                    const auto count=std::strtoul(WowUi::Eval(std::format("__WB.lootItems and __WB.lootItems[{}] and __WB.lootItems[{}].count or 0",slot,slot)).c_str(),nullptr,10);
+                    auto* item=RE::TESForm::LookupByID<RE::TESBoundObject>(static_cast<RE::FormID>(id));
+                    if (!item || !count) { if (elapsed>8) return finish(false,"dragon corpse had no available loot"); return false; }
+                    g_ctx["loot_form"]=id; g_ctx["loot_count"]=count; g_ctx["loot_before"]=player->GetItemCount(item);
+                    g_ctx["loot_take_distance_yd"]=distance; g_ctx["loot_slot"]=slot;
+                    g_ctx["loot_snap"]=Snap("wow_dragon_loot"); WowUi::Eval(std::format("LootSlot({})",slot)); next(10); return false;
+                }
+                if (stage==13) {
+                    if (elapsed<.5) return false;
+                    const bool closed=WowUi::Eval("LootFrame:IsShown()")!="1" && !ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME);
+                    if (!closed && elapsed<3) return false;
+                    g_ctx["checks"]["moving_away_closes_loot"]=closed;
+                    return finish(closed && g_ctx["checks"]["spell_driven_death"]==true && g_ctx["checks"]["corpse_loot_transfer"]==true,
+                        closed ? nullptr : "dragon corpse loot remained open beyond body reach");
+                }
+                if (elapsed<.7) return false;
+                auto* item=RE::TESForm::LookupByID<RE::TESBoundObject>(g_ctx["loot_form"].get<RE::FormID>());
+                const bool took=item && player->GetItemCount(item)==g_ctx["loot_before"].get<int>()+g_ctx["loot_count"].get<int>();
+                if (!took && elapsed<5) return false;
+                g_ctx["checks"]["corpse_loot_transfer"]=took;
+                g_ctx["loot_closed_after_take"]=WowUi::Eval("__wbDragonLoot and __wbDragonLoot.closed or 0");
+                g_ctx["loot_visible_after_take"]=WowUi::Eval("LootFrame:IsShown()");
+                g_ctx["loot_after"]=item ? player->GetItemCount(item) : -1;
+                if (lootOnly && took) {
+                    if (g_ctx["loot_visible_after_take"]!="1") return finish(false,"remaining corpse loot closed before moving away");
+                    auto away=player->GetPosition()-dragon->GetPosition(); away.z=0; away.Unitize();
+                    if (away.Length()<.01f) away={1,0,0};
+                    player->SetPosition(dragon->GetPosition()+away*(320+dragon->GetBoundRadius()+128),true);
+                    next(13); return false;
+                }
+                WowUi::Eval("CloseLoot()");
+                bool passed=g_ctx["checks"].size()==(lootOnly ? 2 : 7); for (const auto& value : g_ctx["checks"]) passed=passed && value==true;
+                return finish(passed,passed ? nullptr : "a dragon combat component remained unverified");
+            }});
+            }
+
+            if ((","+Config::Get().testOnly+",").find(",wow_missile_target,")!=std::string::npos)
+            g_steps.push_back({"wow_missile_target",45,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                static constexpr std::array names={"disabled_in_flight","dead_in_flight","valid_target","moved_after_release"};
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"pass",error==nullptr && g_ctx.value("cases",json::object()).size()==names.size()},{"cases",g_ctx.value("cases",json::object())}};
+                    if (error) r["error"]=error;
+                    for (const auto& row : r["cases"]) if (!row.value("pass",false)) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); g_ctx["cases"]=json::object(); g_ctx["case"]=0; g_ctx["stage"]=0;
+                    auto caster=Character::Caster(); caster["level"]=60; caster["talents"]=json::object(); caster["auras"]=json::array();
+                    Service::Request({{"op","resolve"},{"spell",9912},{"caster",caster},{"seed",1},
+                        {"target",{{"kind","unit"},{"level",1},{"distance_yd",10},{"alive",true},{"reaction","hostile"},{"los",true},{"in_front",true}}}},
+                        [index=g_index](const json& out) { if (index==g_index) g_ctx["outcome"]=out; });
+                    return false;
+                }
+                if (!g_ctx.contains("outcome")) return false;
+                const auto& out=g_ctx["outcome"];
+                int expectedDamage=0; for (const auto& event : out.value("events",json::array()))
+                    if (event.value("type","")=="damage") expectedDamage+=event.value("amount",0);
+                if (!out.value("ok",false) || expectedDamage<=0 || WowUi::Facts(9912).speed<=0)
+                    return finish("resolved damaging missile unavailable");
+                const int index=g_ctx["case"],stage=g_ctx["stage"];
+                if (index==static_cast<int>(names.size())) return finish();
+                if (stage==0) {
+                    Cast::ResetForTesting();
+                    auto* wolf=SpawnWolf(10*Avatar::kUnitsPerYard);
+                    if (!wolf) return finish("missing disposable missile target");
+                    g_ctx["enemy"]=wolf->GetFormID(); g_ctx["at"]=t; g_ctx["stage"]=1;
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth,10000);
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate,0);
+                    wolf->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000); return false;
+                }
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                if (!wolf) return finish("disposable missile target disappeared");
+                if (stage==1) {
+                    if (t-g_ctx["at"].get<double>()<.75 || !wolf->Is3DLoaded()) return false;
+                    bool los=true;
+                    if (!player->HasLineOfSight(wolf,los)) return finish("missile launch fixture has no LOS");
+                    auto* av=player->AsActorValueOwner(); av->SetBaseActorValue(RE::ActorValue::kMagicka,10000);
+                    av->RestoreActorValue(RE::ActorValue::kMagicka,100000);
+                    Bridge::SetTarget(wolf); ObserveCast(); WowUi::Eval("(function() __wbBook='' return 1 end)()");
+                    g_ctx["hp_before"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    const float yards=player->GetPosition().GetDistance(wolf->GetPosition())/Avatar::kUnitsPerYard;
+                    g_ctx["delay"]=std::max(yards,5.f)/WowUi::Facts(9912).speed;
+                    auto immediate=out; immediate["cast_ms"]=0; Cast::BeginForTesting(9912,immediate,wolf);
+                    g_ctx["deferred"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)==g_ctx["hp_before"].get<float>();
+                    if (index==0) wolf->Disable();
+                    if (index==1) { wolf->EnableAI(true); wolf->KillImmediate(); }
+                    if (index==3) {
+                        auto away=wolf->GetPosition()-player->GetPosition(); away.Unitize();
+                        wolf->SetPosition(player->GetPosition()+away*(45*Avatar::kUnitsPerYard),true); wolf->Update3DPosition(true);
+                    }
+                    g_ctx["hp_at_launch"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    g_ctx["at"]=t; g_ctx["stage"]=2; return false;
+                }
+                if (t-g_ctx["at"].get<double>()<g_ctx["delay"].get<double>()+.6) return false;
+                const float before=g_ctx["hp_at_launch"],after=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                const auto diagnostic=Cast::TalentDiagnostics(); const auto log=WowUi::Eval("__wbBook");
+                const bool paid=diagnostic.value("paid_spell",0)==9912 && diagnostic.value("paid_cost",0.f)>0;
+                const bool hit=before-after==expectedDamage && log.find("Your Wrath")!=std::string::npos;
+                const bool ignored=after==before && log.find("Your Wrath")==std::string::npos;
+                g_ctx["cases"][names[index]]={{"pass",paid && g_ctx["deferred"]==true && (index<2 ? ignored : hit)},
+                    {"deferred",g_ctx["deferred"]},{"paid",paid},{"hp_before_impact",before},{"hp_after",after},
+                    {"expected_damage",expectedDamage},{"delay",g_ctx["delay"]},{"disabled",wolf->IsDisabled()},
+                    {"dead",wolf->IsDead()},{"distance_yd",player->GetPosition().GetDistance(wolf->GetPosition())/Avatar::kUnitsPerYard},{"log",log}};
+                wolf->StopCombat(); wolf->Disable(); g_ctx["case"]=index+1; g_ctx["stage"]=0; return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_swipe_targets,")!=std::string::npos)
+            g_steps.push_back({"wow_swipe_targets",45,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto next=[&](int stage) { g_ctx["stage"]=stage; g_ctx["at"]=t; };
+                auto finish=[&](const char* error=nullptr) {
+                    bool pass=error==nullptr && g_ctx.value("checks",json::object()).size()==4;
+                    for (const auto& row : g_ctx.value("checks",json::object())) pass=pass && row==true;
+                    r={{"pass",pass},{"checks",g_ctx.value("checks",json::object())},{"evidence",g_ctx}};
+                    if (error) r["error"]=error; return true;
+                };
+                if (t==0) {
+                    const auto save=std::format("WBSwipeTest_{}_baseline",std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+                    g_ctx={{"baseline",save},{"profile",WowUi::ProfileKey()},{"cursor",Input::Active()},{"stage",0},{"at",t},{"checks",json::object()}};
+                    Melee::Stop(); Cast::Stop(); WowUi::SaveVariables(); RE::BGSSaveLoadManager::GetSingleton()->Save(save.c_str()); return false;
+                }
+                if (RE::UI::GetSingleton()->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || !WowUi::Ready() || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+                const int stage=g_ctx["stage"]; const double elapsed=t-g_ctx["at"].get<double>();
+                if (stage==0) {
+                    if (elapsed<2) return false;
+                    BookReady(); Cast::ResetForTesting(); g_ctx["actors"]=json::array();
+                    for (float side : {0.f,160.f,-160.f}) {
+                        auto* wolf=SpawnWolf(3*Avatar::kUnitsPerYard,side); if (!wolf) return finish("missing disposable Swipe target");
+                        wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth,5000);
+                        wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate,0);
+                        wolf->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000); g_ctx["actors"].push_back(wolf->GetFormID());
+                    }
+                    next(1); return false;
+                }
+                std::array<RE::Actor*,3> actors{};
+                for (int i=0;i<3;++i) {
+                    actors[i]=RE::TESForm::LookupByID<RE::Actor>(g_ctx["actors"][i].get<RE::FormID>());
+                    if (!actors[i]) return finish("generated Swipe target disappeared");
+                }
+                if (stage==1) {
+                    if (elapsed<.75 || std::ranges::any_of(actors,[](const auto* actor) { return !actor->Is3DLoaded(); })) return false;
+                    auto caster=Character::Caster(); caster["level"]=60; caster["form"]="bear"; caster["talents"]=json::object();
+                    caster["auras"]=json::array(); caster["power"]={{"rage",100},{"energy",0}};
+                    json targets=json::array();
+                    for (auto* actor : actors) targets.push_back({{"id",actor->GetFormID()},{"kind","unit"},{"level",actor->GetLevel()},
+                        {"alive",true},{"reaction","hostile"},{"distance_yd",3},{"los",true},{"in_front",true},{"behind",true}});
+                    Service::Request({{"op","resolve"},{"spell",9908},{"caster",caster},{"target",targets[0]},{"targets",targets},{"seed",1}},
+                        [index=g_index](const json& out) { if (index==g_index) g_ctx["outcome"]=out; });
+                    next(2); return false;
+                }
+                if (!g_ctx.contains("outcome")) return false;
+                const auto& out=g_ctx["outcome"];
+                if (!out.value("ok",false) || out.value("results",json::array()).size()!=3) return finish("three-target Swipe resolution unavailable");
+                for (const auto& hit : out["results"]) if (hit.value("type","")!="damage" || hit.value("amount",0)<=0)
+                    return finish("Swipe service outcome was not three damaging hits");
+                if (stage==2) { actors[1]->Disable(); actors[2]->EnableAI(true); actors[2]->KillImmediate(); next(3); return false; }
+                if (stage==3) {
+                    if (elapsed<.4) return false;
+                    if (!actors[1]->IsDisabled() || !actors[2]->IsDead()) return finish("target state changes did not settle");
+                    g_ctx["before"]=json::array(); for (auto* actor : actors) g_ctx["before"].push_back(actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth));
+                    Bridge::SetTarget(actors[0]); WowUi::Eval("(function() __wbBook='' return 1 end)()");
+                    Cast::ApplyForTesting(9908,out,actors[0]); next(4); return false;
+                }
+                if (elapsed<.6) return false;
+                g_ctx["after"]=json::array(); for (auto* actor : actors) g_ctx["after"].push_back(actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth));
+                g_ctx["checks"]["valid_target_exact_damage"]=g_ctx["before"][0].get<float>()-g_ctx["after"][0].get<float>()==out["results"][0].value("amount",0);
+                g_ctx["checks"]["disabled_target_unchanged"]=g_ctx["before"][1]==g_ctx["after"][1];
+                g_ctx["checks"]["dead_target_unchanged"]=g_ctx["before"][2]==g_ctx["after"][2];
+                const auto log=WowUi::Eval("__wbBook"); g_ctx["log"]=log;
+                int hits=0; for (std::size_t at=0;(at=log.find("Your Swipe",at))!=std::string::npos;at+=10) ++hits;
+                g_ctx["checks"]["only_live_target_logged"]=hits==1; return finish();
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_prowl_miss,")!=std::string::npos)
+            g_steps.push_back({"wow_prowl_miss",45,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                static constexpr std::array names={"miss_breaks_prowl","hit_breaks_prowl"};
+                auto finish=[&](const char* error=nullptr) {
+                    bool pass=error==nullptr && g_ctx.value("cases",json::object()).size()==names.size() && g_ctx.value("disabled_combo_rejected",false);
+                    for (const auto& row : g_ctx.value("cases",json::object())) pass=pass && row.value("pass",false);
+                    r={{"pass",pass},{"cases",g_ctx.value("cases",json::object())},{"disabled_combo_rejected",g_ctx.value("disabled_combo_rejected",false)}};
+                    if (error) r["error"]=error; return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); g_ctx["case"]=0; g_ctx["stage"]=0; g_ctx["cases"]=json::object();
+                    auto* wolf=SpawnWolf(2*Avatar::kUnitsPerYard); if (!wolf) return finish("missing disposable Prowl target");
+                    g_ctx["enemy"]=wolf->GetFormID(); wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth,10000);
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate,0); wolf->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    auto caster=Character::Caster(); caster["level"]=60; caster["talents"]=json::object(); caster["auras"]=json::array();
+                    caster["form"]="none"; caster["in_combat"]=false; caster["prowling"]=false; caster["power"]={{"rage",100},{"energy",100}};
+                    auto ask=[&](int spell,int seed,const char* key,bool unit=false) {
+                        json target=unit ? json{{"kind","unit"},{"level",60},{"alive",true},{"reaction","hostile"},{"distance_yd",2},{"los",true},{"in_front",true},{"behind",true}} : json{{"kind","self"}};
+                        Service::Request({{"op","resolve"},{"spell",spell},{"caster",caster},{"target",target},{"seed",seed}},
+                            [index=g_index,key=std::string(key)](const json& out) { if (index==g_index) g_ctx[key]=out; });
+                    };
+                    ask(768,1,"cat"); caster["form"]="cat"; ask(9913,1,"prowl");
+                    caster["prowling"]=true; ask(9850,31,"miss",true); ask(9850,1,"hit",true); return false;
+                }
+                for (const char* key : {"cat","prowl","miss","hit"}) {
+                    if (!g_ctx.contains(key)) return false;
+                    if (!g_ctx[key].value("ok",false)) return finish("Prowl service fixture unavailable");
+                }
+                if (g_ctx["miss"]["events"][0].value("type","")!="miss" || g_ctx["hit"]["events"][0].value("type","")!="damage")
+                    return finish("fixed Claw seeds did not produce miss and hit controls");
+                const int index=g_ctx["case"],stage=g_ctx["stage"];
+                if (index==static_cast<int>(names.size())) {
+                    // Disable() settles on a later frame (the Swipe probe waits for it too): check once it has.
+                    auto* gone=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                    if (gone && !gone->IsDisabled() && t-g_ctx["disabled_at"].get<double>()<2) return false;
+                    const auto form=Forms::SnapshotForTesting();
+                    g_ctx["disabled_combo_rejected"]=gone && gone->IsDisabled() && Forms::ComboPoints(gone)==0 &&
+                        std::ranges::none_of(form["combos"],[&](const json& combo) { return combo.value("target",0u)==gone->GetFormID(); });
+                    return finish();
+                }
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                if (!wolf || !wolf->Is3DLoaded()) return false;
+                if (stage==0) {
+                    Cast::ResetForTesting(); Forms::Leave(); BookReady();
+                    Cast::BeginForTesting(768,g_ctx["cat"]); g_ctx["at"]=t; g_ctx["stage"]=1; return false;
+                }
+                const double elapsed=t-g_ctx["at"].get<double>();
+                if (stage==1) {
+                    if (elapsed<1 || Forms::Current()!="cat" || !Forms::TalentDiagnostics().value("profile_ready",false)) return false;
+                    auto state=Forms::SnapshotForTesting(); state["energy"]=100; state["combos"]=json::array(); Forms::RestoreForTesting(state,false);
+                    Cast::BeginForTesting(9913,g_ctx["prowl"]); g_ctx["at"]=t; g_ctx["stage"]=2; return false;
+                }
+                const auto& out=g_ctx[index==0 ? "miss" : "hit"];
+                if (stage==2) {
+                    if (elapsed<.5) return false;
+                    if (!Forms::SnapshotForTesting().value("prowling",false) || player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kInvisibility)<=0)
+                        return finish("native Prowl did not become active");
+                    bool los=true; if (!player->HasLineOfSight(wolf,los)) return finish("Prowl target fixture has no native LOS");
+                    Bridge::SetTarget(wolf); ObserveCast(); WowUi::Eval("(function() __wbBook='' return 1 end)()");
+                    g_ctx["hp_before"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    Cast::BeginForTesting(9850,out,wolf); g_ctx["paid_power"]=Forms::Power(); g_ctx["at"]=t; g_ctx["stage"]=3; return false;
+                }
+                if (elapsed<.3) return false;
+                const bool prowling=Forms::SnapshotForTesting().value("prowling",false);
+                const float invis=player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kInvisibility);
+                const auto diagnostic=Cast::TalentDiagnostics();
+                const bool aura=std::ranges::any_of(diagnostic["auras"],[](const json& row) { return row.value("spell",0)==9913; });
+                const float damage=g_ctx["hp_before"].get<float>()-wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                const int expectedDamage=index==0 ? 0 : out["events"][0].value("amount",0);
+                const float expectedPower=100-out.value("cost",0.f)+out.value("power_refund",0.f);
+                const int combo=Forms::ComboPoints();
+                const bool pass=!prowling && invis==0 && !aura && damage==expectedDamage && combo==out.value("combo_points",0) &&
+                    std::abs(g_ctx["paid_power"].get<float>()-expectedPower)<.01f && diagnostic.value("paid_spell",0)==9850;
+                g_ctx["cases"][names[index]]={{"pass",pass},{"prowling",prowling},{"invisibility",invis},{"aura",aura},{"damage",damage},
+                    {"expected_damage",expectedDamage},{"paid_power",g_ctx["paid_power"]},{"expected_power",expectedPower},{"combo",combo},
+                    {"log",WowUi::Eval("__wbBook")}};
+                if (index==0) g_ctx["snap"]=Snap("wow_prowl_miss");
+                if (index==1) { wolf->Disable(); g_ctx["disabled_at"]=t; }
+                g_ctx["case"]=index+1; g_ctx["stage"]=0; return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_courier_delivery,")!=std::string::npos)
+            g_steps.push_back({"wow_courier_delivery",130,[](double t,json& r) {
+                if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
+                auto* player=RE::PlayerCharacter::GetSingleton(); auto* ui=RE::UI::GetSingleton();
+                auto* controls=RE::ControlMap::GetSingleton();
+                auto* count=RE::TESForm::LookupByID<RE::TESGlobal>(0x39FBB);
+                auto* container=RE::TESForm::LookupByID<RE::TESObjectREFR>(0x39FB9);
+                auto* courier=RE::TESForm::LookupByID<RE::Actor>(0x39FB7);
+                auto* quest=RE::TESForm::LookupByID<RE::TESQuest>(0x39F82);
+                auto* recipe=RE::TESForm::LookupByID<RE::TESBoundObject>(0xF5CC5);
+                const auto courierItems=[&] {
+                    if (!container || !recipe) return -1;
+                    const auto items=container->GetInventoryCounts([&](RE::TESBoundObject& item) { return &item==recipe; },true);
+                    const auto found=items.find(recipe); return found==items.end() ? 0 : found->second;
+                };
+                auto finish=[&](bool pass,const char* error=nullptr) {
+                    if (!pass) {
+                        if (!g_ctx.contains("failed_snap")) { g_ctx["error"]=error ? error : "Courier did not finish";
+                            g_ctx["failed_snap"]=Snap("wow_courier_failed"); return false; }
+                        if (!Settled(g_ctx["failed_snap"],.5)) return false;
+                    }
+                    r={{"pass",pass},{"evidence",g_ctx}}; if (!pass) r["error"]=g_ctx["error"]; return true;
+                };
+                if (g_ctx.contains("failed_snap")) return finish(false);
+                if (!player || !ui || !controls || !count || !container || !courier || !quest || !recipe)
+                    return finish(false,"native Courier fixture forms unavailable");
+                if (t==0) {
+                    const auto save=std::format("WBCourierTest_{}_baseline",std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+                    g_ctx={{"baseline",save},{"profile",WowUi::ProfileKey()},{"cursor",Input::Active()},{"stage",0},{"at",t},
+                        {"count_before",count->value},{"container_before",courierItems()},
+                        {"player_before",player->GetItemCount(recipe)}};
+                    Melee::Stop(); Cast::Stop(); Bridge::SetTarget(nullptr);
+                    g_ctx["save_pending"]=true; return false;
+                }
+                const int stage=g_ctx["stage"]; const double elapsed=t-g_ctx["at"].get<double>();
+                const bool loading=ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+                bool owns=false; auto* manager=RE::MenuTopicManager::GetSingleton();
+                if (manager) { REX::W32::EnterCriticalSection(&manager->criticalSection);
+                    owns=manager->IsCurrentSpeaker(courier->CreateRefHandle()); REX::W32::LeaveCriticalSection(&manager->criticalSection); }
+                const auto menu=ui->GetMenu<RE::DialogueMenu>();
+                const bool dialogue=ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) && menu && menu->uiMovie && menu->uiMovie->GetVisible();
+                g_ctx["state"]={{"stage",stage},{"elapsed",elapsed},{"quest_running",quest->IsRunning()},
+                    {"count",count->value},{"container_items",courierItems()},{"player_items",player->GetItemCount(recipe)},
+                    {"courier_loaded",courier->Is3DLoaded()},{"distance",courier->GetPosition().GetDistance(player->GetPosition())},
+                    {"owns_dialogue",owns},{"dialogue_visible",dialogue},{"movement",controls->IsMovementControlsEnabled()},
+                    {"fighting",controls->IsFightingControlsEnabled()},{"loading",loading}};
+                ProbeWait("wow_courier_delivery",t,g_ctx["state"]);
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                if (loading || !WowUi::Ready() || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+                if (g_ctx.value("save_pending",false)) {   // Skyrim refuses a save in combat (the setup's stopcombat lingers), paused, or bound
+                    json blockers=json::array();
+                    if (player->IsInCombat()) blockers.push_back("combat");
+                    if (ui->GameIsPaused()) blockers.push_back("paused");
+                    if (!controls->IsMovementControlsEnabled() || !controls->IsFightingControlsEnabled()) blockers.push_back("controls");
+                    if (player->IsInMidair()) blockers.push_back("midair");
+                    json menus=json::array();   // what else is up: a menu Skyrim will not save under
+                    for (const char* name : {"Console","MessageBoxMenu","TweenMenu","LevelUp Menu","StatsMenu","InventoryMenu","ContainerMenu","Dialogue Menu",
+                            "Journal Menu","MapMenu","BarterMenu","Tutorial Menu","Book Menu","FavoritesMenu","MagicMenu","Crafting Menu","Sleep/Wait Menu",
+                            "Training Menu","GiftMenu","Loading Menu","Main Menu","RaceSex Menu","Lockpicking Menu","Mist Menu","Fader Menu"})
+                        if (ui->IsMenuOpen(name)) { menus.push_back(name); blockers.push_back(name); }
+                    g_ctx["menus_open"]=menus; g_ctx["pauses"]=ui->numPausesGame;
+                    g_ctx["save_blockers"]=blockers;
+                    // A WoW loot window a previous step left open rides on Skyrim's invisible ContainerMenu, under which
+                    // Skyrim saves nothing: close it the WoW way, and hide the menu itself if that did not take.
+                    if (ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME)) {
+                        if (!g_ctx.contains("loot_closed_at")) { g_ctx["loot_closed_at"]=t; WowUi::Run("CloseLoot()"); return false; }
+                        if (t-g_ctx["loot_closed_at"].get<double>()>3 && !g_ctx.value("container_hidden",false)) {
+                            g_ctx["container_hidden"]=true;
+                            RE::UIMessageQueue::GetSingleton()->AddMessage(RE::ContainerMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kHide,nullptr);
+                        }
+                        if (elapsed<60) return false;
+                    }
+                    // A save refused early in a launch (the first step's, ~14 s in) left the manager refusing every later
+                    // one in that session; saves from half a minute in have always landed, so the first waits for that.
+                    if ((!blockers.empty() || Frame::Now()<30) && elapsed<60) return false;
+                    g_ctx["save_waited"]=elapsed; g_ctx.erase("save_pending"); g_ctx["at"]=t;
+                    WowUi::SaveVariables(); RE::BGSSaveLoadManager::GetSingleton()->Save(g_ctx["baseline"].get<std::string>().c_str()); return false;
+                }
+                if (stage==0) {
+                    if (elapsed<2) return false;
+                    if (!g_ctx.value("baseline_ok",false)) {   // the baseline must be on disk before anything changes
+                        if (!std::filesystem::exists(SaveFile(g_ctx["baseline"].get<std::string>()))) {
+                            if (elapsed<4) return false;   // the writer may still be at it
+                            const int tries=g_ctx.value("baseline_tries",0);
+                            g_ctx["baseline_attempts"].push_back(Frame::Now());   // game time of each refused attempt
+                            if (tries>=15) return finish(false,"baseline save refused for a minute");
+                            // A refused name stays refused (the manager keeps its pending entry): the retry takes a new one.
+                            if (!g_ctx.contains("baseline_base")) g_ctx["baseline_base"]=g_ctx["baseline"];
+                            g_ctx["baseline"]=std::format("{}{}",g_ctx["baseline_base"].get<std::string>(),tries+1);
+                            g_ctx["baseline_tries"]=tries+1; g_ctx["at"]=t;
+                            RE::BGSSaveLoadManager::GetSingleton()->Save(g_ctx["baseline"].get<std::string>().c_str()); return false;
+                        }
+                        g_ctx["baseline_ok"]=true; g_ctx["baseline_seconds"]=elapsed; g_ctx["baseline_tries"]=g_ctx.value("baseline_tries",0);
+                    }
+                    // Installed WICourierScript metadata: addItemToContainer(FormToAdd: form, countToAdd: Int).
+                    auto* vm=RE::BSScript::Internal::VirtualMachine::GetSingleton();
+                    auto* policy=vm ? vm->GetObjectHandlePolicy() : nullptr;
+                    RE::BSTSmartPointer<RE::BSScript::Object> object;
+                    const bool bound=policy && vm->FindBoundObject(policy->GetHandleForObject(quest->GetFormType(),quest),"WICourierScript",object);
+                    g_ctx["script_bound"]=bound;
+                    if (!bound) return finish(false,"Courier script is not bound to its native quest");
+                    RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback;
+                    const bool dispatched=vm->DispatchMethodCall(object,"addItemToContainer",
+                        RE::MakeFunctionArguments(static_cast<RE::TESForm*>(recipe),std::int32_t{1}),callback);
+                    g_ctx["script_dispatched"]=dispatched;
+                    if (!dispatched) return finish(false,"native Courier script call was rejected");
+                    next(1); return false;
+                }
+                if (stage==1) {
+                    const bool queued=count->value==g_ctx["count_before"].get<float>()+1 &&
+                        courierItems()==g_ctx["container_before"].get<int>()+1;
+                    if (!queued) { if (elapsed<4) return false; return finish(false,"Courier script did not enqueue the recipe"); }
+                    g_ctx["queued"]=true; TravelCell("coc WhiterunExterior01"); next(2); return false;
+                }
+                if (stage==2) { if (elapsed<3 || !player->Is3DLoaded()) return false; next(3); return false; }
+                if (stage==3) {
+                    if (owns && dialogue) { g_ctx["dialogue_seen"]=true; g_ctx["dialogue_snap"]=Snap("wow_courier_dialogue");
+                        g_ctx["presses"]=0; next(4); return false; }
+                    if (owns && !dialogue && !controls->IsMovementControlsEnabled() && elapsed>10)
+                        return finish(false,"Courier owns controls but its dialogue is hidden");
+                    if (elapsed>60) return finish(false,"Courier did not approach after the queued location change");
+                    return false;
+                }
+                const bool delivered=player->GetItemCount(recipe)==g_ctx["player_before"].get<int>()+1;
+                const bool recovered=!ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) && controls->IsMovementControlsEnabled() && controls->IsFightingControlsEnabled();
+                if (delivered && recovered) { g_ctx["delivered"]=true; g_ctx["controls_recovered"]=true; return finish(true); }
+                if (elapsed>28) return finish(false,"Courier delivery/dialogue did not finish without Escape");
+                if (!Settled(g_ctx["dialogue_snap"],.5)) return false;
+                if (dialogue && elapsed>2+g_ctx["presses"].get<int>()*3 && g_ctx["presses"].get<int>()<4) {
+                    Action("key:enter"); g_ctx["presses"]=g_ctx["presses"].get<int>()+1;
+                }
+                return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_melee_retarget,")!=std::string::npos)
+            g_steps.push_back({"wow_melee_retarget",60,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                const std::array<const char*,4> names={"switched_success","switched_error","same_target_success","stopped_success"};
+                auto finish=[&](const char* error=nullptr) {
+                    Melee::Stop(); r={{"cases",g_ctx.value("cases",json::object())},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& row : r["cases"]) if (!row.value("pass",false)) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); const auto p=player->GetPosition(); g_ctx["saved"]["position"]={p.x,p.y,p.z};
+                    Cast::FormForTesting(0,{}); g_ctx["case"]=0; g_ctx["stage"]=0; g_ctx["cases"]=json::object();
+                    for (const auto key : {"enemy","follower"}) {
+                        auto* wolf=SpawnWolf(3*Avatar::kUnitsPerYard,0); if (!wolf) return finish("missing retarget fixture wolf");
+                        g_ctx[key]=wolf->GetFormID(); auto* av=wolf->AsActorValueOwner();
+                        av->SetBaseActorValue(RE::ActorValue::kHealth,10000); av->SetBaseActorValue(RE::ActorValue::kHealRate,0);
+                        av->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    }
+                    auto caster=Character::Caster(); caster["level"]=60; caster["form"]="none";
+                    caster["talents"]=json::object(); caster["auras"]=json::array(); caster.erase("next_swing");
+                    const auto ask=[&](bool alive,const char* key) {
+                        Service::Request({{"op","melee"},{"caster",caster},{"target",{{"level",6},{"alive",alive},
+                            {"distance_yd",3},{"facing",true},{"in_front",true},{"reaction","hostile"},{"attackable",true}}},{"seed",1}},
+                            [index=g_index,key=std::string(key)](const json& out) { if (index==g_index) g_ctx[key]=out; });
+                    };
+                    ask(true,"hit"); ask(false,"reject"); return false;
+                }
+                if (!g_ctx.contains("hit") || !g_ctx.contains("reject")) return false;
+                if (!g_ctx["hit"].value("ok",false) || g_ctx["hit"].value("damage",0)<=0 || g_ctx["reject"].value("ok",true))
+                    return finish("real service retarget fixtures unavailable");
+                auto* a=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                auto* b=RE::TESForm::LookupByID<RE::Actor>(g_ctx["follower"].get<RE::FormID>());
+                if (!a || !b) return finish("retarget fixture disappeared");
+                const int index=g_ctx["case"],stage=g_ctx["stage"];
+                if (stage==0) {
+                    if (!a->Is3DLoaded() || !b->Is3DLoaded() || t<1) return false;
+                    const float h=player->GetHeading(false);
+                    for (auto* wolf : {a,b}) { const float d=(wolf==a ? 3.f : 4.f)*Avatar::kUnitsPerYard;
+                        wolf->SetPosition(player->GetPosition()+RE::NiPoint3{std::sin(h)*d,std::cos(h)*d,0},true); wolf->Update3DPosition(true); }
+                    g_ctx["since"]=t; g_ctx["stage"]=1; return false;
+                }
+                if (stage==1) {
+                    if (t-g_ctx["since"].get<double>()<.35) return false;
+                    g_ctx["hp_a"]=a->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    g_ctx["hp_b"]=b->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    Melee::Reset(); Melee::Start(a); auto complete=Melee::CompletionForTesting(a);
+                    if (index<2) Melee::Start(b); else if (index==2) Melee::Start(a); else Melee::Stop();
+                    complete(g_ctx[index==1 ? "reject" : "hit"]);
+                    g_ctx["attacking"]=Melee::Attacking(); Melee::Stop();
+                    g_ctx["since"]=t; g_ctx["stage"]=2; return false;
+                }
+                if (stage==2) {
+                    if (t-g_ctx["since"].get<double>()<.3) return false;
+                    const float damageA=g_ctx["hp_a"].get<float>()-a->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    const float damageB=g_ctx["hp_b"].get<float>()-b->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    const bool pass=(index==2 ? damageA>0 : std::abs(damageA)<.01f) && std::abs(damageB)<.01f &&
+                        g_ctx["attacking"].get<bool>()==(index!=3);
+                    g_ctx["cases"][names[index]]={{"pass",pass},{"old_target_damage",damageA},{"new_target_damage",damageB},
+                        {"attacking_after_reply",g_ctx["attacking"]}};
+                    g_ctx["results"][names[index]]=pass; g_ctx["since"]=t; g_ctx["stage"]=3; return false;
+                }
+                if (t-g_ctx["since"].get<double>()<2) return false;
+                if (index==3) return finish();
+                g_ctx["case"]=index+1; g_ctx["stage"]=0; return false;
+            }});
+
+            // Growl, Challenging Roar, Cower and a form's freeing, on the real landing path with real service outcomes:
+            // AI-off wolves and an AI-off follower (EncChicken: no shared wolf faction). Victims are Skyrim's combat
+            // targets; a "turn" stands in for Skyrim's own target selection pulling a wolf away.
+            if ((","+Config::Get().testOnly+",").find(",wow_threat_control,")!=std::string::npos)
+            g_steps.push_back({"wow_threat_control",60,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                static constexpr std::array names={"growl_turned","growl_held","growl_stays","growl_released","roar_turned","roar_held",
+                    "roar_returned","cower_to_follower","cower_alone_unchanged","cat_frees","bear_frees","leaving_frees"};
+                auto next=[&](int stage) { g_ctx["stage"]=stage; g_ctx["at"]=t; };
+                auto finish=[&](const char* error=nullptr) {
+                    Carriers::ClearNativeForTesting(player); Carriers::Unroot(player);
+                    const auto checks=g_ctx.value("checks",json::object());
+                    bool pass=error==nullptr;
+                    for (const auto* name : names) pass=pass && checks.value(name,false);
+                    r={{"pass",pass},{"checks",checks},{"evidence",g_ctx.value("evidence",json::object())},{"native",Cast::TalentDiagnostics()}};
+                    if (error) r["error"]=error;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); const auto p=player->GetPosition(); g_ctx["saved"]["position"]={p.x,p.y,p.z};
+                    Cast::FormForTesting(0,{}); g_ctx["checks"]=json::object(); g_ctx["evidence"]=json::object(); g_ctx["replies"]=json::object(); next(0);
+                    auto caster=Character::Caster(); caster["level"]=60; caster["talents"]=json::object(); caster["auras"]=json::array();
+                    caster["prowling"]=false; caster["in_combat"]=false; caster["power"]={{"rage",100},{"energy",100}}; caster.erase("next_swing");
+                    const json unit={{"kind","unit"},{"level",1},{"alive",true},{"reaction","hostile"},{"distance_yd",2},{"los",true},
+                        {"in_front",true},{"behind",true},{"facing",true}}, self={{"kind","self"}};
+                    const auto ask=[&](int spell,const char* form,const json& target,int seed,const std::string& key) {
+                        auto c=caster; c["form"]=form;
+                        Service::Request({{"op","resolve"},{"spell",spell},{"caster",c},{"target",target},{"seed",seed}},
+                            [index=g_index,key](const json& out) { if (index==g_index) g_ctx["replies"][key]=out; });
+                    };
+                    for (int seed=1;seed<=3;++seed) { ask(6795,"bear",unit,seed,std::format("growl{}",seed)); ask(9892,"cat",unit,seed,std::format("cower{}",seed)); }
+                    ask(5209,"bear",self,1,"roar"); ask(768,"none",self,1,"cat"); ask(5487,"cat",self,1,"bear");
+                    for (const auto& [key,forward,right] : {std::tuple{"enemy",3.f,0.f},std::tuple{"roar_second",4.f,2.f},std::tuple{"roar_outside",16.f,0.f}}) {
+                        auto* wolf=SpawnWolf(forward*Avatar::kUnitsPerYard,right*Avatar::kUnitsPerYard); if (!wolf) return finish("missing threat fixture wolf");
+                        g_ctx[key]=wolf->GetFormID();
+                    }
+                    auto* follower=SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0xA91A0),3*Avatar::kUnitsPerYard,-3*Avatar::kUnitsPerYard);
+                    if (!follower) return finish("missing threat fixture follower");
+                    follower->EnableAI(false); Console::Execute("setplayerteammate 1",follower); g_ctx["follower"]=follower->GetFormID();
+                    for (const char* key : {"enemy","roar_second","roar_outside","follower"}) {
+                        auto* av=RE::TESForm::LookupByID<RE::Actor>(g_ctx[key].get<RE::FormID>())->AsActorValueOwner();
+                        av->SetBaseActorValue(RE::ActorValue::kHealth,10000); av->SetBaseActorValue(RE::ActorValue::kHealRate,0);
+                        av->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    }
+                    return false;
+                }
+                std::array<RE::Actor*,4> actors{};
+                for (std::size_t i=0;const char* key : {"enemy","roar_second","roar_outside","follower"}) {
+                    actors[i]=RE::TESForm::LookupByID<RE::Actor>(g_ctx[key].get<RE::FormID>());
+                    if (!actors[i] || actors[i]->IsDisabled()) return finish("threat fixture disappeared");
+                    ++i;
+                }
+                auto* enemy=actors[0]; auto* second=actors[1]; auto* outside=actors[2]; auto* follower=actors[3];
+                const auto who=[&](RE::Actor* a) {
+                    auto* combat=a->GetActorRuntimeData().combatController; auto* v=combat ? combat->targetHandle.get().get() : nullptr;
+                    return std::string(v==player ? "player" : v==follower ? "follower" : v ? "other" : "none");
+                };
+                const auto turn=[](RE::Actor* a,RE::Actor* on) { a->StopCombat(); a->StartCombat(on); };
+                const auto taunted=[](std::uint32_t spell,RE::Actor* a) {
+                    return std::ranges::any_of(Cast::TalentDiagnostics()["auras"],[&](const json& x) {
+                        return x.value("spell",0u)==spell && x.value("target",RE::FormID{})==a->GetFormID() && x.value("taunt",false); });
+                };
+                const auto has=[](const json& effects,const char* name) {
+                    return std::ranges::any_of(effects,[&](const json& e) { return e.value("spell",std::string())==name; });
+                };
+                const auto hinder=[&] {   // a native slow and WoWBridge's root carrier, as a frost spell and Roots would leave them
+                    Carriers::NativeForTesting(player,"WB test snare",RE::ActorValue::kSpeedMult,-50.f,30.f); Carriers::Root(player,10.f);
+                };
+                const auto freed=[&](const char* check,const char* form) {   // the slow and root gone, nothing else
+                    const auto effects=Carriers::EffectsForTesting(player); g_ctx["evidence"][check]={{"form",Forms::Current()},{"effects",effects}};
+                    g_ctx["checks"][check]=Forms::Current()==form && !has(effects,"WB test snare") && !has(effects,"WoWBridge root") &&
+                        has(effects,"WB test haste") && has(effects,"WB test burden");
+                };
+                const auto hindered=[&] { const auto effects=Carriers::EffectsForTesting(player); return has(effects,"WB test snare") && has(effects,"WoWBridge root"); };
+                const int stage=g_ctx["stage"]; const double elapsed=t-g_ctx["at"].get<double>();
+                ProbeWait("wow_threat_control",t,{{"gate",std::format("stage {}",stage)},{"enemy",who(enemy)},{"second",who(second)},{"follower",who(follower)}});
+                auto& evidence=g_ctx["evidence"]; auto& checks=g_ctx["checks"];
+                if (stage==0) {
+                    if (elapsed<1 || std::ranges::any_of(actors,[](const auto* a) { return !a->Is3DLoaded(); })) return false;
+                    for (const char* key : {"growl1","growl2","growl3","cower1","cower2","cower3","roar","cat","bear"}) if (!g_ctx["replies"].contains(key)) return false;
+                    for (const auto& [prefix,type] : {std::pair{"growl","taunt"},std::pair{"cower","threat"}})
+                        for (int seed=1;seed<=3 && !g_ctx.contains(prefix);++seed) {
+                            const auto& out=g_ctx["replies"][std::format("{}{}",prefix,seed)];
+                            if (out.value("ok",false) && !out.value("events",json::array()).empty() && out["events"][0].value("type","")==type) g_ctx[prefix]=out;
+                        }
+                    const auto& replies=g_ctx["replies"];
+                    const auto roar=replies["roar"].value("auras",json::array());
+                    if (!g_ctx.contains("growl") || !g_ctx.contains("cower") || !replies["roar"].value("ok",false) || roar.size()!=1 || roar[0].value("type","")!="taunt" ||
+                        !replies["cat"].value("ok",false) || !replies["bear"].value("ok",false)) return finish("real service threat/form outcomes unavailable");
+                    turn(enemy,follower); turn(follower,enemy); next(1); return false;
+                }
+                if (stage==1) {   // Growl on a wolf fighting their follower
+                    if (elapsed<.3) return false;
+                    evidence["growl_before"]=who(enemy);
+                    if (who(enemy)!="follower") return finish("fixture wolf did not target the follower");
+                    Cast::ApplyForTesting(6795,g_ctx["growl"],enemy); next(2); return false;
+                }
+                if (stage==2) {
+                    if (elapsed<.4) return false;
+                    checks["growl_turned"]=who(enemy)=="player" && taunted(6795,enemy); evidence["growl_turned"]=who(enemy);
+                    turn(enemy,follower); next(3); return false;
+                }
+                if (stage==3) {
+                    if (elapsed<.7) return false;
+                    checks["growl_held"]=who(enemy)=="player"; evidence["growl_held"]=who(enemy); next(4); return false;
+                }
+                if (stage==4) {   // 3 s: the aura fades; their matched threat keeps it on the player
+                    if (elapsed>5) return finish("Growl's taunt did not fade");
+                    if (taunted(6795,enemy)) return false;
+                    if (!g_ctx.contains("faded")) g_ctx["faded"]=t;
+                    if (t-g_ctx["faded"].get<double>()<.3) return false;
+                    checks["growl_stays"]=who(enemy)=="player"; evidence["growl_stays"]=who(enemy);
+                    turn(enemy,follower); next(5); return false;
+                }
+                if (stage==5) {
+                    if (elapsed<.6) return false;
+                    checks["growl_released"]=who(enemy)=="follower"; evidence["growl_released"]=who(enemy);
+                    turn(second,follower); turn(outside,follower); g_ctx.erase("faded"); next(6); return false;
+                }
+                if (stage==6) {   // Challenging Roar: the wolves within 10 yards, not the one at 16
+                    if (elapsed<.3) return false;
+                    evidence["roar_before"]={who(enemy),who(second),who(outside)};
+                    Cast::ApplyForTesting(5209,g_ctx["replies"]["roar"]); next(7); return false;
+                }
+                if (stage==7) {
+                    if (elapsed<.4) return false;
+                    checks["roar_turned"]=who(enemy)=="player" && who(second)=="player" && taunted(5209,enemy) && taunted(5209,second) &&
+                        !taunted(5209,outside) && who(outside)=="follower";
+                    evidence["roar_turned"]={who(enemy),who(second),who(outside)};
+                    turn(enemy,follower); next(8); return false;
+                }
+                if (stage==8) {
+                    if (elapsed<.7) return false;
+                    checks["roar_held"]=who(enemy)=="player" && who(second)=="player"; evidence["roar_held"]={who(enemy),who(second)}; next(9); return false;
+                }
+                if (stage==9) {   // 6 s: released, each returns to whom it attacked
+                    if (elapsed>7) return finish("Challenging Roar's taunt did not fade");
+                    if (taunted(5209,enemy) || taunted(5209,second)) return false;
+                    if (!g_ctx.contains("faded")) g_ctx["faded"]=t;
+                    if (t-g_ctx["faded"].get<double>()<.4) return false;
+                    checks["roar_returned"]=who(enemy)=="follower" && who(second)=="follower"; evidence["roar_returned"]={who(enemy),who(second)};
+                    outside->StopCombat(); turn(second,follower); turn(enemy,player); turn(follower,enemy); next(10); return false;   // the second wolf keeps the follower fighting
+                }
+                if (stage==10) {   // Cower on a wolf attacking the player while their follower fights
+                    if (elapsed<.3) return false;
+                    evidence["cower_before"]={{"enemy",who(enemy)},{"follower",who(follower)},{"follower_in_combat",follower->IsInCombat()}};
+                    Cast::ApplyForTesting(9892,g_ctx["cower"],enemy); next(11); return false;
+                }
+                if (stage==11) {
+                    if (elapsed<.4) return false;
+                    checks["cower_to_follower"]=who(enemy)=="follower"; evidence["cower_to_follower"]=who(enemy);
+                    follower->StopCombat(); second->StopCombat(); turn(enemy,player); next(12); return false;
+                }
+                if (stage==12) {   // and with no follower fighting: nothing visible changes
+                    if (elapsed<.3) return false;
+                    evidence["cower_alone_before"]={{"enemy",who(enemy)},{"follower",who(follower)},{"follower_in_combat",follower->IsInCombat()}};
+                    Cast::ApplyForTesting(9892,g_ctx["cower"],enemy); next(13); return false;
+                }
+                if (stage==13) {
+                    if (elapsed<.4) return false;
+                    checks["cower_alone_unchanged"]=who(enemy)=="player"; evidence["cower_alone_unchanged"]=who(enemy);
+                    for (auto* a : actors) a->StopCombat();
+                    Cast::FormForTesting(0,{}); hinder();
+                    Carriers::NativeForTesting(player,"WB test haste",RE::ActorValue::kSpeedMult,20.f,30.f);   // stays: it is no snare
+                    Carriers::NativeForTesting(player,"WB test burden",RE::ActorValue::kCarryWeight,-10.f,30.f);   // stays: another debuff
+                    next(14); return false;
+                }
+                if (stage==14 || stage==16 || stage==18) {
+                    if (elapsed<.4) return false;
+                    const auto effects=Carriers::EffectsForTesting(player);
+                    if (!hindered() || !has(effects,"WB test haste") || !has(effects,"WB test burden")) {
+                        evidence["hindered"]=effects; return finish("native test effects did not apply");
+                    }
+                    if (stage==14) Cast::ApplyForTesting(768,g_ctx["replies"]["cat"]);
+                    else if (stage==16) Cast::ApplyForTesting(5487,g_ctx["replies"]["bear"]);   // cat to bear
+                    else Cast::EndAura(5487);   // leaving: the form's aura removed
+                    next(stage+1); return false;
+                }
+                if (elapsed<.5) return false;
+                freed(stage==15 ? "cat_frees" : stage==17 ? "bear_frees" : "leaving_frees", stage==15 ? "cat" : stage==17 ? "bear" : "none");
+                if (stage==19) return finish();
+                hinder(); next(stage+1); return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_melee_release,")!=std::string::npos)
+            g_steps.push_back({"wow_melee_release",90,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                const std::array<const char*,8> names={"valid_maul","target_moved_away","target_moved_behind","target_unavailable","rage_drained","target_died",
+                    "live_maul_from_behind","live_zero_rage_fallback"};
+                auto finish=[&](const char* error=nullptr) {
+                    Melee::Reset(); r={{"cases",g_ctx.value("cases",json::object())},{"quote",g_ctx.value("maul",json())},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& row : r["cases"]) if (!row.value("pass",false)) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); const auto p=player->GetPosition(); g_ctx["saved"]["position"]={p.x,p.y,p.z};
+                    g_ctx["cases"]=json::object(); g_ctx["case"]=0; g_ctx["stage"]=0;
+                    auto caster=Character::Caster(); caster["level"]=60; caster["talents"]=json::object(); caster["auras"]=json::array();
+                    caster["form"]="none"; caster["power"]={{"rage",100},{"energy",100}};
+                    const auto ask=[&](json req,const char* key) {
+                        Service::Request(std::move(req),[index=g_index,key=std::string(key)](const json& out) { if (index==g_index) g_ctx[key]=out; });
+                    };
+                    ask({{"op","resolve"},{"spell",5487},{"caster",caster},{"target",{{"kind","self"}}},{"seed",1}},"bear");
+                    caster["form"]="bear"; caster["next_swing"]=9881;
+                    ask({{"op","melee"},{"caster",caster},{"target",{{"level",6},{"distance_yd",3},{"alive",true},
+                        {"reaction","hostile"},{"attackable",true},{"facing",true},{"in_front",true},{"combat_reach_yd",1.5}}},{"seed",1}},"maul");
+                    return false;
+                }
+                if (!g_ctx.contains("bear") || !g_ctx.contains("maul")) return false;
+                if (!g_ctx["bear"].value("ok",false) || !g_ctx["maul"].value("ok",false) || g_ctx["maul"].value("damage",0)<=0 || g_ctx["maul"].value("spell",0)!=9881 || g_ctx["maul"].value("cost",0.f)<=0)
+                    return finish("real service melee fixture unavailable");
+                const int index=g_ctx["case"],stage=g_ctx["stage"];
+                if (index==static_cast<int>(names.size())) return finish();
+                if (stage==0) {
+                    Melee::Reset(); Cast::ResetForTesting(); const auto& pos=g_ctx["saved"]["position"];
+                    player->SetPosition({pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},true);
+                    auto* wolf=SpawnWolf(3*Avatar::kUnitsPerYard,0);
+                    if (!wolf) return finish("missing melee fixture wolf");
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth,10000);
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate,0);
+                    wolf->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    g_ctx["enemy"]=wolf->GetFormID(); Cast::BeginForTesting(5487,g_ctx["bear"]);
+                    g_ctx["since"]=t; g_ctx["stage"]=1; return false;
+                }
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                if (!wolf) return finish("melee fixture disappeared");
+                if (stage==1) {
+                    if (!wolf->Is3DLoaded() || t-g_ctx["since"].get<double>()<1) return false;
+                    const float heading=player->GetHeading(false),distance=(index==1 ? 10.f : index==2 ? -3.f : 3.f)*Avatar::kUnitsPerYard;
+                    wolf->SetPosition(player->GetPosition()+RE::NiPoint3{std::sin(heading)*distance,std::cos(heading)*distance,0},true);
+                    wolf->Update3DPosition(true);
+                    if (index>=6) { auto angle=wolf->GetAngle(); angle.z=heading; wolf->SetAngle(angle); }
+                    if (index==5) { wolf->EnableAI(true); wolf->KillImmediate(); }
+                    g_ctx["since"]=t; g_ctx["stage"]=2; return false;
+                }
+                if (stage==2) {
+                    if (t-g_ctx["since"].get<double>()<.35) return false;
+                    if (index==5 && !wolf->IsDead()) {
+                        if (t-g_ctx["since"].get<double>()<3) return false;
+                        return finish("native corpse did not settle");
+                    }
+                    wolf->EnableAI(false);
+                    const float cost=g_ctx["maul"].value("cost",0.f),budget=(index==4 || index==7) ? 0 : index==6 ? 100 : cost;
+                    Forms::Apply({{"events",{{{"type","next_swing"},{"spell",9881}},{{"type","power"},{"power","rage"},{"amount",-100}},
+                        {{"type","power"},{"power","rage"},{"amount",budget}}}}},nullptr);
+                    g_ctx["power_before"]=Forms::Power(); g_ctx["hp_before"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    ObserveCast();
+                    if (index>=6) {
+                        // Real Start -> Tick -> service -> completion, with the wolf looking away.
+                        Bridge::SetTarget(wolf); Melee::Start(wolf);
+                        g_ctx["since"]=t; g_ctx["stage"]=5; return false;
+                    }
+                    Melee::CompletionForTesting(index==3 ? nullptr : wolf)(g_ctx["maul"]);
+                    g_ctx["power_at_reply"]=Forms::Power(); g_ctx["queued_at_reply"]=Forms::SnapshotForTesting()["next_swing"];
+                    g_ctx["since"]=t; g_ctx["stage"]=3; return false;
+                }
+                if (stage==5) {
+                    const bool queued=Forms::SnapshotForTesting()["next_swing"]==9881;
+                    if (queued && t-g_ctx["since"].get<double>()<5) return false;
+                    // Evidence for a swing whose reply never landed (live_maul_from_behind: rage unspent, October 16).
+                    g_ctx["live_swing"]={{"waited",t-g_ctx["since"].get<double>()},{"still_queued",queued},{"attacking",Melee::Attacking()},
+                        {"cast",Cast::TalentDiagnostics().value("defense_busy",false)},{"error",WowUi::Eval("WBTestLastError")},
+                        {"service_connected",Service::Connected()}};
+                    Melee::Stop(); g_ctx["power_at_reply"]=Forms::Power();
+                    g_ctx["queued_at_reply"]=Forms::SnapshotForTesting()["next_swing"];
+                    g_ctx["since"]=t; g_ctx["stage"]=3; return false;
+                }
+                if (stage==3) {
+                    if (t-g_ctx["since"].get<double>()<.3) return false;
+                    const float damage=g_ctx["hp_before"].get<float>()-wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    const bool retained=g_ctx["queued_at_reply"]==9881;
+                    const bool pass=index>=6 ? !retained && (index==7 || g_ctx["power_at_reply"].get<float>()<g_ctx["power_before"].get<float>()) :
+                        index==0 ? damage>0 && g_ctx["power_at_reply"]==0 && !retained :
+                        std::abs(damage)<.01f && g_ctx["power_at_reply"]==g_ctx["power_before"] && retained;
+                    g_ctx["cases"][names[index]]={{"pass",pass},{"damage",damage},{"power_before",g_ctx["power_before"]},
+                        {"power_at_reply",g_ctx["power_at_reply"]},{"queue_retained",retained},{"dead",wolf->IsDead()},
+                        {"error",WowUi::Eval("WBTestLastError")},{"live_swing",g_ctx.value("live_swing",json())}};
+                    g_ctx.erase("live_swing");
+                    if (index==6) g_ctx["snap"]=Snap("wow_maul_from_behind");
+                    g_ctx["results"][names[index]]=pass; g_ctx["stage"]=4; return false;
+                }
+                if (t-g_ctx["since"].get<double>()<2) return false; // drain the swing's owned audiovisual callbacks
+                wolf->StopCombat(); wolf->Disable(); Melee::Reset(); g_ctx["case"]=index+1; g_ctx["stage"]=0; return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_feral_release,")!=std::string::npos)
+            g_steps.push_back({"wow_feral_release",80,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                const std::array<const char*,7> names={"charge_empty_rage","charge_exact_rage","claw_empty_energy","claw_exact_energy",
+                    "charge_wrong_form","bite_missing_extra_energy","bite_full_energy"};
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"cases",g_ctx.value("cases",json::object())},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& row : r["cases"]) if (!row.value("pass",false)) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); const auto p=player->GetPosition(); g_ctx["saved"]["position"]={p.x,p.y,p.z};
+                    auto* wolf=SpawnWolf(12*Avatar::kUnitsPerYard,0);
+                    if (!wolf) return finish("missing feral release wolf");
+                    auto axis=wolf->GetPosition()-p; axis.z=0; axis.Unitize(); g_ctx["axis"]={axis.x,axis.y};
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth,10000);
+                    wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate,0);
+                    wolf->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000);
+                    g_ctx["enemy"]=wolf->GetFormID(); g_ctx["cases"]=json::object(); g_ctx["case"]=0; g_ctx["stage"]=0;
+                    auto caster=Character::Caster(); caster["level"]=60; caster["talents"]={{"796",5},{"795",5},{"804",1}};
+                    caster["auras"]=json::array(); caster["form"]="none"; caster["power"]={{"rage",100},{"energy",100}};
+                    const auto ask=[&](json req,const char* key) {
+                        Service::Request(std::move(req),[index=g_index,key=std::string(key)](const json& out) { if (index==g_index) g_ctx[key]=out; });
+                    };
+                    for (const auto& [id,key] : {std::pair{5487,"bear"},std::pair{768,"cat"}})
+                        ask({{"op","resolve"},{"spell",id},{"caster",caster},{"target",{{"kind","self"}}},{"seed",1}},key);
+                    for (const auto& [id,key] : {std::pair{16979,"charge"},std::pair{9850,"claw"},std::pair{31018,"bite"}}) {
+                        caster["form"]=id==16979 ? "bear" : "cat"; caster["combo_points"]=id==31018 ? 5 : 0;
+                        ask({{"op","resolve"},{"spell",id},{"caster",caster},
+                            {"target",{{"kind","unit"},{"level",wolf->GetLevel()},{"distance_yd",id==16979 ? 12 : 2},
+                                {"alive",true},{"reaction","hostile"},{"los",true},{"in_front",true},{"behind",true}}},{"seed",1}},key);
+                    }
+                    return false;
+                }
+                for (const char* key : {"bear","cat","charge","claw","bite"}) {
+                    if (!g_ctx.contains(key)) return false;
+                    if (!g_ctx[key].value("ok",false)) return finish("service fixture resolution failed");
+                }
+                const int index=g_ctx["case"],stage=g_ctx["stage"];
+                if (index==static_cast<int>(names.size())) return finish();
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                if (!wolf || !wolf->Is3DLoaded()) return false;
+                const char* key=index==2 || index==3 ? "claw" : index>=5 ? "bite" : "charge";
+                const bool cat=index==2 || index==3 || index>=5;
+                const auto& out=g_ctx[key]; const auto spell=out.value("spell",0u);
+                const bool accepted=index==1 || index==3 || index==6;
+                if (stage==0) {
+                    Cast::ResetForTesting(); const auto& pos=g_ctx["saved"]["position"];
+                    player->SetPosition({pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},true);
+                    Cast::BeginForTesting(cat ? 768 : 5487,g_ctx[cat ? "cat" : "bear"]);
+                    g_ctx["since"]=t; g_ctx["stage"]=1; return false;
+                }
+                if (stage==1) {
+                    if (t-g_ctx["since"].get<double>()<1) return false;
+                    const float distance=(cat ? 2.f : 10.f)*Avatar::kUnitsPerYard;
+                    wolf->SetPosition(player->GetPosition()+RE::NiPoint3{g_ctx["axis"][0].get<float>()*distance,g_ctx["axis"][1].get<float>()*distance,0},true);
+                    wolf->Update3DPosition(true);
+                    if (index==4) Forms::Leave();
+                    g_ctx["since"]=t; g_ctx["stage"]=2; return false;
+                }
+                if (stage==2) {
+                    if (t-g_ctx["since"].get<double>()<.35) return false;
+                    bool los=true;
+                    if (!player->HasLineOfSight(wolf,los)) {
+                        if (t-g_ctx["since"].get<double>()<1.5) return false;
+                        return finish("fixture target not in line of sight after settling");
+                    }
+                    const float cost=out.value("cost",0.f),extra=out.value("extra_power_cost",0.f);
+                    if (index==5 && extra<=5) return finish("bite extra-energy fixture unavailable");
+                    const float budget=accepted ? cost+extra : index==5 ? cost+5 : index==4 ? 100 : 0;
+                    const std::string power=cat ? "energy" : "rage";
+                    Forms::Apply({{"events",{{{"type","power"},{"power",power},{"amount",-100}},
+                        {{"type","power"},{"power",power},{"amount",budget}}}}},nullptr);
+                    if (index>=5) Forms::Apply({{"combo_points",5}},wolf);
+                    const auto p=player->GetPosition(); g_ctx["from"]={p.x,p.y,p.z};
+                    g_ctx["power_before"]=Forms::Power(); g_ctx["combo_before"]=Forms::ComboPoints(wolf);
+                    g_ctx["hp_before"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    ObserveCast(); Cast::BeginForTesting(spell,out,wolf);
+                    g_ctx["power_at_release"]=Forms::Power(); g_ctx["since"]=t; g_ctx["stage"]=3; return false;
+                }
+                if (t-g_ctx["since"].get<double>()<.3) return false;
+                const auto diagnostic=Cast::TalentDiagnostics(); bool aura=false;
+                for (const auto& row : diagnostic["auras"]) if (row["spell"]==spell && row["target"]==wolf->GetFormID()) aura=true;
+                const RE::NiPoint3 from{g_ctx["from"][0].get<float>(),g_ctx["from"][1].get<float>(),g_ctx["from"][2].get<float>()};
+                const float moved=player->GetPosition().GetDistance(from);
+                const float damage=g_ctx["hp_before"].get<float>()-wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                const bool error=WowUi::Eval(cat ? "WBTestLastError==ERR_OUT_OF_ENERGY and 1 or 0" : "WBTestLastError==ERR_OUT_OF_RAGE and 1 or 0")=="1";
+                const bool paid=diagnostic.value("paid_spell",0u)==spell;
+                const bool pass=accepted ? paid && g_ctx["power_at_release"]==0 && (cat ? damage>0 : aura && moved>Avatar::kUnitsPerYard) :
+                    !paid && error && g_ctx["power_at_release"]==g_ctx["power_before"] && !aura && std::abs(damage)<.01f && moved<.5f &&
+                    Forms::ComboPoints(wolf)==g_ctx["combo_before"].get<int>() && Cast::ItemReady(spell);
+                g_ctx["cases"][names[index]]={{"pass",pass},{"power_before",g_ctx["power_before"]},{"power_at_release",g_ctx["power_at_release"]},
+                    {"combo_before",g_ctx["combo_before"]},{"combo_after",Forms::ComboPoints(wolf)},{"damage",damage},{"moved",moved},
+                    {"cost",out.value("cost",0.f)},{"extra_cost",out.value("extra_power_cost",0.f)},{"paid",paid},{"aura",aura},
+                    {"error",WowUi::Eval("WBTestLastError")},{"cooldown_ready",Cast::ItemReady(spell)}};
+                g_ctx["results"][names[index]]=pass; g_ctx["case"]=index+1; g_ctx["stage"]=0; return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_charge_release,")!=std::string::npos)
+            g_steps.push_back({"wow_charge_release",60,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"cases",g_ctx.value("cases",json::object())},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& row : r["cases"]) if (!row.value("pass",false)) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe();
+                    const auto p=player->GetPosition(); g_ctx["saved"]["position"]={p.x,p.y,p.z};
+                    auto* wolf=SpawnWolf(10*Avatar::kUnitsPerYard,0);
+                    if (!wolf) return finish("missing charge fixture wolf");
+                    auto axis=wolf->GetPosition()-p; axis.z=0; axis.Unitize(); g_ctx["axis"]={axis.x,axis.y};
+                    g_ctx["enemy"]=wolf->GetFormID(); g_ctx["cases"]=json::object(); g_ctx["case"]=0; g_ctx["stage"]=0;
+                    g_ctx["minimum"]=std::strtod(WowUi::Eval("__WB.spellInfo(16979).rangeMin").c_str(),nullptr);
+                    g_ctx["maximum"]=std::strtod(WowUi::Eval("__WB.spellInfo(16979).rangeMax").c_str(),nullptr);
+                    if (g_ctx["minimum"].get<double>()<=2 || g_ctx["maximum"].get<double>()<=g_ctx["minimum"].get<double>()+2)
+                        return finish("charge ranges unavailable");
+                    auto caster=Character::Caster(); caster["level"]=60; caster["talents"]={{"796",5},{"795",5},{"804",1}};
+                    caster["auras"]=json::array(); caster["form"]="none"; caster["power"]={{"rage",100},{"energy",100}};
+                    const auto ask=[&](json req,const char* key) {
+                        Service::Request(std::move(req),[index=g_index,key=std::string(key)](const json& out) { if (index==g_index) g_ctx[key]=out; });
+                    };
+                    ask({{"op","resolve"},{"spell",5487},{"caster",caster},{"target",{{"kind","self"}}},{"seed",1}},"bear");
+                    caster["form"]="bear";
+                    ask({{"op","resolve"},{"spell",16979},{"caster",caster},
+                        {"target",{{"kind","unit"},{"level",wolf->GetLevel()},{"distance_yd",10},{"alive",true},{"reaction","hostile"},{"los",true},{"in_front",true}}},{"seed",1}},"charge");
+                    return false;
+                }
+                if (!g_ctx.contains("bear") || !g_ctx.contains("charge")) return false;
+                if (!g_ctx["bear"].value("ok",false) || !g_ctx["charge"].value("ok",false)) return finish("service fixture resolution failed");
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["enemy"].get<RE::FormID>());
+                if (!wolf || !wolf->Is3DLoaded()) return false;
+                const int index=g_ctx["case"],stage=g_ctx["stage"];
+                if (index==3) {
+                    if (g_ctx.contains("shot") && !Settled(g_ctx["shot"],.2)) return false;
+                    return finish();
+                }
+                if (stage==0) {
+                    Cast::ResetForTesting(); Cast::BeginForTesting(5487,g_ctx["bear"]);
+                    g_ctx["since"]=t; g_ctx["stage"]=1; return false;
+                }
+                if (stage==1) {
+                    if (t-g_ctx["since"].get<double>()<1) return false;
+                    const double lo=g_ctx["minimum"],hi=g_ctx["maximum"];
+                    const float yards=static_cast<float>(index==0 ? lo-2 : index==1 ? hi+2 : lo+2);
+                    wolf->SetPosition(player->GetPosition()+RE::NiPoint3{g_ctx["axis"][0].get<float>()*yards*Avatar::kUnitsPerYard,
+                        g_ctx["axis"][1].get<float>()*yards*Avatar::kUnitsPerYard,0},true);
+                    wolf->Update3DPosition(true);
+                    g_ctx["since"]=t; g_ctx["stage"]=2; return false;
+                }
+                if (stage==2) {
+                    if (t-g_ctx["since"].get<double>()<.35) return false;
+                    bool los=true;
+                    if (index==2 && !player->HasLineOfSight(wolf,los)) {
+                        if (t-g_ctx["since"].get<double>()<1.5) return false;
+                        return finish("fixture target not in line of sight after settling");
+                    }
+                    Forms::Apply({{"events",{{{"type","power"},{"power","rage"},{"amount",100}}}}},nullptr);
+                    const auto p=player->GetPosition(); g_ctx["from"]={p.x,p.y,p.z};
+                    g_ctx["distance_before"]=p.GetDistance(wolf->GetPosition())/Avatar::kUnitsPerYard;
+                    ObserveCast();
+                    // The real service answer was valid at ten yards. Exercise the
+                    // production instant-completion path with the target now moved.
+                    Cast::BeginForTesting(16979,g_ctx["charge"],wolf);
+                    g_ctx["power_at_release"]=Forms::Power();
+                    g_ctx["since"]=t; g_ctx["stage"]=3; return false;
+                }
+                if (t-g_ctx["since"].get<double>()<.3) return false;
+                const auto diagnostic=Cast::TalentDiagnostics(); const auto landing=diagnostic.value("charge",json::object());
+                bool root=false,lockout=false; double remaining=0;
+                for (const auto& aura : diagnostic["auras"]) if (aura["spell"]==16979 && aura["target"]==wolf->GetFormID()) {
+                    root=aura.value("root",false); lockout=aura.value("lockout",false); remaining=aura.value("control_remaining",0.0);
+                }
+                const RE::NiPoint3 from{g_ctx["from"][0].get<float>(),g_ctx["from"][1].get<float>(),g_ctx["from"][2].get<float>()};
+                const float distance=player->GetPosition().GetDistance(wolf->GetPosition())/Avatar::kUnitsPerYard;
+                const bool rejected=WowUi::Eval("WBTestLastError==SPELL_FAILED_OUT_OF_RANGE and 1 or 0")=="1";
+                bool pass=index<2 ? rejected && g_ctx["power_at_release"].get<int>()==100 && Cast::ItemReady(16979) && !root && !lockout &&
+                    diagnostic.value("paid_spell",0)!=16979 && player->GetPosition().GetDistance(from)<.5f :
+                    Evidence::ChargeObserved(root,lockout,remaining,wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult),
+                        landing.value("moved",0.f),landing.value("landing_yards",100.f),distance,
+                        diagnostic.value("paid_spell",0),diagnostic.value("paid_cost",-1.f),g_ctx["power_at_release"].get<int>());
+                const std::array<const char*,3> names={"moved_too_close","moved_too_far","still_in_range"};
+                g_ctx["cases"][names[index]]={{"pass",pass},{"distance_before",g_ctx["distance_before"]},{"distance_after",distance},
+                    {"error",WowUi::Eval("WBTestLastError")},{"power",Forms::Power()},{"power_at_release",g_ctx["power_at_release"]},{"paid_spell",diagnostic.value("paid_spell",0)},
+                    {"cooldown_ready",Cast::ItemReady(16979)},{"root",root},{"lockout",lockout},{"landing",landing}};
+                if (index==2) g_ctx["shot"]=Snap("wow_charge_release");
+                g_ctx["results"][names[index]]=pass; g_ctx["case"]=index+1; g_ctx["stage"]=0;
+                return false;
+            }});
             // Explicit negative-path fixture: the private runner temporarily withholds
             // only WoWBridge's managed compass manifest, restoring it in a finally block.
             if ((","+Config::Get().testOnly+",").find(",wow_compass_fallback,")!=std::string::npos) {
@@ -1939,6 +5590,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                 };
                 auto request=[&] {
                     g_startDialogAnswered=-1; g_startDialogChoice=g_ctx["choice"].get<int>();
+                    g_startDialogClass=11; g_startDialogRace=4;
                     g_allowStartDialog=true; Console::Execute("wb start");
                 };
                 auto finish=[&](bool pass,const char* error) {
@@ -2003,7 +5655,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					const std::string body = male ? R"(Character\NightElf\Male\NightElfMale.m2)" : R"(Character\NightElf\Female\NightElfFemale.m2)";
 					const std::string helm = std::string(R"(Item\ObjectComponents\Head\Helm_Leather_RaidDruid_B_01_Ni)") + (male ? "M.m2" : "F.m2");
 					if (t == 0.0) {
-						Cast::FormForTesting(0, {});   // her form and its auras, as leaving it in play
+						Cast::FormForTesting(0, {});   // their form and its auras, as leaving it in play
 						g_ctx["calls"] = Console::Snapshot().value("calls", 0ULL);
 						g_ctx["frames"] = WowModels::GetStats().frames;
 						g_ctx["preview"] = ItemPreview::GetInfo().generation;
@@ -2242,6 +5894,177 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 		}
 
 
+        void PanelHelperTests()
+        {
+            // Disposable fixtures only; excluded even from an unfiltered ordinary suite.
+            if ((","+Config::Get().testOnly+",").find(",wow_panel_helpers,")==std::string::npos) return;
+            g_steps.push_back({"wow_panel_helpers",100,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton(); auto* av=player->AsActorValueOwner();
+                auto* skills=player->GetInfoRuntimeData().skills;
+                auto* gold=RE::TESForm::LookupByID<RE::TESBoundObject>(0xF);
+                const auto check=[&](const std::string& name,bool pass,json evidence) { g_ctx["checks"][name]={{"pass",pass},{"evidence",std::move(evidence)}}; };
+                const auto next=[&](int stage) { g_ctx["stage"]=stage; g_ctx["at"]=t; };
+                if (!g_ctx.contains("stage")) {
+                    if (!skills || !skills->data || !gold || !WowUi::Ready() || !Progression::Ready()) {
+                        r={{"pass",false},{"error","player skills, gold, UI or class progression unavailable"}}; return true;
+                    }
+                    const auto savedSkills=*skills->data;
+                    const auto nativeSkills=NativeSkillProgress();
+                    const auto savedProgression=Progression::SnapshotForTesting();
+                    const auto level=player->GetLevel(); const auto perks=player->GetGameStatsData().perkCount;
+                    const int money=player->GetGoldAmount();
+                    const auto* sword=RE::TESForm::LookupByID<RE::TESBoundObject>(0x12EB7);
+                    const int swords=sword ? player->GetItemCount(const_cast<RE::TESBoundObject*>(sword)) : 0;
+                    const std::array<RE::ActorValue,4> values{RE::ActorValue::kHealth,RE::ActorValue::kMagicka,RE::ActorValue::kStamina,RE::ActorValue::kCarryWeight};
+                    std::array<float,4> bases{}, permanent{}, damage{};
+                    for (std::size_t i=0;i<values.size();++i) { bases[i]=av->GetBaseActorValue(values[i]); permanent[i]=player->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kPermanent,values[i]); damage[i]=player->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kDamage,values[i]); }
+                    const auto autoLoot=WowUi::Eval("GetCVar('autoLootDefault')");
+                    g_restorePanelHelpers=[savedSkills,nativeSkills,savedProgression,level,perks,money,swords,values,bases,permanent,damage,autoLoot] {
+                        auto* p=RE::PlayerCharacter::GetSingleton(); auto* owner=p->AsActorValueOwner();
+                        { std::lock_guard lock(g_nativeBarterLock); g_nativeBarter.reset(); }
+                        Console::Command("levelup","cancel"); Console::Command("merchant","remove"); Console::Command("lootchest","remove");
+                        Console::Execute(std::format("player.setlevel {}",level));
+                        p->GetGameStatsData().perkCount=perks;
+                        *p->GetInfoRuntimeData().skills->data=savedSkills;
+                        for (std::size_t i=0;i<values.size();++i) {
+                            owner->SetBaseActorValue(values[i],bases[i]);
+                            owner->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kPermanent,values[i],permanent[i]-p->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kPermanent,values[i]));
+                            owner->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage,values[i],damage[i]-p->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kDamage,values[i]));
+                        }
+                        for (int v=static_cast<int>(RE::ActorValue::kOneHanded);v<=static_cast<int>(RE::ActorValue::kEnchanting);++v) owner->SetBaseActorValue(static_cast<RE::ActorValue>(v),g_ctx["skill_bases"][std::to_string(v)].get<float>());
+                        auto* g=RE::TESForm::LookupByID<RE::TESBoundObject>(0xF);
+                        const int delta=money-p->GetGoldAmount();
+                        if (delta>0) p->AddObjectToContainer(g,nullptr,delta,nullptr);
+                        if (delta<0) p->RemoveItem(g,-delta,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+                        auto* item=RE::TESForm::LookupByID<RE::TESBoundObject>(0x12EB7);
+                        if (item && p->GetItemCount(item)>swords) p->RemoveItem(item,p->GetItemCount(item)-swords,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+                        Progression::RestoreForTesting(savedProgression); Bridge::ForgetLevel();
+                        WowUi::Eval("(function() if __wbPanelLevelEvents then __wbPanelLevelEvents:UnregisterAllEvents() end __wbPanelLevelEvents=nil if __wbPanelHost then __WB.host=__wbPanelHost end __wbPanelHost=nil __wbPanelHostWrapper=nil CloseLoot() SetCVar('autoLootDefault',"+LuaQuote(autoLoot)+") if WBTestPanel then WBTestPanel:Hide() end return 1 end)()");
+                        bool pools=true;
+                        for (std::size_t i=0;i<values.size();++i) pools=pools && owner->GetBaseActorValue(values[i])==bases[i] &&
+                            p->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kPermanent,values[i])==permanent[i] && p->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kDamage,values[i])==damage[i];
+                        return json{{"level",p->GetLevel()==level},{"perks",p->GetGameStatsData().perkCount==perks},{"gold",p->GetGoldAmount()==money},
+                            {"pools_and_carry",pools},{"skills",NativeSkillProgress()==nativeSkills},{"progression",Progression::SnapshotForTesting()==savedProgression}};
+                    };
+                    g_ctx["checks"]=json::object(); g_ctx["index"]=0;
+                    for (int v=static_cast<int>(RE::ActorValue::kOneHanded);v<=static_cast<int>(RE::ActorValue::kEnchanting);++v) g_ctx["skill_bases"][std::to_string(v)]=av->GetBaseActorValue(static_cast<RE::ActorValue>(v));
+                    for (auto v : {RE::ActorValue::kDestruction,RE::ActorValue::kRestoration,RE::ActorValue::kAlteration,RE::ActorValue::kOneHanded,RE::ActorValue::kTwoHanded}) {
+                        g_ctx["skill_bases"][std::to_string(static_cast<int>(v))]=av->GetBaseActorValue(v); av->SetBaseActorValue(v,15.f);
+                    }
+                    WowUi::Eval("(function() SetCVar('autoLootDefault',0) __wbPanelLevelCount=0 __wbPanelLights=0 __wbPanelHost=__WB.host __wbPanelHostWrapper=function(...) if arg[1]=='levelUp' then __wbPanelLights=__wbPanelLights+1 end return __wbPanelHost(unpack(arg,1,arg.n)) end __WB.host=__wbPanelHostWrapper __wbPanelLevelEvents=CreateFrame('Frame') __wbPanelLevelEvents:RegisterEvent('PLAYER_LEVEL_UP') __wbPanelLevelEvents:SetScript('OnEvent',function() __wbPanelLevelCount=__wbPanelLevelCount+1 __wbPanelLevelLast={arg1,arg2,arg3,arg7} end) return 1 end)()");
+                    Console::Command("unlearn"); next(0); return false;
+                }
+                const int stage=g_ctx["stage"], index=g_ctx["index"];
+                ProbeWait("wow_panel_helpers",t,{{"stage",stage},{"index",index}});
+                if (stage==0) {
+                    if (Console::Snapshot().value("pending",false) || !Progression::Ready() || t-g_ctx["at"].get<double>()<1) return false;
+                    // The catalog reaches Lua a frame or more after the command: compare once it has.
+                    if (!g_ctx.contains("book_ok")) { g_ctx["book_ok"]=Console::Command("book","druid","0"); g_ctx["book_at"]=t; return false; }
+                    if (t-g_ctx["book_at"].get<double>()<0.5) return false;
+                    const bool ok=g_ctx["book_ok"].get<bool>();
+                    const auto saved=Progression::SnapshotForTesting();
+                    const auto known=saved.at("known_spells").get<std::vector<int>>();
+                    std::string ids="{"; for (int id : known) ids+=std::to_string(id)+","; ids+="}";
+                    const auto list=WowUi::Eval("(function() local known={} for _,id in ipairs("+ids+") do known[id]=true end local n,k,u=0,0,0 for _,c in ipairs(__WB.testPanelCatalog.classes or {}) do if c.key=='druid' then for _,s in ipairs(c.spells) do n=n+1 if s.known then k=k+1 else u=u+1 end if (s.known and true or false)~=(known[s.spell] and true or false) then return 'mismatch:'..s.spell end if __WB.classRows[s.spell] and (not __WB.unlearned[s.spell])~=(known[s.spell] and true or false) then return 'book-mismatch:'..s.spell end end end end if k==0 or u==0 then return 'missing-known-or-unknown:'..n..':'..k..':'..u end return n..':'..k..':'..u end)()");
+                    check("class_known_unknown",ok && list.find("mismatch")==std::string::npos && list.find("missing-")==std::string::npos && !known.empty() && list!="0:0:0",{{"rows_known_unknown",list},{"native_known",known},{"console",Console::Snapshot()}});
+                    const std::array<std::array<const char*,3>,12> invalid{{{"gold","0",""},{"gold","1000001",""},{"levelup","health","0"},
+                        {"levelup","invalid","1"},{"merchant","invalid",""},{"lootchest","invalid",""},{"scenario","invalid",""},
+                        {"book","invalid","0"},{"learnchain","5176","mage"},{"emote","not_an_emote",""},{"showhelm","invalid",""},{"showcloak","invalid",""}}};
+                    for (const auto& args : invalid) {
+                        const bool accepted=Console::Command(args[0],args[1],args[2]);
+                        check(std::string("reject_")+args[0]+"_"+args[1],!accepted && !Console::Snapshot().value("ok",true),Console::Snapshot());
+                    }
+                    const auto beforePrice=Progression::SnapshotForTesting();
+                    const bool price=Console::Command("talents","price"); const auto afterPrice=Progression::SnapshotForTesting();
+                    check("talent_price",price && afterPrice.value("reset_cost",-1)==0 && afterPrice.at("talents")==beforePrice.at("talents") &&
+                        afterPrice.at("known_spells")==beforePrice.at("known_spells"),{{"before",beforePrice},{"after",afterPrice},{"console",Console::Snapshot()}});
+                    next(6); return false;
+                }
+                if (stage==6) {
+                    const std::array<std::pair<const char*,const char*>,3> commands{{{"learnwow","5177"},{"learnchain","5176"},{"learntab","3"}}};
+                    g_ctx["learn_ok"]=Console::Command(commands[index].first,commands[index].second,"druid");
+                    g_ctx["learn_console"]=Console::Snapshot(); next(7); return false;
+                }
+                if (stage==7) {
+                    const auto learned=g_ctx["learn_console"].value("learned",std::vector<int>{});
+                    bool known=g_ctx["learn_ok"]==true && !learned.empty();
+                    std::string ids="{";
+                    for (int id : learned) { known=known && Progression::Knows(id); ids+=std::to_string(id)+","; } ids+="}";
+                    const bool published=WowUi::Eval("(function() for _,id in ipairs("+ids+") do if not __WB.classRows[id] or __WB.unlearned[id] then return 0 end end return 1 end)()")=="1";
+                    if ((!known || !published || !Progression::Ready()) && t-g_ctx["at"].get<double>()<8) return false;
+                    const std::array<const char*,3> names{"learn_rank","learn_chain","learn_tab"};
+                    check(names[index],known && published && Progression::Ready(),{{"native_known",known},{"published",published},{"console",g_ctx["learn_console"]}});
+                    if (index<2) { g_ctx["index"]=index+1; next(6); return false; }
+                    g_ctx["index"]=0; next(1); return false;
+                }
+                if (stage==1) {
+                    constexpr int amounts[]{100,1000,10000};
+                    const int before=player->GetGoldAmount(); const bool ok=Console::Command("gold",std::to_string(amounts[index]));
+                    check("gold_"+std::to_string(amounts[index]),ok && player->GetGoldAmount()==before+amounts[index],Console::Snapshot());
+                    if (index<2) { g_ctx["index"]=index+1; return false; }
+                    g_ctx["index"]=0; next(2); return false;
+                }
+                if (stage==2) {
+                    const std::array<const char*,3> choices{"health","magicka","stamina"};
+                    const auto attr=index==0 ? RE::ActorValue::kHealth : index==1 ? RE::ActorValue::kMagicka : RE::ActorValue::kStamina;
+                    g_ctx["level_before"]=player->GetLevel(); g_ctx["base_before"]=av->GetBaseActorValue(attr);
+                    g_ctx["carry_before"]=av->GetPermanentActorValue(RE::ActorValue::kCarryWeight); g_ctx["perks_before"]=player->GetGameStatsData().perkCount;
+                    g_ctx["events_before"]=WowUi::Eval("__wbPanelLevelCount"); g_ctx["lights_before"]=WowUi::Eval("__wbPanelLights");
+                    g_ctx["visual_before"]=SpellVisuals::Running(); g_ctx["visual_max"]=SpellVisuals::Running(); g_ctx["sound_before"]=WowUi::InterfaceSounds();
+                    g_ctx["level_ok"]=Console::Command("levelup",choices[index],"1"); g_ctx["level_console"]=Console::Snapshot(); next(3); return false;
+                }
+                if (stage==3) {
+                    g_ctx["visual_max"]=std::max(g_ctx["visual_max"].get<std::uint32_t>(),SpellVisuals::Running());
+                    if (Console::Snapshot().value("pending",false) || t-g_ctx["at"].get<double>()<2) return false;
+                    if (!g_ctx.contains("level_settled")) { g_ctx["level_settled"]=t; return false; }
+                    if (t-g_ctx["level_settled"].get<double>()<1) return false;
+                    g_ctx["level_ok"]=Console::Snapshot().value("ok",false); g_ctx["level_console"]=Console::Snapshot();
+                    const std::array<const char*,3> choices{"health","magicka","stamina"};
+                    const auto attr=index==0 ? RE::ActorValue::kHealth : index==1 ? RE::ActorValue::kMagicka : RE::ActorValue::kStamina;
+                    const bool state=player->GetLevel()==g_ctx["level_before"].get<int>()+1 && av->GetBaseActorValue(attr)==g_ctx["base_before"].get<float>()+10 &&
+                        player->GetGameStatsData().perkCount==g_ctx["perks_before"].get<int>()+1 && av->GetPermanentActorValue(RE::ActorValue::kCarryWeight)==g_ctx["carry_before"].get<float>()+(index==2 ? 5 : 0);
+                    const auto events=WowUi::Eval("__wbPanelLevelCount");
+                    const bool event=events!=g_ctx["events_before"].get<std::string>() && WowUi::Eval("UnitLevel('player')")==std::to_string(player->GetLevel());
+                    const bool light=WowUi::Eval("__wbPanelLights")!=g_ctx["lights_before"].get<std::string>();
+                    check(std::string("levelup_")+choices[index],g_ctx["level_ok"]==true && state && event && light && Progression::Ready() && WowUi::InterfaceSounds()>g_ctx["sound_before"].get<std::uint32_t>(),
+                        {{"console",g_ctx["level_console"]},{"native_state",state},{"level_event",event},{"event_count",events},{"light_requested",light},
+                         {"visual_before",g_ctx["visual_before"]},{"visual_peak",g_ctx["visual_max"]},{"sound_count",WowUi::InterfaceSounds()},{"progression_ready",Progression::Ready()}});
+                    if (index<2) { g_ctx["index"]=index+1; g_ctx.erase("level_settled"); next(2); return false; }
+                    { std::lock_guard lock(g_nativeBarterLock); g_nativeBarter=std::make_unique<NativeBarterProbe>(); g_nativeBarter->panelHelpers=true; }
+                    const bool ok=Console::Command("merchant","spawn"); g_ctx["merchant_console"]=Console::Snapshot();
+                    check("merchant_spawn",ok && Console::Snapshot().contains("actor"),Console::Snapshot()); next(4); return false;
+                }
+                if (stage==4) {
+                    json proof;
+                    { std::lock_guard lock(g_nativeBarterLock); if (!g_nativeBarter || !g_nativeBarter->done) { if (t-g_ctx["at"].get<double>()<30) return false; proof={{"pass",false},{"error","barter observer did not complete"}}; } else proof=g_nativeBarter->result; g_nativeBarter.reset(); }
+                    check("native_barter_stock_buy_sell",proof.value("pass",false),proof);
+                    const auto id=g_ctx["merchant_console"].value("actor",RE::FormID{});
+                    g_ctx["merchant_remove"]={{"ok",Console::Command("merchant","remove")},{"actor",id},{"console",Console::Snapshot()}};
+                    const bool opened=Console::Command("lootchest","spawn"); g_ctx["loot_console"]=Console::Snapshot();
+                    check("loot_spawn",opened,Console::Snapshot()); next(5); return false;
+                }
+                if (stage==5) {
+                    if (t-g_ctx["at"].get<double>()<1) return false;
+                    if (g_ctx.contains("merchant_remove")) {   // a disable lands a frame or two after the command
+                        const auto removed=g_ctx["merchant_remove"]; g_ctx.erase("merchant_remove");
+                        auto* actor=RE::TESForm::LookupByID<RE::Actor>(removed["actor"].get<RE::FormID>());
+                        check("merchant_remove",removed["ok"].get<bool>() && (!actor || actor->IsDisabled()),removed);
+                    }
+                    const auto view=WowUi::Eval("(LootFrame:IsVisible() and __WB.lootSession and GetNumLootItems()>0) and 1 or 0");
+                    const auto id=g_ctx["loot_console"].value("chest",RE::FormID{});
+                    auto* chest=RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+                    json inventory=json::array();
+                    if (chest) for (const auto& [form,count] : chest->GetInventoryCounts()) if (form && count>0) inventory.push_back({{"form",form->GetFormID()},{"count",count},{"type",static_cast<int>(form->GetFormType())}});
+                    check("wow_loot_window",view=="1" && inventory.size()>=11,{{"visible_nonempty",view},{"inventory",inventory},{"console",g_ctx["loot_console"]}});
+                    WowUi::Eval("(function() CloseLoot() return 1 end)()");
+                    Console::Command("lootchest","remove");
+                    check("loot_remove",!chest || chest->IsDisabled(),Console::Snapshot());
+                    r["checks"]=g_ctx["checks"]; r["pass"]=std::ranges::all_of(r["checks"],[](const json& c) { return c.value("pass",false); }); return true;
+                }
+                r={{"pass",false},{"error","invalid helper probe stage"},{"checks",g_ctx["checks"]}}; return true;
+            }});
+        }
+
 		void IdolModelTests()
 		{
 			g_steps.push_back({"wow_idol_models",25,[](double t,json& r) {
@@ -2255,9 +6078,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (!idols[0] || !idols[1]) { r={{"pass",false},{"error","idol forms missing"}}; return true; }
 				if (t==0) {
 					const std::array<int,2> before{player->GetItemCount(idols[0]),player->GetItemCount(idols[1])};
-					auto* worn=player->GetWornArmor(slot); RE::ExtraDataList* wornExtra=nullptr;
-					for (const auto& [form,entry] : player->GetInventory()) if (form==worn && entry.second && entry.second->extraLists)
-						for (auto* extra : *entry.second->extraLists) if (extra && extra->HasType<RE::ExtraWorn>()) wornExtra=extra;
+					auto* worn=player->GetWornArmor(slot);
 					std::array<RE::FormID,2> refs{};
 					const auto direction=CameraFwd(); RE::NiPoint3 forward{direction.x,direction.y,0}; forward.Unitize();
 					const RE::NiPoint3 right{forward.y,-forward.x,0};
@@ -2267,14 +6088,21 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 						else if (auto ref=player->PlaceObjectAtMe(idols[i],false)) { ref->SetPosition(at); refs[i]=ref->GetFormID(); }
 					}
 					g_ctx={{"stage",1},{"refs",refs},{"before",before}};
-					g_restoreIdolModels=[player,idols,before,refs,worn,wornExtra,slot] {
+					// The worn relic's extra list is looked up again at restore: the probe's equips can free the one seen
+					// now (a dangling ExtraDataList* crashed EquipObject, October 15).
+					g_restoreIdolModels=[player,idols,before,refs,worn,slot] {
 						auto* manager=RE::ActorEquipManager::GetSingleton();
 						for (std::size_t i=0;i<2;++i) {
 							if (auto* ref=RE::TESForm::LookupByID<RE::TESObjectREFR>(refs[i])) { ref->Disable(); ref->SetDelete(true); }
 							if (player->GetWornArmor(slot)==idols[i]) manager->UnequipObject(player,idols[i],nullptr,1,nullptr,false,true,false,true);
 							const int added=player->GetItemCount(idols[i])-before[i]; if (added>0) player->RemoveItem(idols[i],added,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
 						}
-						if (worn) manager->EquipObject(player,worn,wornExtra,1,nullptr,false,true,false,true);
+						if (worn) {
+							RE::ExtraDataList* extra=nullptr;
+							for (const auto& [form,entry] : player->GetInventory()) if (form==worn && entry.second && entry.second->extraLists)
+								for (auto* list : *entry.second->extraLists) if (list && !extra) extra=list;
+							manager->EquipObject(player,worn,extra,1,nullptr,false,true,false,true);
+						}
 					};
 					return false;
 				}
@@ -2388,6 +6216,22 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 
         void MountTests()
         {
+            // Every epic mount summons with the client's kits: the tack rustle (SoundEntries 1161) while preparing, then
+            // its own family's call (SpellVisual CastKit sounds, build 5875).
+            g_steps.push_back({"wow_mount_sounds",5,[](double,json& r) {
+                const std::map<std::uint32_t,std::uint32_t> calls={{23219,4072},{23220,4072},{23221,4072},{23222,4070},
+                    {23223,4070},{23225,4070},{23227,4066},{23228,4066},{23229,4066},{23238,4068},{23239,4068},{23240,4068},
+                    {23241,4071},{23242,4071},{23243,4071},{23246,4067},{23247,7814},{23248,7814},{23249,7814},{23250,4069},{23251,4069}};
+                json wrong=json::object();
+                for (const auto& [spell,call] : calls) {
+                    const auto kit=WowUi::Sounds(spell);
+                    if (kit.precast!=1161 || kit.cast!=call) wrong[std::to_string(spell)]={kit.precast,kit.cast};
+                }
+                // The epic ground mounts (the flyers and the Paladin's class mounts aside).
+                const auto catalog=WowUi::Eval("(function() local n=0 for _,m in pairs(__WB.mountCatalog or {}) do if not m.flying and not m.class then n=n+1 end end return n end)()");
+                r={{"wrong",wrong},{"catalog",catalog},{"pass",wrong.empty() && catalog==std::to_string(calls.size())}};
+                return true;
+            }});
             g_steps.push_back({"wow_ground_mounts",65,[](double t,json& r) {
                 auto* player=RE::PlayerCharacter::GetSingleton(); auto* av=player->AsActorValueOwner();
                 const auto point=[](const json& p) { return RE::NiPoint3{p[0].get<float>(),p[1].get<float>(),p[2].get<float>()}; };
@@ -2403,8 +6247,12 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     const bool running=RE::PlayerControls::GetSingleton()->data.running;
                     const float heading=player->GetHeading(false);
                     WowUi::Run("__wbMountSavedPreferred=WBPreferredMount");
-                    g_restoreMounts=[player,av,speed,running,heading] {
-                        Mounts::Reset(); WowUi::Run("WBPreferredMount=__wbMountSavedPreferred __wbMountSavedPreferred=nil");
+                    // A fresh game owns no mount (they come from reins): both are theirs for the step, the saved set restored after.
+                    auto learned=Mounts::LearnedKeys(); const auto saved=learned;
+                    for (const char* key : {"swift_frostsaber","swift_palomino"}) if (!Mounts::Learned(key)) learned.emplace_back(key);
+                    Mounts::SetLearned(std::move(learned));
+                    g_restoreMounts=[player,av,speed,running,heading,saved] {
+                        Mounts::Reset(); Mounts::SetLearned(saved); WowUi::Run("WBPreferredMount=__wbMountSavedPreferred __wbMountSavedPreferred=nil");
                         av->SetBaseActorValue(RE::ActorValue::kSpeedMult,speed);
                         RE::PlayerControls::GetSingleton()->data.running=running;
                         player->SetHeading(heading);
@@ -2507,6 +6355,74 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 
         // Bounded feasibility probe only. No flight controls or production state
         // changes are enabled by the existence of this optional self-test.
+        // A flying mount's controller, kinematically: the earlier probes asked Skyrim's character controller for vertical
+        // velocity, which its movement overwrote each frame. Here their position itself is driven each frame (gravity and
+        // fall tracking held off) and the probe measures whether the player follows: climb, hover, descend, then lands.
+        void FlightKinematicTest()
+        {
+            g_steps.push_back({"wow_flight_kinematic",15,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto* controller=player->GetCharController();
+                if (t==0) {
+                    if (!controller || !controller->GetHavokWorld() || !player->GetParentCell() || player->GetParentCell()->IsInteriorCell() ||
+                        Mounts::Pending() || Mounts::Snapshot()["active"].is_object()) {
+                        r={{"pass",false},{"error","grounded outdoor controller unavailable"}}; return true;
+                    }
+                    const auto position=player->GetPosition(); const auto* cell=player->GetParentCell();
+                    const float gravity=controller->gravity, fallTime=controller->fallTime, fallStart=controller->fallStartHeight;
+                    g_restoreFlightController=[player,c=RE::NiPointer<RE::bhkCharacterController>(controller),position,gravity,fallTime,fallStart,cell] {
+                        if (player->GetCharController()!=c.get() || player->GetParentCell()!=cell || !c->GetHavokWorld()) return false;
+                        { RE::BSWriteLockGuard guard(c->GetHavokWorld()->worldLock); c->gravity=gravity; c->fallTime=fallTime; c->fallStartHeight=fallStart; }
+                        player->SetPosition(position,true);
+                        return std::abs(c->gravity-gravity)<.0001f;
+                    };
+                    g_ctx={{"start",{position.x,position.y,position.z}},{"stage",0},{"since",t},{"last",t},{"z",position.z},
+                        {"health",player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)},{"samples",json::array()}};
+                    return false;
+                }
+                if (!controller || !controller->GetHavokWorld()) { r={{"pass",false},{"error","controller disappeared"}}; return true; }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["since"].get<double>(), dt=t-g_ctx["last"].get<double>();
+                const float actual=player->GetPositionZ(), wanted=g_ctx["z"].get<float>();
+                if (g_ctx["samples"].size()<400) g_ctx["samples"].push_back({stage,std::round((actual-wanted)*10)/10});
+                if (since>=2) {   // two seconds a stage: climb, hover, descend; then let go and land
+                    const char* names[]={"climb_z","hover_z","descent_z","landed_z"};
+                    g_ctx[names[std::min(stage,3)]]=actual;
+                    if (stage==3) {
+                        const auto& s=g_ctx["start"]; r=g_ctx; r.erase("samples");
+                        float worst=0; for (const auto& x : g_ctx["samples"]) if (x[0]<3) worst=std::max(worst,std::abs(x[1].get<float>()));
+                        const float climb=r["climb_z"].get<float>()-s[2].get<float>(), drift=std::abs(r["hover_z"].get<float>()-r["climb_z"].get<float>()),
+                            descent=r["hover_z"].get<float>()-r["descent_z"].get<float>();
+                        r["displacement"]={{"climb",climb},{"hover_drift",drift},{"descent",descent},{"worst_lag",worst}};
+                        r["landed"]=!player->IsInMidair();
+                        r["no_fall_damage"]=player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)>=g_ctx["health"].get<float>()-.5f;
+                        r["pass"]=climb>250 && drift<10 && descent>150 && worst<40 && r["landed"]==true && r["no_fall_damage"]==true;
+                        return true;
+                    }
+                    g_ctx["stage"]=stage+1; g_ctx["since"]=t;
+                }
+                g_ctx["last"]=t;
+                const int now=g_ctx["stage"];
+                if (now==3) {   // let go: their controller lands the player from the remaining height (fall tracking was held)
+                    RE::BSWriteLockGuard guard(controller->GetHavokWorld()->worldLock);
+                    controller->fallTime=0; controller->fallStartHeight=actual; controller->gravity=1;
+                    return false;
+                }
+                // 200 units a second up, still, then 150 down: the next frame's height, from where the player actually is.
+                const float vertical=now==0 ? 200.f : now==2 ? -150.f : 0.f;
+                const float next=(now==1 ? wanted : actual)+vertical*static_cast<float>(std::clamp(dt,0.0,.1));
+                g_ctx["z"]=next;
+                {   // airborne: a grounded controller snaps the player back onto its support (the first attempt climbed 19 of 400)
+                    using State=RE::hkpCharacterStateTypes;
+                    RE::BSWriteLockGuard guard(controller->GetHavokWorld()->worldLock);
+                    controller->gravity=0; controller->fallTime=0; controller->fallStartHeight=next;
+                    controller->context.currentState=State::kFlying; controller->wantState=State::kFlying;
+                    controller->SetLinearVelocityImpl(RE::hkVector4(0,0,0,0));
+                }
+                auto at=player->GetPosition(); at.z=next; player->SetPosition(at,true);
+                return false;
+            }});
+        }
+
         void FlightControllerTests()
         {
             g_steps.push_back({"wow_flight_controller",12,[](double t,json& r) {
@@ -2616,6 +6532,195 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
             }});
         }
 
+        // Explicit-only M10 fixtures. Discover a loaded Riverwood farmhouse rather than guessing world coordinates;
+        // both extrema must be measured after the player's feet settle there. No save/load is used.
+        bool FinishShadows(double t, json& r)
+        {
+            if (!g_ctx.contains("shadow_home")) return true;
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            auto* home = RE::TESForm::LookupByID<RE::TESObjectREFR>(g_ctx["shadow_home"].get<RE::FormID>());
+            if (!g_ctx.contains("shadow_returning")) {
+                if (r.value("error", std::string()) == "timeout") r["evidence"] = g_ctx;
+                g_ctx["shadow_result"] = r; g_ctx["shadow_returning"] = t;
+                for (const auto* key : { "receive", "blob", "cascades" }) Console::Command("shadows", key, g_ctx["shadow_before"].value(key, false) ? "on" : "off");
+                if (auto* calendar = RE::Calendar::GetSingleton(); calendar && calendar->gameHour) calendar->gameHour->value = g_ctx["shadow_hour"].get<float>();
+                if (home && player) Teleport(player, home);
+                return false;
+            }
+            const bool restored = Landed(t) && player && home && player->Is3DLoaded() && player->GetParentCell() == home->GetParentCell() &&
+                player->GetPosition().GetDistance(home->GetPosition()) < 64 && !RE::UI::GetSingleton()->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+            if (!restored && t - g_ctx["shadow_returning"].get<double>() < 15) return false;
+            r = g_ctx["shadow_result"]; r["returned"] = restored; r["pass"] = r.value("pass", false) && restored;
+            if (restored) {
+                const auto& angle = g_ctx["shadow_angle"];
+                player->SetAngle({ angle[0].get<float>(), angle[1].get<float>(), angle[2].get<float>() });
+            }
+            if (home) home->Disable();
+            return true;
+        }
+
+        void ShadowTests()
+        {
+            for (const std::string name : { "wow_shadow_receive", "wow_shadow_blob", "wow_shadow_cascades" }) {
+                if (("," + Config::Get().testOnly + ",").find("," + name + ",") == std::string::npos) continue;
+                g_steps.push_back({ name, 150, [name](double t, json& r) {
+                    auto* player = RE::PlayerCharacter::GetSingleton();
+                    auto* calendar = RE::Calendar::GetSingleton();
+                    const bool receive = name == "wow_shadow_receive", blob = name == "wow_shadow_blob";
+                    auto point = [](const json& v) { return RE::NiPoint3{ v[0].get<float>(), v[1].get<float>(), v[2].get<float>() }; };
+                    auto position = [](const RE::NiPoint3& p) { return json::array({ p.x, p.y, p.z }); };
+                    auto move = [&](const json& p, int stage) {
+                        player->SetPosition(point(p), true); player->Update3DPosition(true);
+                        g_ctx["stage"] = stage; g_ctx["at"] = t;
+                    };
+                    if (t == 0) {
+                        auto* marker = RE::TESForm::LookupByID<RE::TESObjectSTAT>(0x3B);  // the existing XMarker fixture
+                        if (!player || !calendar || !calendar->gameHour || !marker) { r = { { "pass", false }, { "error", "player, calendar and XMarker required" } }; return true; }
+                        auto home = player->PlaceObjectAtMe(marker, true);
+                        if (!home) { r = { { "pass", false }, { "error", "return marker unavailable" } }; return true; }
+                        const auto angle = player->GetAngle();
+                        g_ctx = { { "shadow_home", home->GetFormID() }, { "shadow_before", Shadows::Status() },
+                            { "shadow_hour", calendar->gameHour->value }, { "shadow_angle", position(angle) },
+                            { "stage", 0 }, { "at", t }, { "samples", json::array() }, { "minimum", 1.0f }, { "maximum", 0.0f } };
+                        Console::Command("shadows", "receive", "on"); Console::Command("shadows", "blob", "off");
+                        Console::Command("shadows", "cascades", receive || blob ? "off" : "on");
+                        if (!Travel("riverwood")) { r = { { "pass", false }, { "error", "Riverwood travel unavailable" } }; return true; }
+                        g_ctx["shadow_travel"] = Console::Snapshot().value("travel", json::object());
+                        calendar->gameHour->value = 12;
+                        return false;
+                    }
+                    if (!player || !calendar || !calendar->gameHour) { r = { { "pass", false }, { "error", "player/calendar lost during shadow fixture" } }; return true; }
+                    calendar->gameHour->value = 12;  // keep the sun fixed while comparing HDR samples
+                    const int stage = g_ctx["stage"];
+                    const auto status = Shadows::Status();
+                    if (stage == 0) {
+                        if (t < 8 || !player->Is3DLoaded() || RE::UI::GetSingleton()->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) return false;
+                        const auto& travel = g_ctx["shadow_travel"];
+                        auto* world = player->GetWorldspace();
+                        const bool arrived = travel.value("source", std::string()) == "live_reference" && travel.contains("position") &&
+                            world && world->GetFormID() == travel.value("world", RE::FormID{}) && player->GetPosition().GetDistance(point(travel["position"])) < 4096;
+                        if (!arrived) {
+                            if (t < 20) return false;
+                            r = { { "pass", false }, { "error", "Riverwood live-reference arrival unavailable" }, { "travel", travel } }; return true;
+                        }
+                        // Pick the nearest loaded farmhouse/inn model, on the main thread. Riverwood's building mesh
+                        // paths supply the evidence; another town or a missing building fails this fixture explicitly.
+                        RE::TESObjectREFR* building = nullptr; float distance = 3000;
+                        auto* tes = RE::TES::GetSingleton();
+                        if (tes && tes->gridCells) for (UINT x = 0; x < tes->gridCells->length; ++x) for (UINT y = 0; y < tes->gridCells->length; ++y) {
+                            auto* cell = tes->gridCells->GetCell(x, y);
+                            if (!cell || !cell->IsAttached() || cell->IsInteriorCell()) continue;
+                            cell->ForEachReference([&](RE::TESObjectREFR* ref) {
+                                auto* base = ref->GetBaseObject() ? ref->GetBaseObject()->As<RE::TESObjectSTAT>() : nullptr;
+                                if (!base || !ref->Get3D() || ref->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
+                                const char* path = base->GetModel();
+                                if (!path) return RE::BSContainer::ForEachResult::kContinue;
+                                std::string model = path;
+                                std::ranges::transform(model, model.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                                const float d = ref->GetPosition().GetDistance(player->GetPosition());
+                                if (d < distance && (model.find("farmhouse") != std::string::npos || model.find("riverwood") != std::string::npos || model.find("inn01") != std::string::npos)) {
+                                    building = ref; distance = d;
+                                }
+                                return RE::BSContainer::ForEachResult::kContinue;
+                            });
+                        }
+                        if (!building) { r = { { "pass", false }, { "error", "no loaded Riverwood farmhouse/inn fixture within 3000 units" } }; return true; }
+                        const auto center = building->Get3D()->worldBound.center;
+                        const float radius = std::clamp(building->Get3D()->worldBound.radius, 300.0f, 1200.0f);
+                        g_ctx["building"] = building->GetFormID(); g_ctx["spots"] = json::array();
+                        for (const float scale : { 0.65f, 0.95f, 1.25f }) for (int k = 0; k < 12; ++k) {
+                            const float a = k * 6.2831853f / 12;
+                            RE::NiPoint3 at{ center.x + std::cos(a) * radius * scale, center.y + std::sin(a) * radius * scale, player->GetPosition().z };
+                            const auto ground = Picker::Cast(at + RE::NiPoint3{ 0, 0, 128 }, at - RE::NiPoint3{ 0, 0, 512 }, true);
+                            if (!ground.hit || std::abs(ground.normal.z) < 0.5f) continue;
+                            // Stay beside the building: reject a roof/floor belonging to the fixture itself.
+                            if (ground.ref == building) continue;
+                            at = ground.pos; g_ctx["spots"].push_back(position(at));
+                        }
+                        if (g_ctx["spots"].empty()) { r = { { "pass", false }, { "error", "no walkable ground beside the building" } }; return true; }
+                        g_ctx["spot"] = 0; move(g_ctx["spots"][0], 1); return false;
+                    }
+                    const double elapsed = t - g_ctx["at"].get<double>();
+                    if (stage == 1) {
+                        if (elapsed < 1.0) return false;
+                        const bool sameFeet = status.contains("probe_feet") && point(status["probe_feet"]).GetDistance(player->GetPosition()) < 64;
+                        if (!status.value("mask_ok", false) || !sameFeet) {
+                            ProbeWait(name.c_str(), t, { { "gate", "fresh_mask_at_feet" }, { "status", status } });
+                            if (elapsed < 3) return false;
+                        } else {
+                            const float vis = status.value("sunVis", 1.0f);
+                            g_ctx["samples"].push_back({ { "position", position(player->GetPosition()) }, { "sunVis", vis }, { "probe", status["probe_serial"] } });
+                            if (vis <= g_ctx["minimum"].get<float>()) { g_ctx["minimum"] = vis; g_ctx["shade"] = position(player->GetPosition()); }
+                            if (vis >= g_ctx["maximum"].get<float>()) { g_ctx["maximum"] = vis; g_ctx["lit"] = position(player->GetPosition()); }
+                        }
+                        if (!receive && !blob) g_ctx["lit"] = position(player->GetPosition());  // cascades can work without a usable mask
+                        const auto next = g_ctx["spot"].get<std::size_t>() + 1;
+                        const bool enough = receive ? g_ctx["maximum"].get<float>() - g_ctx["minimum"].get<float>() > 0.4f :
+                            blob ? g_ctx["maximum"].get<float>() > 0.75f : status.value("probe_pass", false) && status.value("min_lit", 1.0f) < 0.5f;
+                        if (!enough && next < g_ctx["spots"].size()) { g_ctx["spot"] = next; move(g_ctx["spots"][next], 1); return false; }
+                        if (!enough) { r = { { "pass", false }, { "error", "required lit/shaded shadow measurements unavailable" }, { "evidence", g_ctx }, { "status", status } }; return true; }
+                        move(g_ctx["lit"], 2); return false;
+                    }
+                    if (elapsed < 1.0) return false;
+                    const auto fullCapture = [&](const char* shot) {
+                        auto capture = UiPass::TakeCapture(shot);
+                        if (!capture.done) return false;
+                        const auto info = UiPass::GetInfo();
+                        const bool full = capture.width == info.width && capture.height == info.height && capture.width > 0 && capture.height > 0;
+                        g_ctx["captures"][shot] = { { "width", capture.width }, { "height", capture.height }, { "full_resolution", full } };
+                        return true;
+                    };
+                    if (receive) {
+                        if (stage == 2) { if (!CaptureWhenLanded("wow_shadow_receive_lit", t)) return false; g_ctx["stage"] = 3; return false; }
+                        if (stage == 3) { if (!fullCapture("wow_shadow_receive_lit")) return false; move(g_ctx["shade"], 4); return false; }
+                        if (stage == 4) { if (!CaptureWhenLanded("wow_shadow_receive_shade", t)) return false; g_ctx["stage"] = 5; return false; }
+                        if (stage == 5) {
+                            if (!fullCapture("wow_shadow_receive_shade")) return false;
+                            Console::Command("shadows", "receive", "off"); g_ctx["stage"] = 6; g_ctx["at"] = t; return false;
+                        }
+                        if (stage == 6) { if (!CaptureWhenLanded("wow_shadow_receive_off", t)) return false; g_ctx["stage"] = 7; return false; }
+                        if (!fullCapture("wow_shadow_receive_off")) return false;
+                        r = { { "pass", status.value("sunVis", 0.0f) == 1 && g_ctx["maximum"].get<float>() - g_ctx["minimum"].get<float>() > 0.4f },
+                            { "off_sunVis", status["sunVis"] }, { "measurements", g_ctx["samples"] }, { "captures", g_ctx["captures"] } };
+                    } else if (blob) {
+                        if (stage == 2 || stage == 4 || stage == 6) {
+                            const auto feet = Avatar::Current().position;
+                            g_ctx["ticket"] = WorldPass::RequestSample(feet + RE::NiPoint3{ 8, 0, 1 });
+                            const char* shot = stage == 4 ? "wow_shadow_blob_on" : "wow_shadow_blob_off";
+                            if (stage != 6 && !CaptureWhenLanded(shot, t)) return false;
+                            g_ctx["stage"] = stage + 1; return false;
+                        }
+                        const auto sample = WorldPass::GetSample(g_ctx["ticket"].get<int>());
+                        if (!sample.done && !g_ctx.contains("pixel")) return false;
+                        if (sample.done) {
+                            g_ctx["pixel"] = { { "on_screen", sample.onScreen }, { "rgb", { sample.rgba[0], sample.rgba[1], sample.rgba[2] } },
+                                { "luma", sample.rgba[0] * .2126f + sample.rgba[1] * .7152f + sample.rgba[2] * .0722f } };
+                        }
+                        if (stage != 7 && !fullCapture(stage == 5 ? "wow_shadow_blob_on" : "wow_shadow_blob_off")) return false;
+                        g_ctx[stage == 3 ? "off" : stage == 5 ? "on" : "off_again"] = g_ctx["pixel"]; g_ctx.erase("pixel");
+                        if (stage == 3 || stage == 5) {
+                            if (stage == 3) g_ctx["blob_before"] = status.value("blob_draws", std::uint64_t{});
+                            if (stage == 5) g_ctx["blob_ran"] = status.value("blob_draws", std::uint64_t{}) > g_ctx["blob_before"].get<std::uint64_t>();
+                            Console::Command("shadows", "blob", stage == 3 ? "on" : "off");
+                            g_ctx["stage"] = stage + 1; g_ctx["at"] = t; return false;
+                        }
+                        const float off = g_ctx["off"]["luma"], on = g_ctx["on"]["luma"], again = g_ctx["off_again"]["luma"];
+                        const float fraction = 1 - on / std::max((off + again) * .5f, 1e-6f);
+                        r = { { "pass", g_ctx["off"]["on_screen"] == true && g_ctx["on"]["on_screen"] == true && g_ctx["off_again"]["on_screen"] == true &&
+                            g_ctx.value("blob_ran", false) && off > .001f && again > .001f && fraction > .01f && std::abs(off - again) < std::max(off, again) * .3f },   // a live scene: exposure drifts, passers-by
+                            { "darkened_fraction", fraction }, { "off", g_ctx["off"] }, { "on", g_ctx["on"] }, { "off_again", g_ctx["off_again"] }, { "captures", g_ctx["captures"] } };
+                    } else {
+                        if (stage == 2) { if (!CaptureWhenLanded("wow_shadow_cascades", t)) return false; g_ctx["stage"] = 3; return false; }
+                        if (!fullCapture("wow_shadow_cascades")) return false;
+                        r = { { "pass", status.value("cascade_count", 0) >= 1 && status.value("convention_detected", false) &&
+                            status.value("probe_pass", false) && status.value("min_lit", 1.0f) < .5f }, { "probe", status }, { "captures", g_ctx["captures"] } };
+                    }
+                    for (const auto& capture : g_ctx["captures"]) r["pass"] = r["pass"].get<bool>() && capture["full_resolution"].get<bool>();
+                    return true;
+                } });
+            }
+        }
+
 		void BuildSuite()
 		{
 			g_steps.push_back({ "runtime", 1, [](double, json& r) {
@@ -2624,7 +6729,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					auto* player = RE::PlayerCharacter::GetSingleton();
 					auto* av = player->AsActorValueOwner();
 					r["start"] = { player->GetLevel(), av->GetBaseActorValue(RE::ActorValue::kDestruction), av->GetBaseActorValue(RE::ActorValue::kRestoration),
-						av->GetBaseActorValue(RE::ActorValue::kAlteration) };   // her Skyrim level and magic skills as the suite begins
+						av->GetBaseActorValue(RE::ActorValue::kAlteration) };   // their Skyrim level and magic skills as the suite begins
 				}
 				const auto v = REL::Module::get().version();
 				r["version"] = v.string();
@@ -2638,6 +6743,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				}
 				RE::PlayerCamera::GetSingleton()->ForceThirdPerson();
 				const auto p = pc->GetPosition();
+				g_startPos = p;
 				r["cell"] = pc->GetParentCell()->GetFormEditorID();
 				r["pos"] = { p.x, p.y, p.z };
 				r["pass"] = true;
@@ -2703,12 +6809,32 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				Picker::Hit  hit;
 				RE::NiPoint3 dir, origin, ground;
 				BoxProbe     front, behind;
-				json         frontOut, behindOut;
+				json         frontOut, behindOut, tried = json::array();
 				bool         frontDone = false;
+				int          candidate = 0;
 			};
-			g_steps.push_back({ "pick_center_surface", 20, [st = std::make_shared<PickSurface>()](double t, json& r) {
+			// Ground points to pick through, ahead and beside the player: the ray through one straight ahead grazes their own model
+			// (its pixel fell on either side of their silhouette by a pixel's rounding), and foliage, which Havok passes
+			// through, hides a box in front of the terrain behind it. The first whose front box shows is the one judged.
+			static constexpr float kPickPoints[][2] = { { 300.f, 0.f }, { 300.f, 120.f }, { 300.f, -120.f }, { 200.f, 60.f }, { 200.f, -60.f }, { 450.f, 0.f } };
+			static constexpr int   kPickCount = static_cast<int>(sizeof(kPickPoints) / sizeof(kPickPoints[0]));
+			g_steps.push_back({ "pick_center_surface", 30, [st = std::make_shared<PickSurface>()](double t, json& r) {
 				// Pick a terrain pixel (always collidable, unlike foliage): the hit must land near the ground point
 				// that projects there, a box just in front of the hit is visible and one just behind is occluded.
+				auto retry = [&](const char* a_why) {   // the next ground point, or the failure when none is left
+					st->tried.push_back({ { "point", st->candidate }, { "why", a_why } });
+					if (++st->candidate >= kPickCount) {
+						r["tried"] = st->tried;
+						r["error"] = a_why;
+						r["pass"] = false;
+						Surrogate::SetBodyHidden(false);
+						return true;
+					}
+					st->cast = st->frontDone = false;
+					st->front = BoxProbe{};
+					st->frontOut = json::object();
+					return false;
+				};
 				if (t == 0.0) {
 					Surrogate::SetBodyHidden(true);
 					return false;
@@ -2721,38 +6847,43 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					f.z = 0;
 					f.Unitize();
 					auto* pc = RE::PlayerCharacter::GetSingleton();
-					const auto ground = pc->GetPosition() + f * 300.f;
+					const auto ground = pc->GetPosition() + f * kPickPoints[st->candidate][0] + RE::NiPoint3{ f.y, -f.x, 0.f } * kPickPoints[st->candidate][1];
 					float gx = 0, gy = 0;
 					st->cast = true;
 					if (!Picker::WorldToScreen(ground, gx, gy) || !Picker::ScreenRay(gx, gy, st->origin, st->dir)) {
-						r["error"] = "ground point not on screen";
-						r["pass"] = false;
-						Surrogate::SetBodyHidden(false);
-						return true;
+						return retry("ground point not on screen");
 					}
 					st->hit = Picker::Cast(st->origin, st->origin + st->dir * 8000.f);
 					st->ground = ground;
-
-					r["hit"] = st->hit.hit;
 					if (!st->hit.hit) {
-						r["pass"] = false;
-						Surrogate::SetBodyHidden(false);
-						return true;
+						return retry("nothing hit");
 					}
 					return false;
 				}
 				if (!st->frontDone) {
-					st->frontDone = st->front.Step("pick_front", [&] { return st->hit.pos - st->dir * 10.f; }, 4.f, true, st->frontOut);
+					const auto name = std::format("pick_front{}", st->candidate);
+					st->frontDone = st->front.Step(name, [&] { return st->hit.pos - st->dir * 10.f; }, 4.f, true, st->frontOut);
+					if (st->frontDone && !st->frontOut.value("pass", false)) {
+						return retry("the box in front of the hit is not seen there");
+					}
 					return false;
 				}
-				if (!st->behind.Step("pick_behind", [&] { return st->hit.pos + st->dir * 40.f; }, 4.f, false, st->behindOut)) {
+				if (!st->behind.Step(std::format("pick_behind{}", st->candidate), [&] { return st->hit.pos + st->dir * 40.f; }, 4.f, false, st->behindOut)) {
 					return false;
+				}
+				if (!st->behindOut.value("pass", false)) {   // seen behind the hit: a thin or open surface, another point
+					st->behind = BoxProbe{};
+					st->behindOut = json::object();
+					if (!retry("the box behind the hit is seen there")) return false;
+					return true;
 				}
 				Surrogate::SetBodyHidden(false);
 				r["hit"] = { { "dist", st->hit.distance }, { "layer", st->hit.layer }, { "ref", st->hit.ref ? std::format("{:08X}", st->hit.ref->GetFormID()) : "none" } };
 
 				r["front"] = st->frontOut;
 				r["behind"] = st->behindOut;
+				r["point"] = { kPickPoints[st->candidate][0], kPickPoints[st->candidate][1] };
+				r["tried"] = st->tried;
 				const float miss = (st->hit.pos - st->ground).Length();  // terrain is uneven; the feet are not exactly on it
 				// The hit is the surface seen there: a box just in front of it shows, one just behind it is hidden. (How far it is
 				// from the nominal ground point is told, not judged: that point is at the player's height, and with WoW's camera
@@ -2925,6 +7056,40 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				Input::UnbindKey(0x02);
 				return true;
 			} });
+			// Explicit only: exercise the real watchdog, including its persisted stack evidence.
+			if (("," + Config::Get().testOnly + ",").find(",wow_hang_guard,") != std::string::npos)
+			g_steps.push_back({ "wow_hang_guard", 15, [](double, json& r) {
+				const auto directory = logger::log_directory();
+				if (!directory) { r = {{"pass", false}, {"error", "log directory unavailable"}}; return true; }
+				const auto path = *directory / "WoWBridge.log";
+				if (!g_ctx.contains("log_offset")) {
+					spdlog::default_logger()->flush();
+					std::ifstream before(path, std::ios::binary | std::ios::ate);
+					if (!before || before.tellg() < 0) { r = {{"pass", false}, {"error", "cannot read WoWBridge.log"}}; return true; }
+					g_ctx["log_offset"] = static_cast<std::int64_t>(before.tellg());
+					g_ctx["stage"] = "sleep";
+					StepCheckpoint();
+					Sleep(23000);  // deliberately block the MAIN thread past the watchdog's 20 s; it must run independently
+					g_ctx["stage"] = "verify";
+					StepCheckpoint();
+					g_ctx["verify_at"] = GetTickCount64();
+				}
+				std::ifstream after(path, std::ios::binary);
+				after.seekg(g_ctx["log_offset"].get<std::int64_t>());
+				const std::string added((std::istreambuf_iterator<char>(after)), {});
+				const auto report = added.find("hang: main thread silent");
+				const auto checkpoint = added.find("last checkpoint selftest:wow_hang_guard:sleep", report);
+				const auto chain = added.find("WoWBridge.dll+0x", checkpoint);
+				const auto scan = added.find("hang: WoWBridge.dll return addresses on the stack (offsets):", checkpoint);
+				const auto offset = scan == std::string::npos ? scan : added.find_first_not_of(' ', scan + std::string_view("hang: WoWBridge.dll return addresses on the stack (offsets):").size());
+				const bool stack = chain != std::string::npos || (offset != std::string::npos && std::isxdigit(static_cast<unsigned char>(added[offset])));
+				const bool passed = report != std::string::npos && checkpoint != std::string::npos && stack;
+				if (!passed && GetTickCount64() - g_ctx["verify_at"].get<ULONGLONG>() < 3000) return false;
+				r = {{"pass", passed}, {"hang_logged", report != std::string::npos}, {"checkpoint_logged", checkpoint != std::string::npos},
+					{"plugin_stack_offset", stack}, {"slept_seconds", 23}};
+				if (!passed) r["error"] = "watchdog did not persist the hang checkpoint and plugin stack offset";
+				return true;
+			} });
 		}
 
 		bool AvatarWorn()
@@ -2954,7 +7119,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["player"] = WowUi::Eval("UnitName('player')");
 				r["spells"] = WowUi::Eval("GetNumSpellTabs()");
 				r["bar1"] = WowUi::Eval("GetActionTexture(1)");
-				r["pass"] = r["player"] == Integration::PlayerName() && r["spells"] == "5";   // General, her three, and Skyrim's (Flames, Healing)
+				r["pass"] = r["player"] == Integration::PlayerName() && r["spells"] == "5";   // General, their three, and Skyrim's (Flames, Healing)
 				return true;
 			} });
 			// The interface's sounds play (SoundEntries -> the client's WAV -> XAudio2): opening the game menu's.
@@ -2989,10 +7154,10 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["pass"] = r["frames"].get<std::uint64_t>() > 10 && stats.batches >= 15 && r["body_hidden"] == true;
 				return true;
 			} });
-			// Her class spells as her Skyrim skills rise (Progression): at a new game's skills Wrath I is hers and Hurricane is
-			// greyed in her book, learned at Destruction 72; Destruction 30 teaches Moonfire, announced in the chat; at 100
-			// she knows her automatic book and is given the item-book ranks the suite casts, and keeps it with her skills back as they were.
-			// Her level is Skyrim's: a level up shows on her frame and prints the client's line.
+			// Their class spells as their Skyrim skills rise (Progression): at a new game's skills Wrath I is theirs and Hurricane is
+			// greyed in their book, learned at Destruction 72; Destruction 30 teaches Moonfire, announced in the chat; at 100
+			// the player knows their automatic book and is given the item-book ranks the suite casts, and keeps it with their skills back as they were.
+			// Their level is Skyrim's: a level up shows on their frame and prints the client's line.
 			g_steps.push_back({ "wow_progression", 30, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
@@ -3045,9 +7210,12 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 						{"native_known",Progression::Knows(8921)},{"seconds",t-g_ctx.value("at",0.0)}});
 					if ((learned!="0" || message.empty()) && t-g_ctx.value("at",0.0)<8.0) return false;
 				}
-				if (stage(0, 3.0)) {   // a new game's skills: Healing Touch I is hers and casts (the catalog has every rank)
+				if (g_ctx.value("stage",0)==3 && t-g_ctx.value("at",0.0)>=2.5) {   // mastery's reply may take a moment longer
+					if ((pending(17402)!="0" || pending(9912)!="0" || pending(25297)!="0") && t-g_ctx.value("at",0.0)<8.0) return false;
+				}
+				if (stage(0, 3.0)) {   // a new game's skills: Healing Touch I is theirs and casts (the catalog has every rank)
 					g_ctx["novice"] = { Progression::Ready(), pending(5176), pending(17402), pending(8921) };
-					Cast::Use(17402);   // a direct cast must refuse the Hurricane she has not learned
+					Cast::Use(17402);   // a direct cast must refuse the Hurricane the player has not learned
 					g_ctx["unknown_placing"] = Cast::Placing();
 					Cast::CancelPlacing();
 					Bridge::SetTarget(nullptr);
@@ -3073,7 +7241,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				} else if (stage(4, 2.5)) {
 					g_ctx["kept"] = { pending(17402), pending(9912) };
 					Console::Execute(std::format("player.setlevel {}", g_ctx["level"].get<int>() + 1));
-				} else if (stage(5, 0.7)) {   // the level up's light at her feet (0.5 s after the rise, then moments into it)
+				} else if (stage(5, 0.7)) {   // the level up's light at the player's feet (0.5 s after the rise, then moments into it)
 					g_ctx["snap"] = Action("snap:wow_level_up");
 				} else if (stage(6, 0.6)) {
 					g_ctx["snap"] = Action("snap:wow_level_up_1");
@@ -3091,16 +7259,18 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				}
 				const int level = g_ctx["level"].get<int>() + 1;
 				r["pass"] = r["novice"] == json::array({ true, "0", "1", "1" }) && r["rank1_cast"] == "1" &&
-				            r["rank1_native"].value("paid_spell",0u)==5185 && r["rank1_native"].value("paid_cost",0.f)>=10.f &&
-				            r["rank1_native"].value("paid_cost",0.f)<=20.f && r["rank1_native"].value("heal",json::object()).value("spell",0u)==5185 &&
-				            r["rank1_native"].value("heal",json::object()).value("amount",0)>=10 &&
+				            // Healing Touch rank 1 at novice skill: 30 magicka for 37 health since its floors rose to .25
+				            // (decision D8, October 16; was 14 for 16). A 30% band either way for skill and level variance.
+				            r["rank1_native"].value("paid_spell",0u)==5185 && r["rank1_native"].value("paid_cost",0.f)>=21.f &&
+				            r["rank1_native"].value("paid_cost",0.f)<=39.f && r["rank1_native"].value("heal",json::object()).value("spell",0u)==5185 &&
+				            r["rank1_native"].value("heal",json::object()).value("amount",0)>=20 &&
 				            r["unknown_placing"] == false && r["unknown_error"] == "1" &&
 				            r["learned"][0] == "0" && r["learned"][1] != "" &&
 				            r["master"] == json::array({ "0", "0", "0" }) && r["books"] == true && r["kept"] == json::array({ "0", "0" }) &&
 				            r["level_up"][0] == std::to_string(level) && r["level_up"][1] != "";
 				return true;
 			} });
-			// An actual Skyrim save and SKSE co-save, loaded with all her skills lowered: Hurricane stays learned, quietly.
+			// An actual Skyrim save and SKSE co-save, loaded with all their skills lowered: Hurricane stays learned, quietly.
 			g_steps.push_back({ "wow_progression_relog", 45, [](double t, json& r) {
 				constexpr RE::ActorValue kSkills[] = { RE::ActorValue::kDestruction, RE::ActorValue::kRestoration, RE::ActorValue::kAlteration,
 					RE::ActorValue::kOneHanded, RE::ActorValue::kTwoHanded };
@@ -3156,7 +7326,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				            std::atoi(r["learned"][1].get<std::string>().c_str()) >= std::atoi(r["learned"][0].get<std::string>().c_str());
 				return true;
 			} });
-			// Her morph puffs: the authored 2.8 s model lifetime includes its particles (base and aquatic).
+			// Their morph puffs: the authored 2.8 s model lifetime includes its particles (base and aquatic).
 			for (const auto spell : { 768u, 1066u }) {
 			    g_steps.push_back({ spell == 768u ? "wow_morph_puff_base" : "wow_morph_puff_aqua", 6, [spell](double t, json& r) {
 			        const std::string name = spell == 768u ? "wow_morph_puff_base" : "wow_morph_puff_aqua";
@@ -3260,18 +7430,28 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     Input::SetCursorMode(g_ctx["cursor"].get<bool>());
                     // The TrainingMenu payload and background 3D loader can still own this
                     // probe after kHide. Disabling/deleting it here crashed the loader at
-                    // SkyrimSE+7964F2 just after PASS. Leave the AI-disabled test actor alive
-                    // for the test session; never save these disposable probe runs for play.
+                    // SkyrimSE+7964F2 just after PASS. Never delete it; stage 7 only disables
+                    // it once the menu is gone and its 3D is settled, so it cannot stand in
+                    // later probes' way (a living non-hostile NPC ahead: BookFollower, picks).
                 };
                 const int stage=g_ctx["stage"].get<int>();
                 const auto menu=RE::UI::GetSingleton()->GetMenu<RE::TrainingMenu>();
                 if (stage==7) {
                     if (t-g_ctx["restore_at"].get<double>()<1 || !Progression::Ready()) return false;
+                    auto* menus=RE::UI::GetSingleton();
+                    const bool released=!menu && !menus->IsMenuOpen(RE::TrainingMenu::MENU_NAME) &&
+                        !menus->IsMenuOpen(RE::LoadingMenu::MENU_NAME) && (!actor || actor->Is3DLoaded());
+                    if (!released && t-g_ctx["restore_at"].get<double>()<3) return false;
+                    if (actor && released && !actor->IsDisabled() && !g_ctx.contains("disabled_at")) {
+                        actor->Disable(); g_ctx["disabled_at"]=t; return false;   // settles on a later frame
+                    }
+                    if (actor && g_ctx.contains("disabled_at") && !actor->IsDisabled() && t-g_ctx["disabled_at"].get<double>()<2) return false;
                     WowUi::Eval("(function() "+g_ctx["actions"].get<std::string>()+
                         " __WBFire('ACTIONBAR_SLOT_CHANGED',0) __WBFire('ACTIONBAR_PAGE_CHANGED') return 1 end)()");
                     r=g_ctx["finish_result"];
                     r["actions_restored"]=eval(captureActions)==g_ctx["actions"].get<std::string>();
-                    r["pass"]=r.value("pass",false) && r["actions_restored"].get<bool>();
+                    r["probe_actor_disabled"]=!actor || actor->IsDisabled();
+                    r["pass"]=r.value("pass",false) && r["actions_restored"].get<bool>() && r["probe_actor_disabled"].get<bool>();
                     return true;
                 }
                 ProbeWait("wow_trainer",t,{{"stage",stage},{"actor_loaded",actor && actor->Is3DLoaded()},
@@ -3338,12 +7518,15 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                 g_ctx["finish_result"]=r;
                 cleanup(); g_ctx["stage"]=7; g_ctx["restore_at"]=t; return false;
             } });
-            g_steps.push_back({ "wow_merchant", 95, [](double t, json& r) {
+            g_steps.push_back({ "wow_merchant", 200, [](double t, json& r) {
                 auto* player=RE::PlayerCharacter::GetSingleton();
                 auto* gold=RE::TESForm::LookupByID<RE::TESBoundObject>(15);
                 auto* sword=RE::TESForm::LookupByID<RE::TESBoundObject>(0x12EB7);
                 auto ui=[](const char* lua) { return WowUi::Eval(lua); };
+                auto* skills=player->GetInfoRuntimeData().skills;
+                static std::optional<RE::PlayerCharacter::PlayerSkills::Data> savedSkills; // native trades train Speech
                 if (t==0.0) {
+                    savedSkills.reset();
                     Melee::Stop(); Forms::Leave();
                     WowUi::Run("CloseMerchant() ClearCursor() __WBMerchantProbe=nil");
                     g_ctx={{"stage",-1},{"money",player->GetGoldAmount()},{"count",sword ? player->GetItemCount(sword) : 0},
@@ -3353,9 +7536,10 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     // Use Skyrim.esm's original LucanValeriusREF; never move/disable a vendor.
                     auto* actor=RE::TESForm::LookupByID<RE::Actor>(0x13487);
                     auto* marker=RE::TESForm::LookupByID<RE::TESObjectSTAT>(0x3B); // XMarker
-                    if (!actor || actor->IsDead() || actor->IsDisabled() || !marker || !gold || !sword) {
-                        r={{"pass",false},{"error","living original Lucan, XMarker or native inventory forms unavailable"}}; return true;
+                    if (!actor || actor->IsDead() || actor->IsDisabled() || !marker || !gold || !sword || !skills || !skills->data) {
+                        r={{"pass",false},{"error","living original Lucan, XMarker, native skill data or inventory forms unavailable"}}; return true;
                     }
+                    savedSkills=*skills->data; g_ctx["native_skills"]=NativeSkillProgress();
                     const auto home=player->PlaceObjectAtMe(marker,true);
                     if (!home) { r={{"pass",false},{"error","could not retain merchant return position"}}; return true; }
                     g_ctx["home"]=home->GetFormID();
@@ -3363,7 +7547,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     g_ctx["actor"]=actor->GetFormID();
                     Input::SetCursorMode(true);
                     player->AddObjectToContainer(gold,nullptr,10000,nullptr);
-                    player->MoveTo(actor);
+                    Teleport(player, actor);
                     return false;
                 }
                 if (g_ctx.contains("returning")) {
@@ -3374,6 +7558,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     if (!settled && t<90) return false;
                     r=g_ctx["result"]; r["returned_player"]=settled;
                     if (!settled) { r["pass"]=false; r["error"]="merchant player return did not settle"; }
+                    r["native_skills_restored"]=NativeSkillProgress()==g_ctx["native_skills"];
+                    r["pass"]=r.value("pass",false) && r["native_skills_restored"].get<bool>();
                     const auto& angle=g_ctx["angle"];
                     player->SetAngle({angle[0].get<float>(),angle[1].get<float>(),angle[2].get<float>()});
                     if (home) { home->Disable(); home->SetDelete(true); }
@@ -3419,8 +7605,16 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     const int delta=g_ctx["money"].get<int>()-player->GetGoldAmount();
                     if (delta>0) player->AddObjectToContainer(gold,nullptr,delta,nullptr);
                     else if (delta<0) player->RemoveItem(gold,-delta,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+                    // Buying and selling award native Speech XP: skill levels, skill XP and player XP back exactly.
+                    if (savedSkills && skills && skills->data) {
+                        for (std::size_t i=0;i<18;++i)
+                            player->AsActorValueOwner()->SetBaseActorValue(static_cast<RE::ActorValue>(static_cast<int>(RE::ActorValue::kOneHanded)+i),
+                                g_ctx["native_skills"]["base"][i].get<float>());
+                        *skills->data=*savedSkills;
+                    }
+                    savedSkills.reset();
                     g_ctx["result"]=r;
-                    if (auto* home=RE::TESForm::LookupByID<RE::TESObjectREFR>(g_ctx["home"].get<RE::FormID>())) player->MoveTo(home);
+                    if (auto* home=RE::TESForm::LookupByID<RE::TESObjectREFR>(g_ctx["home"].get<RE::FormID>())) Teleport(player, home);
                     g_ctx["returning"]=t;
                 };
                 const int stage=g_ctx["stage"].get<int>();
@@ -3434,7 +7628,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     {"dialogue_open",menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME)},
                     {"dialogue_visible",dialogue && dialogue->uiMovie && dialogue->uiMovie->GetVisible()}});
                 if (stage==0 && t>15 && !g_ctx.contains("pending_snap")) g_ctx["pending_snap"]=Snap("wow_merchant_pending");
-                if (t>65) {
+                if (t>165) {
                     r={{"pass",false},{"error","native dialogue/barter probe did not complete"},{"stage",stage},{"evidence",g_ctx.value("wait",json())}};
                     RE::UIMessageQueue::GetSingleton()->AddMessage(RE::DialogueMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kHide,nullptr);
                     { std::lock_guard lock(g_nativeBarterLock); g_nativeBarter.reset(); }
@@ -3451,6 +7645,21 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     g_ctx["stage"]=0; return false;
                 }
                 if (stage==0) {
+                    if (g_ctx.value("reactivate", false)) {
+                        auto* pick=RE::CrosshairPickData::GetSingleton();
+                        pick->target=actor->CreateRefHandle(); pick->targetActor=actor->CreateRefHandle();
+                        player->ActivatePickRef(); g_ctx["reactivate"]=false; return false;
+                    }
+                    // The Golden Claw's opening scene (MS13: Lucan and Camilla argue as the player first comes in) holds him in
+                    // MS13LucanHoldPositionPackage and refuses talk: wait it out, then speak to him again.
+                    if (package && package->GetFormID()==0x383C0) { g_ctx["scene"]=true; return false; }
+                    if (g_ctx.value("scene",false) && !menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME)) {
+                        g_ctx["scene"]=false; g_ctx["scene_waited_until"]=t;
+                        auto* pick=RE::CrosshairPickData::GetSingleton();
+                        pick->target=actor->CreateRefHandle(); pick->targetActor=actor->CreateRefHandle();
+                        Teleport(player, actor); g_ctx["reactivate"] = true;
+                        return false;
+                    }
                     const auto dialogue=menus->GetMenu<RE::DialogueMenu>();
                     if (!dialogue || !menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME) || !dialogue->uiMovie || !dialogue->uiMovie->GetVisible()) return false;
                     g_ctx["dialogue_visible"]=true;
@@ -3462,14 +7671,20 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     if (!Settled(g_ctx["seq"],0.5)) return false;
                     g_ctx["dialogue_input"]=!Input::Active() && Input::GetStats().keysSwallowed==0;
                     g_ctx["dialogue_keys_swallowed"]=Input::GetStats().keysSwallowed;
+                    g_ctx["dialogue_input_state"]={{"active",Input::Active()},{"cursor_mode",Input::CursorMode()},
+                        {"paused",menus->GameIsPaused()},{"dialogue_open",menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME)}};
                     g_ctx["seq"]=Snap("wow_native_dialogue"); g_ctx["stage"]=2; return false;
                 }
                 if (stage==2) {
                     if (!Settled(g_ctx["seq"])) return false;
-                    g_ctx["seq"]=Action("key:esc"); g_ctx["stage"]=3; return false;
+                    // Only while the dialogue is still open: an Escape after it closed by itself opened Skyrim's
+                    // Journal and paused a suite (October 16).
+                    if (menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME)) g_ctx["seq"]=Action("key:esc");
+                    else g_ctx["dialogue_closed_itself"]=true;
+                    g_ctx["stage"]=3; return false;
                 }
                 if (stage==3) {
-                    if (!Settled(g_ctx["seq"],0.5) || menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME)) return false;
+                    if (!g_ctx.value("dialogue_closed_itself",false) && (!Settled(g_ctx["seq"],0.5) || menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME))) return false;
                     g_ctx["dialogue_recovered"]=Input::Active();
                     g_ctx["stock"]=chestCount(sword);
                     g_ctx["vendorGold"]=chestCount(gold); g_ctx["vendorActorGold"]=actorBarterGold();
@@ -3486,13 +7701,15 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     if (!g_ctx.contains("return_dialogue_escape")) g_ctx["return_dialogue_escape"]=Action("key:esc");
                     return false;
                 }
+                // The runner's Escape may land after the dialogue closed by itself; the Journal it would open is a
+                // stray menu, closed as it opens (MenusOpened's sink), and the step goes on.
                 if (g_ctx.contains("return_dialogue_escape") && !Settled(g_ctx["return_dialogue_escape"],0.5)) return false;
                 {
                     std::lock_guard lock(g_nativeBarterLock);
                     if (!g_nativeBarter || (!g_nativeBarter->done && g_nativeBarter->stage!=6)) return false;
                     r=g_nativeBarter->result; g_nativeBarter.reset();
                 }
-                for (const auto* key : {"dialogue_visible","dialogue_flags","dialogue_input","dialogue_keys_swallowed","dialogue_recovered"}) r[key]=g_ctx[key];
+                for (const auto* key : {"dialogue_visible","dialogue_flags","dialogue_input","dialogue_keys_swallowed","dialogue_recovered","dialogue_input_state"}) r[key]=g_ctx.value(key,json());
                 r["closed"]=true;
                 r["input_recovered"]=Input::Active();
                 r["returned_to_dialogue"]=g_ctx.contains("return_dialogue_escape");
@@ -3942,6 +8159,12 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				}
 				if (stage==0) {
 					if (t<1 || ui("__WB.liveInventory and 1 or 0")!="1") return false;
+					if (!g_ctx.contains("bagSounds")) {   // B opens five bags with one sound
+						ui("(function() CloseAllBags() return 1 end)()");
+						const auto before=WowUi::InterfaceSounds();
+						ui("(function() RunBinding(GetBindingAction('B'),'down') return 1 end)()");
+						g_ctx["bagSounds"]=WowUi::InterfaceSounds()-before;
+					}
 					const auto probe=ui(R"((function()
 					  local staff,potion
 					  for _,i in pairs(__WB.bagItems) do
@@ -3988,7 +8211,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					counts+="} local got={} for _,i in pairs(__WB.bagItems) do got[i.form]=(got[i.form] or 0)+i.count end "
 						"for form,n in pairs(want) do if got[form]~=n then return 0 end got[form]=nil end return next(got)==nil and 1 or 0 end)()";
 					g_ctx["counts"]=WowUi::Eval(counts)=="1";
-					// Her septims as the backpack's money, 1 septim = 1 gold.
+					// Their septims as the backpack's money, 1 septim = 1 gold.
 					g_ctx["money"]=WowUi::Eval("GetMoney()")==std::to_string(std::int64_t{player->GetGoldAmount()}*10000);
 					g_ctx["tooltip"]=ui("__WBBagsProbe.tip");
 					UiPass::RequestCapture("wow_bags");
@@ -4032,7 +8255,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     // displaced item's former place. Track that confirmed key for
                     // the subsequent unequip/save/load gestures, retaining all counts.
                     if (ui("(function() for pos,i in pairs(__WB.bagItems) do if i.key==__WBBagsProbe.key then __WBBagsProbe.dest=pos return 1 end end return 0 end)()")!="1") return failed("equipped staff reservation missing");
-					ui("(function() __WBBagPage(1) return 1 end)()");   // her first page, its icons given time to load (lazily)
+					ui("(function() __WBBagPage(1) return 1 end)()");   // their first page, its icons given time to load (lazily)
 					advance(21);
 					return false;
 				}
@@ -4212,8 +8435,10 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["split"]=g_ctx["split"]; r["splitTotals"]=g_ctx["splitTotals"]; r["pilesPersisted"]=g_ctx["pilesPersisted"];
 				r["dropped"]=g_ctx["dropped"]; r["dropReference"]=g_ctx["dropReference"];
 				r["dropCount"]=g_ctx["dropCount"]; r["dropDistance"]=g_ctx["dropDistance"];
+				r["bagSounds"]=g_ctx["bagSounds"];
 				r["pass"]=r["split"]=="1" && r["splitTotals"]==true && r["pilesPersisted"]=="1" && g_ctx["dropRequested"]=="1" && g_ctx["dropUi"]=="1" && r["counts"]==true && r["tooltip"]=="Staff of Jordan" && r["equipped"]==true &&
-					r["consumed"]==true && r["move"]=="1" && r["money"]==true && r["shiftBUnbound"]==true && r["moneyStatic"]==true && r["swapReleased"]==true && r["equipmentHidden"]==true && r["splitLayout"]==true;
+					r["consumed"]==true && r["move"]=="1" && r["money"]==true && r["shiftBUnbound"]==true && r["moneyStatic"]==true && r["swapReleased"]==true && r["equipmentHidden"]==true && r["splitLayout"]==true &&
+					r["bagSounds"]==1;
 				if (!r["pass"].get<bool>()) r["wait"]=g_ctx["wait"];
 
 				player->RemoveItem(staff,1,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
@@ -4251,7 +8476,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					if (t-g_ctx["at"].get<double>()<2) return false;
 					auto* driver=RE::TESForm::LookupByID<RE::Actor>(g_ctx["driver"].get<RE::FormID>());
 					if (!driver) return false;
-					player->MoveTo(driver); g_ctx["stage"]=1; g_ctx["at"]=t; return false;
+					Teleport(player, driver); g_ctx["stage"]=1; g_ctx["at"]=t; return false;
 				}
 				if (stage==1) {
 					if (t-g_ctx["at"].get<double>()<3) return false;
@@ -4268,7 +8493,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["opened"]=true;
 					g_ctx["fares"]=eval("TaxiNodeCost(2)==200000 and TaxiNodeCost(7)==500000 and GetNumRoutes(2)==1 and TaxiNodeGetType(1)=='CURRENT' and 1 or 0")=="1";
 					WowUi::Run("this=TaxiButton2 TaxiNodeOnButtonEnter(this) this=nil");
-					UiPass::RequestCapture("wow_taxi"); g_ctx["stage"]=3; g_ctx["at"]=t; return false;
+					if (!CaptureWhenLanded("wow_taxi", t)) return false; g_ctx["stage"]=3; g_ctx["at"]=t; return false;
 				}
 				if (stage==3) {
 					if (t-g_ctx["at"].get<double>()<2) return false;
@@ -4280,6 +8505,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["marker"]=std::strtoul(eval("__WB.taxi.nodes[2].marker").c_str(),nullptr,10);
 					g_ctx["fare"]=std::atoi(eval("__WB.taxi.nodes[2].cost").c_str());
 					g_ctx["before"]=player->GetGoldAmount();
+					TeleportStarted();
 					WowUi::Run("TaxiButton2:Click('LeftButton')"); g_ctx["stage"]=5; g_ctx["at"]=t; return false;
 				}
 				if (stage==5) {
@@ -4289,7 +8515,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["arrived"]=true;
 					g_ctx["paid"]=player->GetGoldAmount()==g_ctx["before"].get<int>()-g_ctx["fare"].get<int>();
 					g_ctx["closed"]=eval("not __WB.taxi and not TaxiFrame:IsShown() and 1 or 0")=="1";
-					UiPass::RequestCapture("wow_taxi_arrived"); g_ctx["stage"]=6; g_ctx["at"]=t; return false;
+					if (!CaptureWhenLanded("wow_taxi_arrived", t)) return false; g_ctx["stage"]=6; g_ctx["at"]=t; return false;
 				}
 				if (stage==6) {
 					if (t-g_ctx["at"].get<double>()<2) return false;
@@ -4346,18 +8572,33 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     pick->target=actor->CreateRefHandle(); pick->targetActor=pick->target;
                     player->ActivatePickRef();
                 };
+                auto settledFor=[&](const char* key,bool ready,double seconds) { // continuously ready
+                    if (!ready) { g_ctx.erase(key); return false; }
+                    if (!g_ctx.contains(key)) g_ctx[key]=t;
+                    return t-g_ctx[key].get<double>()>=seconds;
+                };
+                // Never move a native actor in the frame the player changes cells (loader race,
+                // see wow_trainer): the player arrives and the destination settles, then Faendal
+                // is moved, and he is changed only once his own 3D has settled there.
                 if (stage==0) {
                     if (elapsed<2) return false;
-                    player->MoveTo(driver); npc->MoveTo(driver);
-                    npc->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kSpeedMult,0);
-                    advance(1); return false;
+                    Teleport(player, driver); advance(1); return false;
                 }
                 if (stage==1) {
-                    if (elapsed<4 || !npc->Is3DLoaded() || player->GetPosition().GetDistance(driver->GetPosition())>320) return false;
-                    const auto pos=driver->GetPosition(); npc->SetPosition({pos.x+80,pos.y+80,pos.z},true);
-                    activate(driver); advance(2); return false;
+                    auto* cell=player->GetParentCell();
+                    if (!settledFor("player_settled_at",elapsed>=4 && cell && cell->IsAttached() && driver->Is3DLoaded() &&
+                        player->GetPosition().GetDistance(driver->GetPosition())<=320,1.5)) return false;
+                    Teleport(npc, driver); advance(2); return false;
                 }
                 if (stage==2) {
+                    auto* npcCell=npc->GetParentCell();
+                    if (!settledFor("npc_settled_at",elapsed>=2 && npc->Is3DLoaded() && npcCell && npcCell->IsAttached() &&
+                        npc->GetPosition().GetDistance(driver->GetPosition())<2048,1.5)) return false;
+                    npc->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kSpeedMult,0);
+                    const auto pos=driver->GetPosition(); npc->SetPosition({pos.x+80,pos.y+80,pos.z},true);
+                    activate(driver); advance(3); return false;
+                }
+                if (stage==3) {
                     const bool opened=WowUi::Eval("__WB.taxi and TaxiFrame:IsVisible() and 1 or 0")=="1" && !ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
                     if (!opened) { if (elapsed>10) return finish(false,"native carriage panel did not open"); return false; }
                     if (!g_ctx.contains("carriage_snap")) { g_ctx["carriage_snap"]=Snap("wow_taxi_dialogue_carriage"); return false; }
@@ -4365,9 +8606,9 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     g_ctx["evidence"]["carriage_opened"]=true;
                     g_ctx["session"]=std::strtoul(WowUi::Eval("__WB.taxi.session").c_str(),nullptr,10);
                     g_ctx["fare"]=std::atoi(WowUi::Eval("__WB.taxi.nodes[2].cost").c_str());
-                    activate(npc); advance(3); return false;
+                    activate(npc); advance(4); return false;
                 }
-                if (stage==3) {
+                if (stage==4) {
                     auto* manager=RE::MenuTopicManager::GetSingleton();
                     bool owns=false;
                     if (manager) {
@@ -4385,7 +8626,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     if (elapsed<3) return false;
                     if (!owns || !dialogue || !closed) {
                         if (elapsed<10) return false;
-                        UiPass::RequestCapture("wow_taxi_dialogue_failed");
+                        if (!CaptureWhenLanded("wow_taxi_dialogue_failed", t)) return false;
                         return finish(false,"unrelated native dialogue was hidden or carriage retained input");
                     }
                     const bool refused=!Taxi::Open(driver);
@@ -4395,9 +8636,9 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     g_ctx["gold"]=player->GetGoldAmount();
                     const auto pos=player->GetPosition(); g_ctx["position"]={pos.x,pos.y,pos.z};
                     Taxi::Command("travel",2,g_ctx["session"].get<std::uint32_t>(),g_ctx["fare"].get<int>());
-                    advance(4); return false;
+                    advance(5); return false;
                 }
-                if (stage==4) {
+                if (stage==5) {
                     if (elapsed<1 || !Settled(g_ctx["native_snap"])) return false;
                     const auto& pos=g_ctx["position"];
                     const bool unchanged=player->GetGoldAmount()==g_ctx["gold"].get<int>() &&
@@ -4405,7 +8646,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                         ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
                     g_ctx["evidence"]["stale_travel_ignored"]=unchanged;
                     if (!unchanged) return finish(false,"stale carriage click changed gold, position or native dialogue");
-                    g_ctx["escape"]=Action("key:esc"); advance(5); return false;
+                    g_ctx["escape"]=Action("key:esc"); advance(6); return false;
                 }
                 if (!Settled(g_ctx["escape"],.5)) return false;
                 const auto* controls=RE::ControlMap::GetSingleton();
@@ -4415,7 +8656,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                 if (!recovered && elapsed<6) return false;
                 return finish(recovered,"Escape did not restore native movement/combat controls");
             } });
-			// Her quests in the client's Quest Log: two quests under their kinds, one objective done; the log opens on L's
+			// Their quests in the client's Quest Log: two quests under their kinds, one objective done; the log opens on L's
 			// command, lists headers and quests, shows the selected one's objectives; a watched quest shows on screen.
 			g_steps.push_back({ "wow_quest_log", 12, [](double t, json& r) {
 				auto ui = [](const char* a_lua) { return WowUi::Eval(a_lua); };
@@ -4461,7 +8702,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (t - g_ctx["closed"].get<double>() < 0.6) {
 					return false;
 				}
-				Quests::Reset();   // her own quests again
+				Quests::Reset();   // their own quests again
 				for (const char* k : { "open", "entries", "first", "selected", "watched", "abandon", "count" }) {
 					r[k] = g_ctx[k];
 				}
@@ -4531,6 +8772,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				}
 				if (!WowUi::Ready()) return false;
 				if (!g_ctx.contains("saved")) {
+					g_keepOpen = { "StatsMenu" };   // its level-up flow opens Skyrim's skills menu on purpose
 					g_levelChoiceSaved = std::make_unique<RE::PlayerCharacter::PlayerSkills::Data>(*data);
 					g_ctx["saved"] = {{"xp", data->xp}, {"threshold", data->levelThreshold}, {"level", player->GetLevel()}, {"perks", player->GetGameStatsData().perkCount}};
 					data->xp = data->levelThreshold + 1.f;
@@ -4788,7 +9030,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				return true;
 			} });
 			// An actual engine custom marker, through the same handle the map menu
-			// writes. Preserve her existing marker/path; never fabricate quest targets.
+			// writes. Preserve their existing marker/path; never fabricate quest targets.
 			g_steps.push_back({ "wow_minimap_poi", 35, [](double t, json& r) {
 				static RE::ObjectRefHandle saved;
 				static RE::TeleportPath* savedPath = nullptr;
@@ -4897,9 +9139,13 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["capture"] = { capture.width, capture.height };
 					Cast::Use(768); g_ctx["stage"] = 5; g_ctx["at"] = t; return false;
 				}
-				if (stage == 5) {
-					if (Cast::Casting() || t - g_ctx["at"].get<double>() < 1) return false;
-					g_ctx["form_loss"] = Forms::Current() == "none" && Cast::TrackingMask() == 0 && probe("GetTrackingTexture() and 'active' or 'empty'") == "empty";
+				if (stage == 5) {   // leaving the form lands a frame or two later at some frame rates: judged once it has, within 5 s
+					const double since = t - g_ctx["at"].get<double>();
+					const auto   texture = probe("GetTrackingTexture() and 'active' or 'empty'");
+					const bool   lost = Forms::Current() == "none" && Cast::TrackingMask() == 0 && texture == "empty";
+					if (Cast::Casting() || since < 1 || (!lost && since < 5)) return false;
+					g_ctx["form_loss"] = lost;
+					g_ctx["form_loss_seen"] = { { "form", Forms::Current() }, { "mask", Cast::TrackingMask() }, { "texture", texture }, { "after", since } };
 					// Exercise the exact CAST record payload and the load ordering (Cast,
 					// then Forms), with real wall time away and permanent aura display.
 					Cast::ResetForTesting(); Cast::Restore(g_ctx["saved_tracking"]); Forms::Reset();
@@ -4946,7 +9192,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["pass"] = r["time"] == "23:30" && r["moon"] != "0.000";   // the day half of the strip starts at 0
 				return true;
 			} });
-			// Her light at night (evidence): Riverwood at half past eleven, her model beside the world's, captured.
+			// Their light at night (evidence): Riverwood at half past eleven, their model beside the world's, captured.
 			g_steps.push_back({ "wow_light_night", 12, [](double t, json& r) {
 				auto* hour = RE::Calendar::GetSingleton()->gameHour;
 				if (t == 0.0) {
@@ -5034,8 +9280,10 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					if (count >= 4) { r["pass"] = false; r["error"] = "wow_party needs a free party slot for its temporary animal teammate"; return true; }
 					g_ctx["count0"] = count;
 					g_ctx["target0"] = Bridge::Target() ? Bridge::Target()->GetFormID() : 0;
-					WowUi::Run("__wbPartyChanges=0 __wbPartyProbe=CreateFrame('Frame') __wbPartyProbe:RegisterEvent('PARTY_MEMBERS_CHANGED') "
-						"__wbPartyProbe:SetScript('OnEvent',function() __wbPartyChanges=__wbPartyChanges+1 end)");
+					// Registered now (Eval runs at once): a queued Run comes after the interface applies the snapshot that already
+					// holds the new teammate, so the join's PARTY_MEMBERS_CHANGED could fire before the counter existed (October 17).
+					WowUi::Eval("(function() __wbPartyChanges=0 __wbPartyProbe=CreateFrame('Frame') __wbPartyProbe:RegisterEvent('PARTY_MEMBERS_CHANGED') "
+						"__wbPartyProbe:SetScript('OnEvent',function() __wbPartyChanges=__wbPartyChanges+1 end) return 1 end)()");
 					auto* actor = SpawnWolf(300.0f, -150.0f);
 					if (!actor) { r["pass"] = false; r["error"] = "could not spawn party probe"; cleanup(); return true; }
 					actor->GetActorRuntimeData().boolBits.set(RE::Actor::BOOL_BITS::kPlayerTeammate);
@@ -5078,7 +9326,9 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					// Wait for the render-thread snapshot: an already selected party unit makes F2-F5 request its pet.
 					if (WowUi::Eval("UnitExists('target') and 1 or 0") != "0") return false;
 					g_ctx["binding"] = true;
-					WowUi::Run(std::format("RunBinding(GetBindingAction('F{}'),'down')", slot + 1));
+					// F2-F4; the fourth follower has no key by default (F5 is Skyrim's quicksave): their command then.
+					WowUi::Run(std::format("local k=GetBindingKey('TARGETPARTYMEMBER{0}') "
+						"RunBinding(k and GetBindingAction(k) or 'TARGETPARTYMEMBER{0}','down')", slot));
 					return false;
 				}
 				if (!g_ctx.contains("capture")) {
@@ -5241,7 +9491,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 			// WoW's selection circle on the ground under the target, in its reaction's colour (a wolf: hostile, red).
 			g_steps.push_back({ "wow_selection_circle", 20, [](double t, json& r) {
 				if (t == 0.0) {
-					auto* wolf = SpawnWolf(350.0f, 160.0f);   // off to her right, so she does not stand in front of it
+					auto* wolf = SpawnWolf(350.0f, 160.0f);   // off to their right, so the player does not stand in front of it
 					if (!wolf) {
 						r["error"] = "no wolf";
 						r["pass"] = false;
@@ -5300,7 +9550,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 			g_steps.push_back({ "wow_hover_highlight", 20, [](double t, json& r) {
 				if (t == 0.0) {
 					Input::SetCursorMode(true);
-					auto* wolf = SpawnWolf(350.0f, -160.0f);   // on her left: the circle test's wolf stands on her right
+					auto* wolf = SpawnWolf(350.0f, -160.0f);   // on their left: the circle test's wolf stands on their right
 					if (!wolf) {
 						r["error"] = "no wolf";
 						r["pass"] = false;
@@ -5379,6 +9629,14 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 			// A cast through the interface's own action button: cast bar, then the Skyrim target is hurt and mana spent.
 			g_steps.push_back({ "wow_cast_wrath", 25, [](double t, json& r) {
 				if (t == 0.0) {
+                    WowUi::Eval(R"((function()
+                        __wbWrathProbe={lines={}}
+                        if not __wbWrathProbeFrame then
+                            __wbWrathProbeFrame=CreateFrame('Frame')
+                            __wbWrathProbeFrame:SetScript('OnEvent',function() if __wbWrathProbe then table.insert(__wbWrathProbe.lines,arg1) end end)
+                        end
+                        __wbWrathProbeFrame:RegisterEvent('CHAT_MSG_SPELL_SELF_DAMAGE') return 1
+                    end)())");
 					// A wolf 8 yards ahead: in Wrath's 30 yards and in sight.
 					auto* wolf = SpawnWolf(500.0f);
 					if (!wolf) {
@@ -5390,7 +9648,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					return false;
 				}
 				auto* target = RE::TESForm::LookupByID<RE::Actor>(g_ctx["actor"].get<RE::FormID>());
-				if (g_ctx.contains("used")) {   // the least she had once it was paid (a big pool's regeneration refills it fast)
+				if (g_ctx.contains("used")) {   // the least the player had once it was paid (a big pool's regeneration refills it fast)
 					const int mana = std::atoi(WowUi::Eval("UnitMana('player')").c_str());
 					g_ctx["mana_min"] = std::min(mana, g_ctx.value("mana_min", mana));
 				}
@@ -5419,7 +9677,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["bar"] = WowUi::Eval("CastingBarFrame:IsVisible()");
 				}
 				if (since > 1.0 && !g_ctx.contains("snap")) {
-					g_ctx["snap"] = Snap("wow_avatar_casting");   // her ReadySpellDirected and the precast glow while Wrath is cast
+					g_ctx["snap"] = Snap("wow_avatar_casting");   // their ReadySpellDirected and the precast glow while Wrath is cast
 					g_ctx["visuals"] = SpellVisuals::Running();
 				}
 				if (since > 2.12 && !g_ctx.contains("snap2")) {
@@ -5446,14 +9704,20 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["dead"] = target && target->IsDead();
 				r["frame_dead"] = WowUi::Eval("UnitIsDead('target')");
 				const bool deathAgrees = r["hp_after"].get<float>() > 0.0f || (r["dead"] == true && r["frame_dead"] == "1");
-				r["pass"] = r["cast_bar"] == "1" && r["hp_after"].get<float>() < r["hp_before"].get<float>() && r["sounds"] == 3 &&
-				            std::atoi(r["mana_after"].get<std::string>().c_str()) < std::atoi(r["mana_before"].get<std::string>().c_str()) &&
-				            deathAgrees;
+                r["combat_log"]=WowUi::Eval("table.concat(__wbWrathProbe.lines,'|')");
+                r["logged_miss"]=WowUi::Eval(std::format("(function() for _,line in ipairs(__wbWrathProbe.lines) do if line==string.format(SPELLMISSSELFOTHER,'Wrath',{}) or line==string.format(SPELLRESISTSELFOTHER,'Wrath',{}) then return 1 end end return 0 end)()",
+                    LuaQuote(g_ctx["name"].get<std::string>()),LuaQuote(g_ctx["name"].get<std::string>())))=="1";
+                const bool hit=r["hp_after"].get<float>()<r["hp_before"].get<float>() && r["sounds"]==3;
+                const bool miss=r["logged_miss"]==true && std::abs(r["hp_after"].get<float>()-r["hp_before"].get<float>())<.01f && r["sounds"]==2;
+                r["outcome"]=hit ? "hit" : miss ? "logged miss/resist" : "unexpected";
+                r["pass"]=r["cast_bar"]=="1" && (hit || miss) &&
+                    Cast::TalentDiagnostics().value("paid_spell",0)==9912 &&
+                    std::atoi(r["mana_after"].get<std::string>().c_str())<std::atoi(r["mana_before"].get<std::string>().c_str()) && deathAgrees;
 				return true;
 			} });
 			// Moonfire on a wolf made sturdy enough to live through it: the direct hit, the debuff on the target frame, and
 			// a periodic tick three seconds later (the plugin's aura table, on the gameplay clock).
-			// A target that dies while she casts at it: the cast fails at its end, as the client's does, and costs nothing.
+			// A target that dies while the player casts at it: the cast fails at its end, as the client's does, and costs nothing.
 			g_steps.push_back({ "wow_cast_target_died", 15, [](double t, json& r) {
 				if (t == 0.0) {
 					auto* wolf = SpawnWolf(500.0f);
@@ -5484,9 +9748,9 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (since < 3.0) {
 					return false;
 				}
-				r["spent"] = g_ctx["mana0"].get<int>() - Cast::Mana();   // her mana may come back meanwhile: nothing was spent
+				r["spent"] = g_ctx["mana0"].get<int>() - Cast::Mana();   // their mana may come back meanwhile: nothing was spent
 				r["casting"] = Cast::Casting();
-				r["mana"] = { Cast::Mana(), Cast::MaxMana() };   // her magicka
+				r["mana"] = { Cast::Mana(), Cast::MaxMana() };   // their magicka
 				r["pass"] = r["spent"].get<int>() < 1 && r["casting"] == false;
 				Bridge::SetTarget(nullptr);
 				wolf->Disable();   // no corpse left where a later test's right click would loot it (the loot menu stops play)
@@ -5550,8 +9814,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				Bridge::SetTarget(nullptr);
 				return true;
 			} });
-			// Her WoW gear is Skyrim items: given and worn; taking off the chestguard takes it off her model, taking off the
-			// staff takes its ability and leaves her bare-handed; putting them on brings them back.
+			// Their WoW gear is Skyrim items: given and worn; taking off the chestguard takes it off their model, taking off the
+			// staff takes its ability and leaves the player bare-handed; putting them on brings them back.
 			g_steps.push_back({ "wow_gear", 25, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* data = RE::TESDataHandler::GetSingleton();
@@ -5607,7 +9871,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					return false;
 				}
 				r["start"] = g_ctx["start"];   // chest worn, staff worn, ability, chest on the WoW model
-				r["off"] = g_ctx["off"];       // the same after taking them off, then her stance (25 bare hands)
+				r["off"] = g_ctx["off"];       // the same after taking them off, then their stance (25 bare hands)
 				r["on"] = { worn(chest), worn(staff), player->HasSpell(ability), static_cast<bool>(Character::InSlot(4)), Character::Melee().ready };
 				r["off_loaded"] = g_ctx["off_loaded"];
 				r["off_right_hand"] = g_ctx["off_right_hand"];
@@ -5619,7 +9883,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["stat_gains"]=json::array();
 				for (int i=0;i<3;++i) r["stat_gains"].push_back(r["on_stats"][i].get<float>()-g_ctx["off_stats"][i].get<float>());
 				r["stats_applied"]=r["stat_gains"][0].get<float>()>=54.f && r["stat_gains"][1].get<float>()>=30.f && r["stat_gains"][2].get<float>()>=28.f;
-				r["pass"] = r["stats_applied"]==true && r["start"] == json::array({ true, true, true, true }) && (r["off"] == json::array({ false, false, false, false, 25 }) ||   // bare hands, or a Skyrim one-hander of the new game's in her hand
+				r["pass"] = r["stats_applied"]==true && r["start"] == json::array({ true, true, true, true }) && (r["off"] == json::array({ false, false, false, false, 25 }) ||   // bare hands, or a Skyrim one-hander of the new game's in their hand
 				             (r["off"] == json::array({ false, false, false, false, 26 }) && g_ctx.value("off_right_hand", 0) != 0)) &&
 				            r["on"] == json::array({ true, true, true, true, 28 }) && r["off_loaded"] == true && r["redressed"] == true;
 				return true;
@@ -5958,23 +10222,23 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					const auto level = player->GetLevel();
 					const auto progression = Progression::SnapshotForTesting();
 					std::array<RE::TESForm*,2> hands{player->GetEquippedObject(false),player->GetEquippedObject(true)};
-					std::array<RE::ExtraDataList*,2> extras{};
-					for (const auto& [form,entry] : player->GetInventory()) {
-						if (!entry.second || !entry.second->extraLists) continue;
-						for (auto* extra : *entry.second->extraLists) if (extra) {
-							if (form==hands[0] && extra->HasType<RE::ExtraWorn>()) extras[0]=extra;
-							if (form==hands[1] && extra->HasType<RE::ExtraWornLeft>()) extras[1]=extra;
-						}
-					}
 					const bool added = player->GetItemCount(staff)==0;
 					g_ctx["level_before"]=level;
 					g_ctx["hands_before"]={hands[0]?hands[0]->GetFormID():0,hands[1]?hands[1]->GetFormID():0};
-					g_restoreGearFeedback=[player,staff,level,progression,hands,extras,added] {
+					g_restoreGearFeedback=[player,staff,level,progression,hands,added] {
 						auto* equip=RE::ActorEquipManager::GetSingleton();
 						equip->UnequipObject(player,staff,nullptr,1,nullptr,false,true,false,true);
 						if (added) player->RemoveItem(staff,1,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
 						Console::Execute(std::format("player.setlevel {}",level));
 						Progression::RestoreForTesting(progression);
+						// The extra lists captured at the start may be freed by now (the staff's removal, the level's 3D
+						// reset): a stale one fed to EquipObject faulted in the engine (October 16). Resolve them live.
+						std::array<RE::ExtraDataList*,2> extras{};
+						for (const auto& [form,entry] : player->GetInventory()) {
+							if (!entry.second || !entry.second->extraLists) continue;
+							for (std::size_t n=0;n<hands.size();++n) if (form==hands[n] && !extras[n])
+								for (auto* extra : *entry.second->extraLists) if (extra && (extra->HasType<RE::ExtraWorn>() || extra->HasType<RE::ExtraWornLeft>())) extras[n]=extra;
+						}
 						for (std::size_t n=0;n<hands.size();++n) if (hands[n]) {
 							auto* slot=RE::TESForm::LookupByID<RE::BGSEquipSlot>(n ? 0x13F43 : 0x13F42);
 							if (auto* object=hands[n]->As<RE::TESBoundObject>())
@@ -6003,7 +10267,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 						const bool used=Gear::UseEffect(from,nullptr);
 						g_ctx["item_use_level"]=player->GetLevel();
 						g_ctx["item_use"] = used && player->GetLevel()==2 && player->GetItemCount(from)==0 && player->GetItemCount(to)==1 &&
-							!Cast::ItemReady(23041) && !Cast::ItemReady(23042);
+							!Cast::ItemReady(Cast::kItemCategory | 1031);   // the staves' shared category timer
 						Gear::UseEffect(to,nullptr); // cooldown must reject reversing the transformation
 						g_ctx["use_cooldown"] = player->GetItemCount(to)==1 && player->GetItemCount(from)==0;
 						if (player->GetItemCount(to)>0) player->RemoveItem(to,1,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
@@ -6214,7 +10478,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					std::ranges::all_of(r["results"], [](const json& result) { return result.value("pass", false); });
 				return true;
 			} });
-			// Dress the loaded WoW body in Skyrim iron, capture it, and restore all the armour she actually wore.
+			// Dress the loaded WoW body in Skyrim iron, capture it, and restore all the armour the player actually wore.
 			g_steps.push_back({ "skyrim_gear_looks", 50, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* data = RE::TESDataHandler::GetSingleton();
@@ -6534,10 +10798,11 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 							if (g_ctx["added"] == true) { player->AddObjectToContainer(form, nullptr, 1, nullptr); }
 						}
 						if (!form || !player->GetInventoryCounts().contains(form)) {
-							r = { { "pass", false }, { "error", "requested preview item missing from her inventory" } }; return true;
+							r = { { "pass", false }, { "error", "requested preview item missing from their inventory" } }; return true;
 						}
 						g_itemProbe = std::make_unique<ItemMenuProbe>();
 						g_itemProbe->form = form, g_itemProbe->entry = entry, g_itemProbe->name = name;
+						g_keepOpen = { std::string(RE::InventoryMenu::MENU_NAME) };   // the probe's own paused menu
 						RE::UIMessageQueue::GetSingleton()->AddMessage(RE::InventoryMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kShow, nullptr);
 						return false;
 					}
@@ -6559,8 +10824,9 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				} });
 			}
 			// Falls as WoW's server takes them: 10 yards costs nothing (under 14.57), 25 yards 0.018 x 25 - 0.2426 = 20.7% of
-			// her health (the user died dropping from a roof's height under Skyrim's own fall damage).
-			g_steps.push_back({ "wow_fall", 24, [](double t, json& r) {
+			// their health (the user died dropping from a roof's height under Skyrim's own fall damage). In Cat Form with Feline
+			// Grace, 35 yards costs 0.018 x (35 - 17) - 0.2426 = 8.1%.
+			g_steps.push_back({ "wow_fall", 36, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
 				auto  health = [&] { return av->GetActorValue(RE::ActorValue::kHealth); };
@@ -6572,7 +10838,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					at.z += a_yards * Avatar::kUnitsPerYard;
 					player->SetPosition(at, true);
 				};
-				// Landed, and a moment more: the fall's damage is dealt on the frame she lands, after this step may have run.
+				// Landed, and a moment more: the fall's damage is dealt on the frame the player lands, after this step may have run.
 				auto landed = [&] {
 					const auto* c = player->GetCharController();
 					const bool  down = Frame::Now() - g_ctx["dropped"].get<double>() > 1.0 && c && c->context.currentState == RE::hkpCharacterStateTypes::kOnGround;
@@ -6601,7 +10867,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (!landed()) {
 					return false;
 				}
-				if (!g_ctx.contains("shown")) {   // seen a while (her frame, the log line) and captured, before she is healed
+				if (!g_ctx.contains("shown")) {   // seen a while (their frame, the log line) and captured, before the player is healed
 					g_ctx["shown"] = t;
 					g_ctx["after"] = health();
 					UiPass::RequestCapture("wow_fall_landed");
@@ -6610,22 +10876,205 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (t - g_ctx["shown"].get<double>() < 2.0) {
 					return false;
 				}
+				if (!g_ctx.contains("grace_at")) {
+					g_ctx["grace_at"] = t;
+					g_ctx["long_hp0"] = g_ctx["hp0"];
+					g_ctx["frame_health"] = WowUi::Eval("UnitHealth('player')");   // their frame shows what Skyrim has
+					g_ctx["skyrim_health"] = std::ceil(health());
+					Console::Command("learnwow", "20719", "");
+					Console::Command("form", "cat", "");
+					return false;
+				}
+				if (!g_ctx.contains("grace_drop")) {
+					if (t - g_ctx["grace_at"].get<double>() < 3.0) return false;
+					g_ctx["grace_drop"] = true;
+					g_ctx["grace_form"] = Forms::Current();
+					g_ctx["grace_known"] = Progression::Knows(20719);
+					g_ctx["grace_max"] = av->GetPermanentActorValue(RE::ActorValue::kHealth);   // Cat Form may change it
+					drop(35.0f);
+					return false;
+				}
+				if (!landed()) {
+					return false;
+				}
 				const float maxHp = g_ctx["max"].get<float>();
+				r["grace_form"] = g_ctx["grace_form"];
+				r["grace_known"] = g_ctx["grace_known"];
+				r["grace_loss_share"] = (g_ctx["hp0"].get<float>() - health()) / g_ctx["grace_max"].get<float>();
+				r["grace_expected_share"] = 0.018f * (35.0f - 17.0f) - 0.2426f;
+				Console::Command("form", "none", "");
 				r["short_loss"] = g_ctx["short"];
-				r["frame_health"] = WowUi::Eval("UnitHealth('player')");   // her frame shows what Skyrim has
-				r["skyrim_health"] = std::ceil(health());
 				r["logged"] = WowUi::Eval("(function() for i = 1, ChatFrame1:GetNumMessages() do local t = ChatFrame1:GetMessageInfo(i) "
 										  "if t and string.find(t, 'fall') then return 1 end end return 0 end)()");
-				r["long_loss_share"] = (g_ctx["hp0"].get<float>() - g_ctx["after"].get<float>()) / maxHp;
+				r["frame_health"] = g_ctx["frame_health"];
+				r["skyrim_health"] = g_ctx["skyrim_health"];
+				r["long_loss_share"] = (g_ctx["long_hp0"].get<float>() - g_ctx["after"].get<float>()) / maxHp;
 				r["expected_share"] = 0.018f * 25.0f - 0.2426f;
 				r["pass"] = g_ctx["short"].get<float>() < 0.5f && std::abs(r["long_loss_share"].get<float>() - r["expected_share"].get<float>()) < 0.03f &&
-				            std::abs(std::atof(r["frame_health"].get<std::string>().c_str()) - r["skyrim_health"].get<float>()) <= 1.0f;
+				            std::abs(std::atof(r["frame_health"].get<std::string>().c_str()) - r["skyrim_health"].get<float>()) <= 1.0f &&
+				            std::abs(r["grace_loss_share"].get<float>() - r["grace_expected_share"].get<float>()) < 0.03f;
 				av->RestoreActorValue(RE::ActorValue::kHealth, 100000.0f);
 				return true;
 			} });
+			// Dispels by the 1.12 types Skyrim's own magic takes (Cast Dispel, SkyrimAuras::DispelType): Rattles (a disease),
+			// Lingering Damage Health (a poison) and an ice hazard's frost (a harmful touch spell) on the player. Cure Poison's one poison goes
+			// and nothing else; then Cleanse's three effects (Poison, Disease, Magic) clear the rest, the disease leaving
+			// their spells as a shrine would take it.
+			g_steps.push_back({ "wow_dispel", 12, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* av = player->AsActorValueOwner();
+				auto* disease = RE::TESForm::LookupByID<RE::SpellItem>(0xB8781);       // DiseaseRattles
+				auto* poison = RE::TESForm::LookupByID<RE::MagicItem>(0x65A6F);        // DamageHealthLinger01
+				auto* frost = RE::TESForm::LookupByID<RE::MagicItem>(0x3E07D);        // HazardIceSpell: 1 frost a second, 6 s
+				const auto types = [&] {
+					std::map<std::string, int> n;
+					if (auto* effects = player->GetActiveEffectList()) {
+						for (auto* e : *effects) {
+							if (e && SkyrimAuras::Visible(e) && !SkyrimAuras::DispelType(e).empty()) ++n[SkyrimAuras::DispelType(e)];
+						}
+					}
+					return json(n);
+				};
+				const auto dispel = [](std::uint32_t a_spell, std::initializer_list<const char*> a_types) {
+					json events = json::array();
+					for (const auto* type : a_types) events.push_back({ { "type", "dispel" }, { "dispel", type }, { "count", 1 } });
+					Cast::ApplyForTesting(a_spell, { { "name", "Test dispel" }, { "events", events } }, RE::PlayerCharacter::GetSingleton());
+				};
+				if (t == 0.0) {
+					if (!disease || !poison || !frost) {
+						r = { { "pass", false }, { "error", "Skyrim fixture spells missing" } };
+						return true;
+					}
+					av->RestoreActorValue(RE::ActorValue::kHealth, 100000.0f);
+					player->AddSpell(disease);
+					g_ctx["disease_added"] = player->HasSpell(disease);
+					auto* caster = player->GetMagicCaster(RE::MagicSystem::CastingSource::kInstant);
+					caster->CastSpellImmediate(poison, false, player, 1.0f, false, 0.0f, nullptr);
+					caster->CastSpellImmediate(frost, false, player, 1.0f, false, 0.0f, nullptr);
+					return false;
+				}
+				const auto diseased = [&] {
+					auto* effects = player->GetActiveEffectList();
+					return effects && std::ranges::any_of(*effects, [&](RE::ActiveEffect* e) { return e && e->spell == disease; });
+				};
+				if (!g_ctx.contains("before")) {
+					if (t < 1.0) return false;
+					json seen = json::array();   // evidence: every effect on the player (spell, type, flags, duration)
+					if (auto* effects = player->GetActiveEffectList()) {
+						for (auto* e : *effects) {
+							if (e && e->spell) seen.push_back({ std::format("{:08X}", e->spell->GetFormID()), static_cast<int>(e->spell->GetSpellType()),
+								e->flags.underlying(), e->duration, SkyrimAuras::Visible(e), SkyrimAuras::DispelType(e) });
+						}
+					}
+					g_ctx["effects"] = seen;
+					g_ctx["resist_disease"] = av->GetActorValue(RE::ActorValue::kResistDisease);
+					g_ctx["diseased"] = diseased();
+					g_ctx["before"] = types();
+					dispel(8946, { "Poison" });   // Cure Poison
+					return false;
+				}
+				if (!g_ctx.contains("cured")) {
+					if (t < 1.5) return false;
+					g_ctx["cured"] = types();
+					g_ctx["disease_after_cure"] = player->HasSpell(disease);
+					UiPass::RequestCapture("wow_dispel_cured");   // their debuff row: Disease and Magic borders remain
+					return false;
+				}
+				if (!g_ctx.contains("cleansed")) {
+					if (t < 2.5) return false;
+					dispel(4987, { "Poison", "Disease", "Magic" });   // Cleanse
+					g_ctx["cleansed"] = t;
+					return false;
+				}
+				if (t < 3.0) return false;
+				const auto after = types();
+				const auto& before = g_ctx["before"];
+				const auto& cured = g_ctx["cured"];
+				json checks;
+				// Rattles' effect rests on a vanilla GetRandomPercent condition: the disease is theirs when the player has the spell.
+				checks["applied"] = g_ctx.value("disease_added", false) && before.value("Poison", 0) > 0 && before.value("Magic", 0) > 0;
+				checks["cure_poison_only"] = cured.value("Poison", 0) == 0 && cured.value("Disease", 0) == before.value("Disease", 0) &&
+				                             cured.value("Magic", 0) == before.value("Magic", 0) && g_ctx.value("disease_after_cure", false);
+				checks["cleanse_all"] = after.value("Disease", 0) == 0 && after.value("Magic", 0) == 0;
+				checks["disease_spell_gone"] = !player->HasSpell(disease);
+				player->RemoveSpell(disease);
+				av->RestoreActorValue(RE::ActorValue::kHealth, 100000.0f);
+				r = { { "checks", checks }, { "before", before }, { "cured", cured }, { "after", after }, { "effects", g_ctx["effects"] },
+					{ "resist_disease", g_ctx["resist_disease"] }, { "disease_added", g_ctx.value("disease_added", false) },
+					{ "diseased", g_ctx.value("diseased", false) } };
+				r["pass"] = std::ranges::all_of(checks, [](const json& v) { return v == true; });
+				return true;
+			} });
+			// SpellStacking.cpp: Mark of the Wild and Gift of the Wild (one family, identical flags, both helpful) never stack;
+			// the later one replaces the earlier, and Thorns stays beside it.
+			g_steps.push_back({ "wow_buff_stacking", 20, [](double t, json& r) {
+				static constexpr std::uint32_t kSpells[] = { 9885, 9910, 21850, 21849, 9884 };   // Gift 1 and Mark 6: weaker than Mark 7
+				if (t == 0) {
+					auto caster = Character::Caster();
+					caster["reagents"]["17026"] = 1;   // Gift's Wild Thornroot (and rank 1's Berries); nothing is consumed
+					caster["reagents"]["17021"] = 1;
+					for (const auto spell : kSpells)
+						Service::Request({ { "op", "resolve" }, { "spell", spell }, { "caster", caster }, { "seed", 1 },
+							{ "target", { { "kind", "self" } } } },
+							[index = g_index, spell](const json& out) { if (index == g_index) g_ctx["out"][std::to_string(spell)] = out; });
+					return false;
+				}
+				if (g_ctx.value("out", json::object()).size() < std::size(kSpells)) return t < 8 ? false : (r = { { "pass", false }, { "error", "no service answer" } }, true);
+				auto present = [] {
+					json ids = json::array();
+					for (const auto& a : Cast::TalentDiagnostics()["auras"])
+						if (a["target"] == RE::PlayerCharacter::GetSingleton()->GetFormID()) ids.push_back(a["spell"]);
+					return ids;
+				};
+				auto has = [](const json& ids, std::uint32_t spell) { return std::ranges::find(ids, json(spell)) != ids.end(); };
+				auto* av = RE::PlayerCharacter::GetSingleton()->AsActorValueOwner();
+				if (!g_ctx.contains("applied_at")) {
+					g_ctx["carry"] = av->GetActorValue(RE::ActorValue::kCarryWeight);
+					g_ctx["rate"] = av->GetActorValue(RE::ActorValue::kMagickaRateMult);
+					for (const auto spell : { 9885u, 9910u, 21850u }) Cast::ApplyForTesting(spell, g_ctx["out"][std::to_string(spell)]);
+					g_ctx["after"] = present();
+					g_ctx["applied_at"] = t;
+					return false;
+				}
+				if (t - g_ctx["applied_at"].get<double>() < 1) return false;   // their carriers land on a later frame
+				if (g_ctx.contains("gift_at")) {   // Gift rank 1 is a party spell: no bounce, but the player keeps their stronger Mark
+					if (t - g_ctx["gift_at"].get<double>() < .5) return false;
+					r = g_ctx["result"];
+					r["after_gift_rank1"] = present();
+					r["pass"] = r["pass"].get<bool>() && has(r["after_gift_rank1"], 9885) && !has(r["after_gift_rank1"], 21849);
+					for (const auto spell : kSpells) Cast::CancelAura(spell);
+					return true;
+				}
+				if (g_ctx.contains("bounced_at")) {   // Spell::CheckCast: Mark rank 6 bounces off the stronger Mark rank 7
+					if (t - g_ctx["bounced_at"].get<double>() < .5) return false;
+					r = g_ctx["result"];
+					r["bounce_error"] = WowUi::Eval("WBTestLastError or ''");
+					r["bounce_text"] = WowUi::Eval("SPELL_FAILED_AURA_BOUNCED or ''");
+					r["after_bounce"] = present();
+					r["pass"] = r["pass"].get<bool>() && r["bounce_error"] == r["bounce_text"] && has(r["after_bounce"], 9885) && !has(r["after_bounce"], 9884);
+					g_ctx["result"] = r;
+					Cast::BeginForTesting(21849, g_ctx["out"]["21849"]);
+					g_ctx["gift_at"] = t;
+					return false;
+				}
+				// Gift's Strength and Spirit reach Skyrim: carry weight and the magicka rate (5a53e64's carriers).
+				r["carry_gain"] = av->GetActorValue(RE::ActorValue::kCarryWeight) - g_ctx["carry"].get<float>();
+				r["magicka_rate_gain"] = av->GetActorValue(RE::ActorValue::kMagickaRateMult) - g_ctx["rate"].get<float>();
+				const json after = g_ctx["after"];
+				Cast::ApplyForTesting(9885, g_ctx["out"]["9885"]);
+				const auto again = present();
+				r.update({ { "stack", g_ctx["out"]["21850"].value("stack", "") }, { "gift_error", g_ctx["out"]["21850"].value("error", "") },
+					{ "after_gift", after }, { "after_mark", again } });
+				r["pass"] = r["carry_gain"].get<float>() > 5 && r["magicka_rate_gain"].get<float>() > 5 && has(after, 21850) && !has(after, 9885) && has(after, 9910) && has(again, 9885) && !has(again, 21850) && has(again, 9910);
+				g_ctx["result"] = r;
+				ObserveCast();
+				Cast::BeginForTesting(9884, g_ctx["out"]["9884"]);   // instant: Complete's checks run now
+				g_ctx["bounced_at"] = t;
+				return false;
+			} });
 			// Pushback: Skyrim hits on you while Wrath is cast (2 s). A hit 0.5 s in sets it back 1 s, but the remaining
 			// time may not exceed the whole cast, so 0.5 s; one at 1.5 s sets it back 0.8 s. The bar's end moves 1.3 s.
-			// The first also shifts her 12 units, as a blow does: only moving herself would interrupt (the user saw every
+			// The first also shifts the player 12 units, as a blow does: only moving the player would interrupt (the user saw every
 			// hit interrupt).
 			g_steps.push_back({ "wow_cast_pushback", 20, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -6640,7 +11089,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					Bridge::SetTarget(nullptr);
 					BookReady();
 					ObserveCast();
-					// Load beside her first; prepare an unobstructed nearby position
+					// Load beside the player first; prepare an unobstructed nearby position
 					// once its frozen skeleton exists, independent of the old camera.
 					const auto placed = player->PlaceObjectAtMe(RE::TESForm::LookupByID<RE::TESNPC>(0x00023ABE), false);
 					auto* wolf = placed ? placed->As<RE::Actor>() : nullptr;
@@ -6748,7 +11197,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (!g_ctx.contains("hit1") && since >= 0.5) {
 					hit();
 					g_ctx["hit1"] = t;
-					auto at = player->GetPosition();   // and the blow shifts her, as Skyrim's do: the cast goes on
+					auto at = player->GetPosition();   // and the blow shifts the player, as Skyrim's do: the cast goes on
 					at.x += 12.0f;
 					player->SetPosition(at, true);
 				}
@@ -6772,8 +11221,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					std::abs(moved - 1.3) < 0.08 && std::abs(moved - r["delayed_ms"].get<double>() / 1000.0) < 0.02 && r["landed"] == true;
 				return finish();
 			} });
-			// Her own movement ends a cast (the user: "if you move on your own in any way, cancelled"): Healing Touch on
-			// her, and a second in a real W key from the runner - "Interrupted" on the bar, no heal.
+			// Their own movement ends a cast (the user: "if you move on your own in any way, cancelled"): Healing Touch on
+			// the player, and a second in a real W key from the runner - "Interrupted" on the bar, no heal.
 			g_steps.push_back({ "wow_cast_walk_interrupts", 14, [](double t, json& r) {
 				auto* av = RE::PlayerCharacter::GetSingleton()->AsActorValueOwner();
 				if (t == 0.0) {
@@ -6816,13 +11265,13 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["bar"] = g_ctx["bar"];
 				r["casting"] = g_ctx["casting"];
 				r["healed"] = av->GetActorValue(RE::ActorValue::kHealth) - g_ctx["hp0"].get<float>();
-				// What 5 s of Skyrim's own regeneration gives back (about 0.7% of her health a second), not a Healing Touch.
+				// What 5 s of Skyrim's own regeneration gives back (about 0.7% of their health a second), not a Healing Touch.
 				r["pass"] = r["bar"] == "Interrupted" && r["casting"] == false &&
 				            r["healed"].get<float>() < std::max(30.0f, 0.06f * av->GetPermanentActorValue(RE::ActorValue::kHealth));
 				Input::SetCursorMode(false);
 				return true;
 			} });
-			// A blow from another only delays it (Unit::InterruptOrDelaySpell): a wolf bites her through Healing Touch; each
+			// A blow from another only delays it (Unit::InterruptOrDelaySpell): a wolf bites the player through Healing Touch; each
 			// bite pushes the bar back, and the cast still goes off.
 			g_steps.push_back({ "wow_cast_bites_delay", 24, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -6851,6 +11300,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     wolf->SetPosition(player->GetPosition()+RE::NiPoint3{std::sin(heading)*100.f,std::cos(heading)*100.f,0},true);
                     wolf->StartCombat(player);
 					g_ctx["fight"] = t;
+					// From full health: while the player regenerates a bite can hide under the regained health (a long-run flake).
+					av->RestoreActorValue(RE::ActorValue::kHealth, 100000.0f);
 					g_ctx["hp"] = av->GetActorValue(RE::ActorValue::kHealth);
 					return false;
 				}
@@ -6858,7 +11309,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     {"ai",wolf->IsAIEnabled()},{"combat",wolf->IsInCombat()},{"wolf_health",wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)},
                     {"player_health",av->GetActorValue(RE::ActorValue::kHealth)},{"distance",wolf->GetPosition().GetDistance(player->GetPosition())},
                     {"known",Progression::Knows(25297)},{"cast",Cast::TalentDiagnostics()}});
-                if (!g_ctx.contains("used")) {   // once it has bitten her, so the next bites fall within the cast
+                if (!g_ctx.contains("used")) {   // once it has bitten the player, so the next bites fall within the cast
 					if (av->GetActorValue(RE::ActorValue::kHealth) >= g_ctx["hp"].get<float>() - 0.5f) {
                         if (t-g_ctx["fight"].get<double>()>10) { r={{"pass",false},{"error","no initial native bite"},{"diagnostic",g_ctx["wait"]}}; wolf->KillImmediate(); wolf->Disable(); return true; }
 						return false;
@@ -6888,7 +11339,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                 r["cast_error"] = WowUi::Eval("WBTestLastError");
                 r["delays"] = WowUi::Eval("__wbDelayed");
 				r["bar_moved"] = std::atof(g_ctx.value("end1", std::string("0")).c_str()) - std::atof(g_ctx.value("end0", std::string("0")).c_str());
-				r["completed"] = GeneralHas("Your Healing Touch heals you");
+				r["completed"] = GeneralHas("Your Healing Touch heals you") || GeneralHas("Your Healing Touch critically heals you");
 				r["pass"] = std::atoi(r["delays"].get<std::string>().c_str()) >= 1 && r["completed"] == true;
 				wolf->KillImmediate();
 				wolf->Disable();
@@ -6908,7 +11359,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["used"] = t;
 					return false;
 				}
-				// Her cast and its swirl, captured in the frame at the moments the client's were (evidence/spellref/
+				// Their cast and its swirl, captured in the frame at the moments the client's were (evidence/spellref/
 				// wow_rejuv_*: Screenshot() timed from CastSpellByName).
 				const double since = t - g_ctx["used"].get<double>();
 				constexpr const char* kAt[] = { "0.15", "0.4", "0.8", "1.5", "3.0" };
@@ -6951,7 +11402,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["teammate"] = best->GetActorRuntimeData().boolBits.all(RE::Actor::BOOL_BITS::kPlayerTeammate);
 					g_ctx["ai"] = best->IsAIEnabled();
 					best->EnableAI(false);
-					best->MoveTo(player);   // beside her, in Healing Touch's 40 yards
+					Teleport(best, player);   // beside the player, in Healing Touch's 40 yards
 					best->GetActorRuntimeData().boolBits.set(RE::Actor::BOOL_BITS::kPlayerTeammate);
 					best->AsActorValueOwner()->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, -40.0f);
 					Bridge::SetTarget(best);
@@ -6961,12 +11412,24 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				auto* friendly = RE::TESForm::LookupByID<RE::Actor>(g_ctx["actor"].get<RE::FormID>());
 				auto  hp = [&] { return friendly->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth); };
 				if (!g_ctx.contains("used")) {
-					if (t < 2.0 || !friendly->Is3DLoaded()) {
+					if (t < 2.0 || !friendly->Is3DLoaded() || t - g_ctx.value("los_at", 0.0) < 0.5) {
 						return false;   // the last cast's global cooldown; the move
+					}
+					// MoveTo can leave him inside the player or behind cover, depending on where earlier steps left the player: in sight
+					// first, around their three yards out.
+					bool unused = true;
+					if (const int tries = g_ctx.value("los_tries", 0); tries < 8 && !player->HasLineOfSight(friendly, unused)) {
+						const float angle = player->GetAngleZ() + tries * RE::NI_PI / 4;
+						const auto  at = player->GetPosition();
+						friendly->SetPosition({ at.x + std::sin(angle) * 192.0f, at.y + std::cos(angle) * 192.0f, at.z }, true);
+						friendly->Update3DPosition(true);   // AI off: the skeleton stays put unless told
+						g_ctx["los_tries"] = tries + 1;
+						g_ctx["los_at"] = t;
+						return false;
 					}
 					g_ctx["hp0"] = hp();
 					g_ctx["reaction"] = WowUi::Eval("UnitReaction('player', 'target')");
-					// A retained, known lower rank may still be on her bar after earning the item-book rank.
+					// A retained, known lower rank may still be on their bar after earning the item-book rank.
 					g_ctx["slot"] = WowUi::Eval("__WBSlotOf(25297)");
 					Cast::Use(25297);
 					g_ctx["used"] = t;
@@ -6981,6 +11444,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["error"] = WowUi::Eval("WBTestLastError");
 				r["starts"] = WowUi::Eval("__wbCastProbe.starts");
 				r["slot"] = g_ctx["slot"];
+				r["los_tries"] = g_ctx.value("los_tries", 0);
 				r["pass"] = r["reaction"] == "5" && r["healed"].get<float>() > 20.0f;
 				if (g_ctx["teammate"].get<bool>()) { friendly->GetActorRuntimeData().boolBits.set(RE::Actor::BOOL_BITS::kPlayerTeammate); }
 				else { friendly->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kPlayerTeammate); }
@@ -6992,7 +11456,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				Cast::ResetForTesting();
 				return true;
 			} });
-			// Auto-attack: AttackTarget on a wolf in reach draws her staff and swings it every 3.7 seconds (Staff of Jordan),
+			// Auto-attack: AttackTarget on a wolf in reach draws their staff and swings it every 3.7 seconds (Staff of Jordan),
 			// each swing rolled by the service and written to the combat log in the client's words; the staff's stance
 			// meanwhile, and still drawn once the attack stops (as the client keeps it: build/wowref melee_*, after_*).
 			g_steps.push_back({ "wow_melee", 20, [](double t, json& r) {
@@ -7029,7 +11493,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					g_ctx["drawn"] = Avatar::Current().weaponsDrawn;
 				}
 				if (since > 2.0 && !g_ctx.contains("snap")) {
-					g_ctx["snap"] = Snap("wow_melee");   // her staff in her hands
+					g_ctx["snap"] = Snap("wow_melee");   // their staff in their hands
 				}
 				if (since < 8.0) {
 					return false;
@@ -7045,15 +11509,15 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				r["drawn"] = g_ctx["drawn"];
 				r["drawn_after"] = Avatar::WeaponsDrawn();
 				const int stance = g_ctx["stance"].get<int>();
-				r["general"] = GeneralHas("You hit Wolf") || GeneralHas("You crit Wolf") || GeneralHas("You miss Wolf");   // and where she reads it
+				r["general"] = GeneralHas("You hit Wolf") || GeneralHas("You crit Wolf") || GeneralHas("You miss Wolf");   // and where the player reads it
 				r["pass"] = r["general"] == true && r["attacking"] == true && r["stopped"] == true && r["swings"].get<int>() >= 2 && r["swings"].get<int>() <= 3 &&
 				            (stance == 28 || stance == 19) && r["drawn"] == true && r["drawn_after"] == true &&
 				            log.find("Wolf") != std::string::npos;
 				wolf->KillImmediate();
 				return true;
 			} });
-			// A wolf bites her: what her hidden body does, and the camera shakes Skyrim asked for (the user: the screen
-			// shook when she was hit; WoW's camera does not, so none is played).
+			// A wolf bites the player: what their hidden body does, and the camera shakes Skyrim asked for (the user: the screen
+			// shook when the player was hit; WoW's camera does not, so none is played).
 			g_steps.push_back({ "wow_hit_camera", 18, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto  health = [&] { return player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth); };
@@ -7080,7 +11544,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					wolf->StartCombat(player);
 					return false;
 				}
-				// The camera's place relative to her feet, frame to frame: the largest jump while bitten, then while staggered.
+				// The camera's place relative to the player's feet, frame to frame: the largest jump while bitten, then while staggered.
 				if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->cameraRoot) {
 					const auto off = cam->cameraRoot->world.translate - player->GetPosition();
 					if (g_ctx.contains("off")) {
@@ -7090,13 +11554,13 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					}
 					g_ctx["off"] = { off.x, off.y, off.z };
 				}
-				g_ctx["low"] = std::min(g_ctx.value("low", health()), health());   // her regeneration may refill a bite by the end
+				g_ctx["low"] = std::min(g_ctx.value("low", health()), health());   // their regeneration may refill a bite by the end
 				if (t < 8.0) {
 					return false;
 				}
 				if (!g_ctx.contains("staggered")) {
 					wolf->KillImmediate();
-					player->SetGraphVariableFloat("staggerMagnitude", 1.0f);   // as a power attack staggers her
+					player->SetGraphVariableFloat("staggerMagnitude", 1.0f);   // as a power attack staggers the player
 					g_ctx["staggered"] = player->NotifyAnimationGraph("staggerStart");
 					return false;
 				}
@@ -7114,8 +11578,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				player->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 10000.0f);
 				return true;
 			} });
-			// A spell put on her bar is kept for the next session, as the server keeps a character's actions: Starfire into
-			// slot 12 is written to her actions file (the suite's own); taking it off again writes that too.
+			// A spell put on their bar is kept for the next session, as the server keeps a character's actions: Starfire into
+			// slot 12 is written to their actions file (the suite's own); taking it off again writes that too.
 			g_steps.push_back({ "wow_action_saved", 5, [](double t, json& r) {
 				const auto file = WowUi::WtfFile("actions-test.lua", true);
 				auto finish = [] {
@@ -7278,7 +11742,11 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				if (t-g_ctx["at"].get<double>() < 3.0) return false;
 				r["cast_bar"]=g_ctx["bar"]; r["cooldown"]=g_ctx["cooldown"];
 				r["mana_before"]=g_ctx["mana0"]; r["mana_min"]=g_ctx["mana_min"]; r["mana_after"]=Cast::Mana();
-				r["landed"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)<g_ctx["hp0"].get<float>();
+				// Landed, or resolved against it (a miss or resist is the WoW roll's: the cast ran to its end with no error);
+				// a 2000-health wolf at their level 2 dodges one Wrath in several suites (October 16).
+				r["resolved"]=WowUi::Eval("__wbCastProbe and __wbCastProbe.event or ''");
+				r["landed"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)<g_ctx["hp0"].get<float>() ||
+					(r["resolved"]=="SPELLCAST_STOP" && WowUi::Eval("WBTestLastError or ''").empty());
 				r["pass"]=r["cast_bar"]=="1" && r["cooldown"]=="Interface\\Cooldown\\UI-Cooldown-Indicator.m2" &&
 					r["landed"]==true && r["mana_min"].get<int>()<r["mana_before"].get<int>();
 				return finish();
@@ -7306,7 +11774,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					return false;
 				}
 				if (Avatar::Current().animation == 11) {
-					g_ctx["shuffled"] = true;   // ShuffleLeft while she turns on the spot
+					g_ctx["shuffled"] = true;   // ShuffleLeft while the player turns on the spot
 				}
 				if (!Settled(g_ctx["seq"], 0.3)) {
 					return false;
@@ -7321,7 +11789,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 			// A real right click on a barrel two yards ahead opens it (Skyrim's container menu, closed again at once: it
 			// stops play). NPC dialogue goes the same way (the Activate key's own path), but no dialogue opens in a
 			// session started from the main menu with coc, not even a forced greeting, so it is not tested here.
-			// The user's scheme: a right click on a hostile unit attacks it (as in WoW); Alt+right click attacks anything she
+			// The user's scheme: a right click on a hostile unit attacks it (as in WoW); Alt+right click attacks anything the player
 			// may strike; Ctrl tapped alone toggles Skyrim's sneak.
 			g_steps.push_back({ "wow_rclick_attack", 20, [](double t, json& r) {
 				if (t == 0.0) {
@@ -7360,7 +11828,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					return false;
 				}
 				if (!g_ctx.contains("alt")) {
-					// What was under her cursor: a WoW frame there takes the click (a step that left one open).
+					// What was under their cursor: a WoW frame there takes the click (a step that left one open).
 					g_ctx["under"] = WowUi::Eval("(function() local f = GetMouseFocus() return f and (f:GetName() or 'unnamed') or 'world' end)()");
 					g_ctx["plain_attacking"] = Melee::Attacking();
 					Melee::Stop();
@@ -7389,6 +11857,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				if (t == 0.0) {
 					ClearCorpses();
+					g_ctx["cursor0"] = Input::Active();   // RunSuite's every-exit cleanup restores it after a timeout
 					Input::SetCursorMode(true);
 					auto* bucket = PlaceAhead(RE::TESForm::LookupByID<RE::TESBoundObject>(0x00012FDF), 110.0f, 110.0f);   // Bucket01
 					g_ctx["ref"] = bucket ? bucket->GetFormID() : 0;
@@ -7414,7 +11883,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 						if (found) break;
 					}
 					if (!found) {
-						if (t<5) return false;
+						if (t-g_ctx.value("spot_at",0.0)<0.6) return false;
+						if (const int spot=g_ctx.value("spot",0); NextPickSpot(bucket,spot)) { g_ctx["spot"]=spot+1; g_ctx["spot_at"]=t; return false; }
 						const auto hit=Picker::PickScreen(x,y);
 						r={{"pass",false},{"error","no pixel picks the bucket"},{"expected_ref",bucket->GetFormID()},
 							{"picked_ref",hit.ref ? hit.ref->GetFormID() : 0},{"pick_layer",hit.layer}};
@@ -7436,7 +11906,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 							{"focus",WowUi::Eval("(function() local f=GetMouseFocus() return f and (f:GetName() or 'unnamed') or 'world' end)()")}};
 						bucket->Disable(); Input::SetCursorMode(false); return true;
 					}
-					// The pointer moves 1.5 yards to its right, on the ground: what she holds goes there.
+					// The pointer moves 1.5 yards to its right, on the ground: what the player holds goes there.
 					auto f = CameraFwd();
 					f.z = 0;
 					f.Unitize();
@@ -7533,13 +12003,23 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     ui("(function() ClearCursor() __WBEquipReturn=nil return 1 end)()");
                     for (auto* form : {a,b}) if (form) {
                         RE::ActorEquipManager::GetSingleton()->UnequipObject(p,form,nullptr,1,nullptr,false,false,false,true);
-                        const int added=p->GetItemCount(form)-g_ctx.value(form==a ? "a0" : "b0",0);
+                        // Only the probe's plain copies leave, never an enchanted, tempered, named or poisoned
+                        // copy of the same base: plain unworn instances first, then bare copies.
+                        int added=p->GetItemCount(form)-g_ctx.value(form==a ? "a0" : "b0",0);
+                        for (auto* list : UnwornInstances(p,form,InstanceIdentity(nullptr))) if (added>0) {
+                            const int n=std::min(added,list->GetCount());
+                            p->RemoveItem(form,n,RE::ITEM_REMOVE_REASON::kRemove,list,nullptr); added-=n;
+                        }
                         if (added>0) p->RemoveItem(form,added,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
                     }
                     for (bool left : {false,true}) {
-                        auto* old=RE::TESForm::LookupByID(g_ctx.value(left ? "left" : "right",0u));
+                        const auto hand=g_ctx.value(left ? "left_instance" : "right_instance",json::object());
+                        auto* old=RE::TESForm::LookupByID(hand.value("form",0u));
                         auto* slot=RE::BGSDefaultObjectManager::GetSingleton()->GetObject<RE::BGSEquipSlot>(left ? RE::DEFAULT_OBJECT::kLeftHandEquip : RE::DEFAULT_OBJECT::kRightHandEquip);
-                        if (auto* form=old ? old->As<RE::TESBoundObject>() : nullptr) RE::ActorEquipManager::GetSingleton()->EquipObject(p,form,nullptr,1,left ? slot : nullptr,false,true,false);
+                        if (auto* form=old ? old->As<RE::TESBoundObject>() : nullptr) { // the same copy, not any copy of its base
+                            const auto lists=UnwornInstances(p,form,hand.value("identity",json()));
+                            RE::ActorEquipManager::GetSingleton()->EquipObject(p,form,lists.empty() ? nullptr : lists.front(),1,left ? slot : nullptr,false,true,false);
+                        }
                         else if (auto* spell=old ? old->As<RE::SpellItem>() : nullptr) RE::ActorEquipManager::GetSingleton()->EquipSpell(p,spell,slot);
                     }
                 };
@@ -7547,10 +12027,21 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                     Melee::Stop(); Forms::Leave();
                     if (!a || !b) { r={{"pass",false},{"error","missing equipment fixtures"}}; return true; }
                     g_ctx={{"a0",p->GetItemCount(a)},{"b0",p->GetItemCount(b)},{"stage",0},
-                        {"left",p->GetEquippedObject(true) ? p->GetEquippedObject(true)->GetFormID() : 0},
-                        {"right",p->GetEquippedObject(false) ? p->GetEquippedObject(false)->GetFormID() : 0}};
+                        {"left_instance",HandInstance(p,true)},{"right_instance",HandInstance(p,false)},
+                        {"a_instances",InstanceCounts(p,a)},{"b_instances",InstanceCounts(p,b)}};
                     ui("(function() ClearCursor() __WBEquipReturn={} return 1 end)()");
                     p->AddObjectToContainer(a,nullptr,1,nullptr); p->AddObjectToContainer(b,nullptr,1,nullptr); return false;
+                }
+                if (g_ctx["stage"]==3) { // verified baseline: the exact copies back in hand and in the bags
+                    const bool hands=HandInstance(p,false)==g_ctx["right_instance"] && HandInstance(p,true)==g_ctx["left_instance"];
+                    const bool carried=InstanceCounts(p,a)==g_ctx["a_instances"] && InstanceCounts(p,b)==g_ctx["b_instances"];
+                    if ((!hands || !carried) && t-g_ctx["restore_at"].get<double>()<2) return false;
+                    r=g_ctx["result"]; r["hands_restored"]=hands; r["instances_restored"]=carried;
+                    if (!hands || !carried) r["restore_evidence"]={{"right",HandInstance(p,false)},{"left",HandInstance(p,true)},
+                        {"a",InstanceCounts(p,a)},{"b",InstanceCounts(p,b)},{"expected",{{"right",g_ctx["right_instance"]},
+                        {"left",g_ctx["left_instance"]},{"a",g_ctx["a_instances"]},{"b",g_ctx["b_instances"]}}}};
+                    r["pass"]=r.value("pass",false) && hands && carried;
+                    return true;
                 }
                 ProbeWait("wow_equipment_return",t,{{"stage",g_ctx["stage"]},{"native",p->GetEquippedObject(false) ? p->GetEquippedObject(false)->GetFormID() : 0},
                     {"client",ui("(function() local rows={} for pos,i in pairs(__WB.bagItems) do if i.form==0x12EB7 or i.form==0x13983 then tinsert(rows,i.form..':'..pos..':'..i.count..':'..tostring(i.bagCount)) end end return table.concat(rows,',') end)()")}});
@@ -7574,7 +12065,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                 r={{"returned_to_source",ui("__WB.bagItems[__WBEquipReturn.from] and __WB.bagItems[__WBEquipReturn.from].form==0x12EB7 and __WB.bagItems[__WBEquipReturn.from].bagCount>0 and 1 or 0")=="1"},
                     {"counts_unchanged",p->GetItemCount(a)==g_ctx["a0"].get<int>()+1 && p->GetItemCount(b)==g_ctx["b0"].get<int>()+1}};
                 r["pass"]=r["returned_to_source"]==true && r["counts_unchanged"]==true;
-                UiPass::RequestCapture("wow_equipment_return"); cleanup(); return true;
+                UiPass::RequestCapture("wow_equipment_return"); cleanup();
+                g_ctx["result"]=r; g_ctx["restore_at"]=t; g_ctx["stage"]=3; return false;
             } });
             g_steps.push_back({ "wow_equipment_full", 100, [](double t,json& r) {
                 auto* player=RE::PlayerCharacter::GetSingleton();
@@ -8346,6 +12838,12 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					barrel->extraList.SetOwner(nullptr);
 					barrel->AddObjectToContainer(potion,nullptr,3,nullptr);
 					barrel->AddObjectToContainer(gold,nullptr,7,nullptr);
+					// Nameless records Skyrim's menus hide (a draugr's hair, a fork): never listed as "<Missing Name>".
+					g_ctx["nameless"]=json::array();
+					for (const RE::FormID id : {0x3BC83u,0x104B3Fu})
+						if (auto* form=RE::TESForm::LookupByID<RE::TESBoundObject>(id); form && !*form->GetName()) {
+							barrel->AddObjectToContainer(form,nullptr,1,nullptr); g_ctx["nameless"].push_back(id);
+						}
 					g_ctx["ref"]=barrel->GetFormID();
 					g_ctx["potion0"]=player->GetItemCount(potion); g_ctx["gold0"]=player->GetItemCount(gold);
 					WowUi::Eval("(function() __WBLootTest={auto=GetCVar('autoLootDefault')} SetCVar('autoLootDefault',0) return 1 end)()");
@@ -8375,6 +12873,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 							{"health",wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)},
 							{"distance",wolf->GetPosition().GetDistance(player->GetPosition())}, {"potions",count(wolf,potion)}};
 					}
+					if (g_ctx.contains("r_route")) state["r_route"]=g_ctx["r_route"];
 					g_ctx["waiting"]=state; g_ctx["diagnose_at"]=t+5;
 					logger::info("selftest: wow_loot waiting {} {}",g_ctx["stage_name"].get<std::string>(),state.dump());
 				}
@@ -8395,6 +12894,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					  end
 					  return p and g and GetNumLootItems()==2 and 1 or 0
 					end)())")=="1";
+					g_ctx["nameless_hidden"]=g_ctx["nameless"].size()==2 && WowUi::Eval("(function() for _,i in pairs(__WB.lootItems) do "
+						"if i.form==0x3BC83 or i.form==0x104B3F then return 0 end end return 1 end)()")=="1";
 					UiPass::RequestCapture("wow_loot");
 					WowUi::Eval("(function() LootSlot(__WBLootTest.potion) return 1 end)()");
 					advance(2,"potion_transfer"); return false;
@@ -8412,7 +12913,8 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				}
 				if (stage==4) {
 					if (WowUi::Eval("LootFrame:IsShown()")!="1") return false;
-					WowUi::Eval("(function() __WBLootAll() return 1 end)()");
+					g_ctx["r_route"]=WowUi::Eval("GetBindingAction('R')..'/'..tostring(GetBindingKey('WBLOOTALL'))..'/'..tostring(__WoweeBindingScripts and __WoweeBindingScripts.WBLOOTALL~=nil)");
+					Action("key:r");   // Loot All's key in the loot window, through their real keyboard path
 					advance(5,"gold_transfer_and_close"); return false;
 				}
 				if (stage==5) {
@@ -8431,6 +12933,15 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				}
 				if (stage==7) {
 					if (RE::UI::GetSingleton()->IsMenuOpen(RE::ContainerMenu::MENU_NAME)) return false;
+					// Toggle Auto Loot's key, Y, twice: on, then back off.
+					if (const int presses=g_ctx.value("toggle_presses",0); presses<2 || !Settled(g_ctx["toggle_seq"])) {
+						if (presses>0 && !Settled(g_ctx["toggle_seq"])) return false;
+						if (presses==0) { g_ctx["cursor_mode"]=Input::Active(); Input::SetCursorMode(true); }   // WoW's keys, as the player plays
+						if (presses==1) g_ctx["toggled_on"]=WowUi::Eval("GetCVar('autoLootDefault')")=="1";
+						g_ctx["toggle_seq"]=Action("key:y"); g_ctx["toggle_presses"]=presses+1; return false;
+					}
+					g_ctx["toggled_off"]=WowUi::Eval("GetCVar('autoLootDefault')")=="0";
+					Input::SetCursorMode(g_ctx["cursor_mode"].get<bool>());
 					auto* wolf=SpawnWolf(180.f,-60.f);
 					if (!wolf) { r={{"pass",false},{"error","no corpse fixture"}}; return true; }
 					g_ctx["corpse"]=wolf->GetFormID(); advance(8,"corpse_3d"); return false;
@@ -8467,8 +12978,16 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					advance(11,"corpse_close"); return false;
 				}
 				if (RE::UI::GetSingleton()->IsMenuOpen(RE::ContainerMenu::MENU_NAME)) return false;
-				for (const char* field : {"replaced","listed","take_one","close_kept_gold","all_gold","owned_mark","corpse_backend","corpse_listed"}) r[field]=g_ctx[field];
-				r["pass"]=r["replaced"]==true && r["listed"]==true && r["take_one"]==true && r["close_kept_gold"]==true && r["all_gold"]==true && r["owned_mark"]==true && r["corpse_backend"]==true && r["corpse_listed"]==true;
+				// The client's session closed too (its __WBLootClosed is a queued task after the menu's hide): the next step's
+				// container must not find the loot window still closing (wow_rclick_open after it, October 16). On the
+				// close's own clock: the stage's began 5 s earlier and its cap had already passed (a second time).
+				if (!g_ctx.contains("menu_closed_at")) g_ctx["menu_closed_at"]=t;
+				const auto clientLoot=WowUi::Eval("(function() return 'session='..tostring(__WB.lootSession or 0)..' closing='..tostring(__WB.lootClosing or false)..' shown='..tostring(LootFrame:IsShown() or 0) end)()");
+				const bool clientOpen=clientLoot.find("session=0")==std::string::npos || clientLoot.find("closing=true")!=std::string::npos || clientLoot.find("shown=1")!=std::string::npos;
+				if (clientOpen && t-g_ctx["menu_closed_at"].get<double>()<5) return false;
+				logger::info("selftest: wow_loot client at finish: {} ({:.2f}s after the menu closed)", clientLoot, t-g_ctx["menu_closed_at"].get<double>());
+				for (const char* field : {"replaced","listed","nameless_hidden","take_one","close_kept_gold","all_gold","owned_mark","toggled_on","toggled_off","corpse_backend","corpse_listed"}) r[field]=g_ctx[field];
+				r["pass"]=r["replaced"]==true && r["listed"]==true && r["nameless_hidden"]==true && r["toggled_on"]==true && r["toggled_off"]==true && r["take_one"]==true && r["close_kept_gold"]==true && r["all_gold"]==true && r["owned_mark"]==true && r["corpse_backend"]==true && r["corpse_listed"]==true;
 				barrel->Disable();
 				RE::TESForm::LookupByID<RE::Actor>(g_ctx["corpse"].get<RE::FormID>())->Disable();
 				player->RemoveItem(potion,3,RE::ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
@@ -8511,14 +13030,22 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
                         if (found) break;
                     }
 					if (!found) {
-						if (t < 5.0) {
-							return false;
-						}
+						if (t - g_ctx.value("spot_at", 0.0) < 0.6) return false;
+						if (const int spot = g_ctx.value("spot", 0); NextPickSpot(barrel, spot)) { g_ctx["spot"] = spot + 1; g_ctx["spot_at"] = t; return false; }
 						r["error"] = "no pixel picks the barrel";
 						r["pass"] = false;
 						return true;
 					}
+					// Nothing of the WoW interface under the click: late in a suite a panel or a remembered mouse focus
+					// took the right-click itself (the crosshair found nothing, October 16).
+					// A carried bag item or pending purchase turns the first right-click into its cancel (WowUi's
+					// cancelBag): record what an earlier step left on the cursor, then start clean as a player would.
+					g_ctx["carried"] = WowUi::Eval("(function() local b=__WB.bagHeld local m=__WB.merchantCursor return (b and ('bag:'..tostring(b.key)..'x'..tostring(b.count)) or '')..(m and (' merchant:'..tostring(m.key)) or '')..(CursorHasItem() and ' cursor-item' or '')..(CursorHasSpell() and ' cursor-spell' or '') end)()");
+					WowUi::Run("ClearCursor() CloseAllWindows() CloseAllBags() CloseDropDownMenus() if GameTooltip then GameTooltip:Hide() end");
 					Input::SetCursor(x, y);
+					g_ctx["pixel"] = { x, y };
+					g_ctx["over_ui"] = WowUi::PointerOverInterface();
+					{ const auto b = Input::MouseButtons(); g_ctx["buttons"] = { b.left, b.right, b.middle }; }
 					MenusOpened().clear();
 					g_ctx["seq"] = Action("rclick");
 					return false;
@@ -8528,12 +13055,26 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 					auto menu = ui->GetMenu<RE::ContainerMenu>();
 					g_ctx["replaced"] = menu && menu->uiMovie && !menu->uiMovie->GetVisible() && !menu->PausesGame() &&
 						WowUi::Eval("LootFrame:IsShown()") == "1";
+					// Evidence for a suite-only failure: what the click found (menu, crosshair pick, the client's loot session).
+					auto* pick = RE::CrosshairPickData::GetSingleton();
+					const auto target = pick ? pick->target.get() : RE::NiPointer<RE::TESObjectREFR>{};
+					g_ctx["click"] = { { "container_menu", ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME) }, { "menu_object", menu != nullptr },
+						{ "movie_visible", menu && menu->uiMovie && menu->uiMovie->GetVisible() }, { "pauses", menu && menu->PausesGame() },
+						{ "crosshair", target ? std::format("{:08X}", target->GetFormID()) : "none" }, { "barrel", std::format("{:08X}", barrel->GetFormID()) },
+						{ "loot", WowUi::Eval("(function() return 'session='..tostring(__WB.lootSession or 0)..' shown='..tostring(LootFrame:IsShown() or 0)..' closing='..tostring(__WB.lootClosing or false) end)()") },
+						{ "cursor", { Input::CursorMode(), Input::Active() } }, { "pixel", g_ctx.value("pixel", json()) },
+						{ "carried_before", g_ctx.value("carried", "") }, { "over_ui_before", g_ctx.value("over_ui", false) },
+						{ "over_ui_now", WowUi::PointerOverInterface() }, { "buttons_before", g_ctx.value("buttons", json()) } };
+					// Late in a long suite the container can open more than a second after the click (it did twice).
+					if (!g_ctx.contains("clicked_at")) g_ctx["clicked_at"] = t;
+					if (g_ctx["replaced"] != true && t - g_ctx["clicked_at"].get<double>() < 3) return false;
 					WowUi::Eval("(function() HideUIPanel(LootFrame) return 1 end)()");
 					g_ctx["closed"] = t;
 					return false;
 				}
 				if (ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME)) return false;
 				r["loot_frame_opened"] = g_ctx["replaced"];
+				r["click"] = g_ctx.value("click", json());
 				r["container_closed"] = true;
 				r["pass"] = r["loot_frame_opened"] == true;
 				barrel->Disable();
@@ -8541,7 +13082,7 @@ return __WB.bagHeld and __WB.bagHeld.count==2 and 1 or 0 end)())");
 				return true;
 			} });
 			// Map probes close Skyrim's paused map through the menu observer's UI task.
-			// Her frame's right-click menu offers Unlock Frame, then Lock Frame (the user's request), kept as WBUnlockedFrames.
+			// Their frame's right-click menu offers Unlock Frame, then Lock Frame (the user's request), kept as WBUnlockedFrames.
 			// Chat lines fade, and the up arrow brings them back as the client's does (the user: once faded, the arrows did
 			// nothing). Its time shortened to see it fade; captured faded, then after a real click on the arrow.
 			g_steps.push_back({ "wow_chat_scroll", 15, [](double t, json& r) {
@@ -8753,6 +13294,163 @@ return 1 end)())");
 				r["pass"] = r["last"].get<std::string>().find(g_ctx["name"].get<std::string>() + " says: Watch the skies") != std::string::npos;
 				return true;
 			} });
+			// Speech over the speaker (wowapi_bubbles.lua): a frozen guard ahead says a line through Skyrim's subtitles; the
+			// client's chat bubble shows it at the guard's bubble point (0.7 yards over its model, as its nameplate row
+			// carries it), follows the guard across the screen, is captured (wow_npc_bubble), holds for its time (2 s and
+			// 0.75 s a word) and fades; with Show Chat Bubbles off the next line reaches chat alone.
+			g_steps.push_back({ "wow_npc_bubble", 40, [](double t, json& r) {
+				static constexpr const char* kLine = "Well met, traveler. The roads are dangerous these days.";   // 9 words: 8.75 s
+				static constexpr const char* kQuiet = "Mind your step.";
+				auto* subtitles = RE::SubtitleManager::GetSingleton();
+				auto next = [&](int n) { g_ctx["stage"] = n; g_ctx["at"] = t; };
+				auto unsay = [&] {
+					if (!subtitles) return;
+					RE::BSSpinLockGuard guard(subtitles->lock);
+					auto& lines = subtitles->subtitles;
+					for (auto it = lines.begin(); it != lines.end();) {
+						const std::string_view text(it->subtitle.c_str() ? it->subtitle.c_str() : "");
+						it = text == kLine || text == kQuiet ? lines.erase(it) : it + 1;
+					}
+				};
+				auto say = [&](RE::Actor* a_actor, const char* a_text) {
+					RE::SubtitleInfo line;
+					line.speaker = a_actor->CreateRefHandle();
+					line.subtitle = a_text;
+					line.targetDistance = 100.0f;
+					RE::BSSpinLockGuard guard(subtitles->lock);
+					subtitles->subtitles.push_back(line);
+				};
+				auto finish = [&](const char* error) {
+					unsay();
+					if (g_ctx.contains("actor"))
+						if (auto* a = RE::TESForm::LookupByID<RE::Actor>(g_ctx["actor"].get<RE::FormID>())) a->Disable();
+					WowUi::Run(std::format("SetCVar('ChatBubbles', '{}')", g_ctx.value("cvar", std::string("1")) == "0" ? 0 : 1));
+					r = { { "pass", error == nullptr }, { "checks", g_ctx.value("checks", json::object()) },
+						{ "wait", g_ctx.value("wait", json()) }, { "captures", json::array({ "wow_npc_bubble" }) } };
+					for (const auto& [key, ok] : r["checks"].items()) if (ok != true) r["pass"] = false;
+					if (error) r["error"] = error;
+					return true;
+				};
+				if (t > 36) return finish("bubble stage did not settle");
+				if (t == 0.0) {
+					g_ctx["cvar"] = WowUi::Eval("GetCVar('ChatBubbles')");   // before any finish restores it
+					if (!subtitles) return finish("no subtitle manager");
+					WowUi::Run("SetCVar('ChatBubbles', '1')");
+					auto* guard = SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0xAA8FC), 350.0f, 160.0f);   // EncGuardImperialM05MaleGuard
+					if (!guard) return finish("could not place a guard");
+					guard->EnableAI(false);
+					g_ctx["actor"] = guard->GetFormID(); g_ctx["checks"] = json::object();
+					next(0); return false;
+				}
+				auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_ctx["actor"].get<RE::FormID>());
+				if (!actor) return finish("the guard disappeared");
+				const auto id = actor->GetFormID();
+				const int stage = g_ctx["stage"];
+				const double since = t - g_ctx["at"].get<double>();
+				auto& checks = g_ctx["checks"];
+				const auto row = [&] {
+					return WowUi::Eval(std::format("(function() for _,u in ipairs(__WB.nameplates and __WB.nameplates.units or {{}}) do "
+						"if u.guid=={} and u.bx then return string.format('%.6f %.6f',u.bx,u.by) end end return '' end)()", id));
+				};
+				// The bubble's text stands on the row's point, which is the guard's own bubble point as projected here.
+				const auto placed = [&] {
+					const auto [w, h] = RE::BSGraphics::Renderer::GetScreenSize();
+					float x = 0, y = 0;
+					if (!w || !h || !Picker::WorldToScreen(actor->GetPosition() + RE::NiPoint3{ 0, 0, actor->GetHeight() + 0.7f * Avatar::kUnitsPerYard }, x, y))
+						return std::string("off screen");
+					return WowUi::Eval(std::format("(function() local f=__WBChatBubbleFrame({0}) local u "
+						"for _,v in ipairs(__WB.nameplates.units) do if v.guid=={0} then u=v end end "
+						"if not f or not f:IsShown() or not u or not u.bx then return 'no bubble or row' end "
+						"if math.abs(u.bx-{1})>=0.01 or math.abs(u.by-{2})>=0.01 then return 'row differs from the projection' end "
+						"local w,h=__WBViewportSize() "
+						"if math.abs((f.text:GetLeft()+f.text:GetWidth()/2)/w-u.bx)>=0.002 or math.abs(1-f.text:GetBottom()/h-u.by)>=0.002 then "
+						"return 'bubble differs from its row' end return 1 end)()", id, x / w, y / h));
+				};
+				const auto shown = [&](const char* a_text) {
+					return WowUi::Eval(std::format("(function() local f=__WBChatBubbleFrame({}) return f and f:IsShown() and f.text:GetText()=={} "
+						"and f:GetAlpha()==1 and 1 or 0 end)()", id, LuaQuote(a_text))) == "1";
+				};
+				const auto lastChat = [] {   // the last few lines: other chatter may follow theirs
+					return WowUi::Eval("(function() local n,t=ChatFrame1:GetNumMessages(),'' for i=math.max(1,n-5),n do "
+						"t=t..(ChatFrame1:GetMessageInfo(i) or '')..'\\n' end return t end)()");
+				};
+				if (stage == 0) {   // loaded, on screen and in sight: its nameplate row has a bubble point
+					ProbeWait("wow_npc_bubble", t, { { "gate", "row" }, { "actor", id }, { "loaded", actor->Is3DLoaded() }, { "row", row() } });
+					if (actor->Is3DLoaded() && !g_ctx.contains("placed")) {
+						// Ahead of the CAMERA first (the row needs him on screen; in cursor mode the view and the player's
+						// heading differ - 3 of 5 suites lost him), facing it, at the player's ground height.
+						if (auto* cam = RE::Main::WorldRootCamera()) {
+							const auto& m = cam->world.rotate;
+							RE::NiPoint3 fwd{ m.entry[0][0], m.entry[1][0], 0.f }; fwd.Unitize();
+							actor->SetPosition(RE::NiPoint3{ cam->world.translate.x, cam->world.translate.y, RE::PlayerCharacter::GetSingleton()->GetPosition().z } + fwd * 420.f, true);
+							actor->SetAngle({ 0.f, 0.f, std::atan2(-fwd.x, -fwd.y) });
+							g_ctx["placed"] = true;
+						} else g_ctx["placed"] = false;
+						logger::info("selftest: wow_npc_bubble guard placed ahead of the camera {}", g_ctx["placed"].get<bool>());
+						g_ctx["at"] = t; return false;
+					}
+					if (actor->Is3DLoaded() && row().empty() && since > 4 && !g_ctx.contains("placed2")) {
+						// Still no row: the player's heading, closer and to both sides, then behind (a wall ahead in Riverwood, once)
+						g_ctx["placed2"] = PlaceInSight(actor, { { 350.f, 160.f }, { 350.f, -160.f }, { 420.f, 0.f }, { 260.f, 90.f },
+							{ 200.f, -200.f }, { 200.f, 200.f }, { -250.f, 0.f }, { 150.f, 0.f } });
+						logger::info("selftest: wow_npc_bubble guard placed in sight {}", g_ctx["placed2"].get<bool>());
+						g_ctx["at"] = t; return false;
+					}
+					if (!actor->Is3DLoaded() || row().empty() || since < 1) {
+						if (since > 10) return finish("the guard never stood on screen in sight");
+						return false;
+					}
+					say(actor, kLine); g_ctx["said"] = t; next(1); return false;
+				}
+				if (stage == 1) {
+					if (since < 0.5) return false;
+					unsay();
+					g_ctx["placed"] = placed();
+					ProbeWait("wow_npc_bubble", t, { { "gate", "placed" }, { "placed", g_ctx["placed"] }, { "row", row() } });
+					if (g_ctx["placed"] != "1" && since < 3) return false;
+					checks["bubble_shows_line"] = shown(kLine);
+					checks["chat_line"] = lastChat().find(std::string(actor->GetDisplayFullName()) + " says: Well met") != std::string::npos;
+					checks["at_its_point"] = g_ctx["placed"] == "1";
+					g_ctx["row0"] = row();
+					const auto forward = CameraFwd(); RE::NiPoint3 right{ forward.y, -forward.x, 0 }; right.Unitize();
+					actor->SetPosition(actor->GetPosition() + right * 100.f, true);
+					actor->Update3DPosition(true);
+					next(2); return false;
+				}
+				if (stage == 2) {
+					if (since < 0.5) return false;
+					const auto now = row();
+					float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+					const bool moved = std::sscanf(g_ctx["row0"].get<std::string>().c_str(), "%f %f", &x0, &y0) == 2 &&
+						std::sscanf(now.c_str(), "%f %f", &x1, &y1) == 2 && std::abs(x1 - x0) + std::abs(y1 - y0) > 0.005f;
+					g_ctx["placed"] = placed();
+					ProbeWait("wow_npc_bubble", t, { { "gate", "follow" }, { "placed", g_ctx["placed"] }, { "row0", g_ctx["row0"] }, { "row", now } });
+					if ((!moved || g_ctx["placed"] != "1") && since < 3) return false;
+					checks["follows_the_guard"] = moved && g_ctx["placed"] == "1";
+					UiPass::RequestCapture("wow_npc_bubble");
+					next(3); return false;
+				}
+				if (stage == 3) {
+					if (!UiPass::TakeCapture("wow_npc_bubble").done) return false;
+					next(4); return false;
+				}
+				const double said = t - g_ctx["said"].get<double>();
+				if (stage == 4) {   // its time: 2 s + 0.75 s a word, then a quarter second, then the fade
+					if (said < 8.3) return false;
+					checks["held_for_its_time"] = shown(kLine);
+					next(5); return false;
+				}
+				if (stage == 5) {
+					if (said < 9.8) return false;
+					checks["fades_after_its_time"] = WowUi::Eval(std::format("__WBChatBubbleFrame({}) and 0 or 1", id)) == "1";
+					WowUi::Run("SetCVar('ChatBubbles', '0')");
+					say(actor, kQuiet); next(6); return false;
+				}
+				if (since < 0.5) return false;
+				checks["bubbles_off_chat_only"] = WowUi::Eval(std::format("__WBChatBubbleFrame({}) and 0 or 1", id)) == "1" &&
+					lastChat().find(kQuiet) != std::string::npos;
+				return finish(nullptr);
+			} });
 			// Visual fidelity: unchanged client handlers, inherited talent regions,
 			// live clock atlas and captures for reviewing the glyph origin on D3D11.
 			g_steps.push_back({ "wow_fidelity_layout", 15, [](double t, json& r) {
@@ -8950,6 +13648,10 @@ return 1 end)())");
 			// Shift+Tab opens Skyrim's Tab menu (the user's choice).
 			g_steps.push_back({ "wow_shift_tab", 15, [](double t, json& r) {
 				auto* ui = RE::UI::GetSingleton();
+				if (Config::Get().testSteamOverlay) {   // its Shift+Tab would open Steam's overlay and pause the game (D4)
+					r = { { "pass", false }, { "error", "Steam's overlay is on for Skyrim and takes Shift+Tab (turn it off: decision D4)" } };
+					return true;
+				}
 				if (!g_ctx.contains("seq")) {
 					if (t < 1.0) {
 						return false;
@@ -8998,7 +13700,7 @@ return 1 end)())");
 				}
 				r = g_ctx;
 				r["target_after"] = WowUi::Eval("UnitExists('target')");
-				r["skyrim_menu"] = ui->IsMenuOpen(RE::JournalMenu::MENU_NAME);
+				r["skyrim_menu"] = ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) || MenusOpened().contains("Journal Menu");   // or closed by the guard
 				r["wow_game_menu"] = WowUi::Eval("GameMenuFrame:IsVisible()");
 				r["pass"] = r["target_after"] == "nil" && r["skyrim_menu"] == false && r["wow_game_menu"] != "1";
 				Bridge::SetTarget(nullptr);
@@ -9025,7 +13727,7 @@ return 1 end)())");
 				r["pass"] = r["left"].get<float>() > 30.0f;
 				return true;
 			} });
-			// Her model replaces the Skyrim body whatever the player does: no geometry of it is drawn while running forward
+			// Their model replaces the Skyrim body whatever the player does: no geometry of it is drawn while running forward
 			// or back (the user saw it come back while W was held).
 			g_steps.push_back({ "wow_body_hidden_moving", 15, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -9049,7 +13751,7 @@ return 1 end)())");
 				g_ctx["frames"] = g_ctx["frames"].get<int>() + 1;
 				g_ctx["shown_frames"] = g_ctx["shown_frames"].get<int>() + (shown > 0);
 				if (const auto pose = Avatar::Current(); pose.animation == 5 && pose.speed > g_ctx.value("run", json::array({ 0.0f, 0.0f }))[0].get<float>()) {
-					g_ctx["run"] = { pose.speed, pose.rate };   // her run at its fastest: Skyrim's speed, and the rate WoW's Run plays at
+					g_ctx["run"] = { pose.speed, pose.rate };   // their run at its fastest: Skyrim's speed, and the rate WoW's Run plays at
 				} else if (pose.animation == 13) {
 					g_ctx["back"] = std::max(g_ctx.value("back", 0.0f), pose.speed);   // backing away
 				}
@@ -9093,7 +13795,7 @@ return 1 end)())");
 			} });
 			g_steps.push_back({ "wow_rmb_steer", 15, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
-				if (t == 0.0) {   // her cursor over the world above her, not a frame an earlier step left it on
+				if (t == 0.0) {   // their cursor over the world above the player, not a frame an earlier step left it on
 					Input::SetCursorMode(true);
 					Input::SetCursor(1280.0f, 400.0f);
 					return false;
@@ -9197,6 +13899,11 @@ return 1 end)())");
 						return false;
 					}
 					if (!g_ctx.contains("targeted")) {
+						// Facing it: the step before (wow_cast_behind) leaves the player turned away, and the wolf stands by the
+						// camera's heading; a cast refused for facing recorded only "no debuff" in two suites (October 16).
+						const auto to = wolf->GetPosition() - player->GetPosition();
+						player->SetAngle({ 0.f, 0.f, std::atan2(to.x, to.y) });
+						Cast::ResetForTesting(); ObserveCast();
 						Bridge::SetTarget(wolf);
 						g_ctx["targeted"] = t;
 						return false;
@@ -9211,6 +13918,8 @@ return 1 end)())");
 				const double since = t - g_ctx["used"].get<double>();
 				const auto   pos = wolf->GetPosition();
 				if (since >= 2.0 && !g_ctx.contains("attack")) {
+					g_ctx["cast"] = { { "starts", WowUi::Eval("__wbCastProbe and __wbCastProbe.starts or -1") },
+						{ "last_error", WowUi::Eval("WBTestLastError or ''") }, { "event", WowUi::Eval("__wbCastProbe and __wbCastProbe.event or ''") } };
 					g_ctx["debuff"] = WowUi::Eval("UnitDebuff('target', 1)");
 					g_ctx["speed_mult"] = wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeedMult);
 					g_ctx["p1"] = { pos.x, pos.y };
@@ -9228,6 +13937,7 @@ return 1 end)())");
 				const float moved = RE::NiPoint3{ pos.x - g_ctx["p1"][0].get<float>(), pos.y - g_ctx["p1"][1].get<float>(), 0 }.Length();
 				r["tick_in_general"] = GeneralHas("from your Entangling Roots");   // "Wolf suffers N Nature damage from your ..."
 				r["debuff"] = g_ctx.value("debuff", "");
+				r["cast"] = g_ctx.value("cast", json());
 				r["speed_mult"] = g_ctx["speed_mult"];
 				r["distance"] = g_ctx["d1"];
 				r["in_combat"] = wolf->IsInCombat();
@@ -9238,8 +13948,8 @@ return 1 end)())");
 				Bridge::SetTarget(nullptr);
 				return true;
 			} });
-			// Her buff row and its tooltips: Rejuvenation (a WoW heal over time) and Oakflesh (Skyrim's own spell, cast on
-			// her) each show an icon; resting the pointer on one shows its name and words - the WoW aura's text, Skyrim's.
+			// Their buff row and its tooltips: Rejuvenation (a WoW heal over time) and Oakflesh (Skyrim's own spell, cast on
+			// the player) each show an icon; resting the pointer on one shows its name and words - the WoW aura's text, Skyrim's.
 			g_steps.push_back({ "wow_buff_tooltips", 20, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				const float h = static_cast<float>(UiPass::GetInfo().height);
@@ -9332,7 +14042,7 @@ return 1 end)())");
 				Input::SetCursorMode(false);
 				return true;
 			} });
-			// Her caster-form book (service: caster-book). Each casts as her bar would and checks what Skyrim shows.
+			// Their caster-form book (service: caster-book). Each casts as their bar would and checks what Skyrim shows.
 			// Starfire: a hostile wolf ahead is hurt after its cast.
 			g_steps.push_back({ "wow_book_starfire", 12, [](double t, json& r) {
 				if (t == 0.0) {
@@ -9371,7 +14081,7 @@ return 1 end)())");
 				wolf->Disable();
 				return true;
 			} });
-			// Regrowth on her: its heal at once, then its heal over time (a "Regrowth" tick in the log).
+			// Regrowth on the player: its heal at once, then its heal over time (a "Regrowth" tick in the log).
 			g_steps.push_back({ "wow_book_regrowth", 12, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
@@ -9403,7 +14113,7 @@ return 1 end)())");
 				r["pass"] = r["healed"].get<float>() > 0.0f && std::atoi(r["ticked"].get<std::string>().c_str()) >= 2;
 				return true;
 			} });
-			// Mark of the Wild on her: its Skyrim side - 20 health and magicka (the fortify potions'), Oakflesh's 40 armor
+			// Mark of the Wild on the player: its Skyrim side - 20 health and magicka (the fortify potions'), Oakflesh's 40 armor
 			// (service/skyrim_balance.py) - while it lasts.
 			g_steps.push_back({ "wow_book_mark", 8, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -9436,7 +14146,7 @@ return 1 end)())");
 				            std::abs(r["armor"].get<float>() - 40.0f) < 2.0f;   // service/skyrim_balance.py: potions' 20, Oakflesh's 40
 				return true;
 			} });
-			// Gift of the Wild: her and her follower, one Wild Thornroot spent.
+			// Gift of the Wild: the player and their follower, one Wild Thornroot spent.
 			g_steps.push_back({ "wow_book_gift", 8, [](double t, json& r) {
 				if (t == 0.0) {
 					BookReady();
@@ -9469,7 +14179,7 @@ return 1 end)())");
 				r["pass"] = r["spent"] == 1 && std::abs(r["follower_health"].get<float>() - 20.0f) < 1.5f;
 				return true;
 			} });
-			// Thorns on her, then a wolf that bites her: it is hurt by her thorns ("You reflect ...").
+			// Thorns on the player, then a wolf that bites the player: it is hurt by their thorns ("You reflect ...").
 			g_steps.push_back({ "wow_book_thorns", 16, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				if (t == 0.0) {
@@ -9520,12 +14230,12 @@ return 1 end)())");
 				player->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 10000.0f);
 				return true;
 			} });
-			// Hibernate a wolf (a beast): it sleeps (Skyrim's paralysis); her blow wakes it, as any damage does.
-			g_steps.push_back({ "wow_book_hibernate", 18, [](double t, json& r) {
+			// Hibernate a wolf (a beast): it sleeps (Skyrim's paralysis); their blow wakes it, as any damage does.
+			g_steps.push_back({ "wow_book_hibernate", 26, [](double t, json& r) {   // 26: room for one recast
 				if (t == 0.0) {
 					BookReady();
 					ClearCorpses();
-					// Its AI on (a sleeping beast is a thinking one); far enough that the cast is done before it reaches her.
+					// Its AI on (a sleeping beast is a thinking one); far enough that the cast is done before it reaches the player.
 					auto* wolf = SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0x00023ABE), 500.0f);
 					if (!wolf) {
 						r["error"] = "no wolf";
@@ -9562,6 +14272,16 @@ return 1 end)())");
 				// Asleep once its cast lands - 1.5 seconds, longer if the wolf's bites push it back; a villager's blow may
 				// wake it soon after (any blow does).
 				if (!g_ctx.contains("slept")) {
+					// The wolf runs in at 500 units with its AI on: a hill or a tree between them, or a bite at the
+					// wrong moment, made the one cast miss in a suite (October 17). Once more, in sight.
+					if (!asleep() && since > 5.0 && !g_ctx.contains("recast")) {
+						g_ctx["recast"] = { { "distance", wolf->GetPosition().GetDistance(RE::PlayerCharacter::GetSingleton()->GetPosition()) },
+							{ "in_sight", PlaceInSight(wolf, { { 300.f, 0.f }, { 300.f, 120.f }, { 300.f, -120.f } }) } };
+						Bridge::SetTarget(wolf);
+						Cast::Use(18658);
+						g_ctx["used"] = t;
+						return false;
+					}
 					if (asleep() || since > 5.0) {
 						g_ctx["slept"] = asleep();
 						g_ctx["slept_at"] = t;
@@ -9573,7 +14293,7 @@ return 1 end)())");
 						return false;
 					}
 					g_ctx["wrath"] = t;
-					Carriers::Damage(wolf, 5.0f);   // a blow of hers lands (as her melee deals it; a Wrath may miss)
+					Carriers::Damage(wolf, 5.0f);   // a blow of theirs lands (as their melee deals it; a Wrath may miss)
 					Cast::Damaged(wolf, 5);
 					return false;
 				}
@@ -9582,6 +14302,7 @@ return 1 end)())");
 				}
 				r["slept"] = g_ctx["slept"];
 				r["woke"] = !asleep();
+				if (g_ctx.contains("recast")) r["recast"] = g_ctx["recast"];
 				r["pass"] = r["slept"] == true && r["woke"] == true;
 				Bridge::SetTarget(nullptr);
 				wolf->Disable();
@@ -9620,7 +14341,7 @@ return 1 end)())");
 				wolf->Disable();
 				return true;
 			} });
-			// Innervate on her: Skyrim's magicka regeneration 400% up while it lasts.
+			// Innervate on the player: Skyrim's magicka regeneration 200% up while it lasts (service/skyrim_balance.py).
 			g_steps.push_back({ "wow_book_innervate", 6, [](double t, json& r) {
 				auto* av = RE::PlayerCharacter::GetSingleton()->AsActorValueOwner();
 				if (t == 0.0) {
@@ -9642,10 +14363,10 @@ return 1 end)())");
 				}
 				r["rate"] = av->GetActorValue(RE::ActorValue::kMagickaRate) - g_ctx["rate0"][0].get<float>();
 				r["rate_mult"] = av->GetActorValue(RE::ActorValue::kMagickaRateMult) - g_ctx["rate0"][1].get<float>();
-				r["pass"] = std::abs(r["rate"].get<float>() - 50.0f) < 1.0f || std::abs(r["rate_mult"].get<float>() - 50.0f) < 1.0f;   // the regen potion's 50%
+				r["pass"] = std::abs(r["rate"].get<float>() - 200.0f) < 1.0f || std::abs(r["rate_mult"].get<float>() - 200.0f) < 1.0f;
 				return true;
 			} });
-			// Barkskin on her: her next Wrath takes a second longer to cast (2 s, now 3).
+			// Barkskin on the player: their next Wrath takes a second longer to cast (2 s, now 3).
 			g_steps.push_back({ "wow_book_barkskin", 10, [](double t, json& r) {
 				if (t == 0.0) {
 					BookReady();
@@ -9691,7 +14412,7 @@ return 1 end)())");
 				r["pass"] = std::abs(std::atof(r["cast_seconds"].get<std::string>().c_str()) - 3.0) < 0.05;
 				return true;
 			} });
-			// Tranquility: channelled, it heals her and her follower every 2 seconds ("Tranquility" in the log).
+			// Tranquility: channelled, it heals the player and their follower every 2 seconds ("Tranquility" in the log).
 			g_steps.push_back({ "wow_book_tranquility", 16, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
@@ -9738,21 +14459,30 @@ return 1 end)())");
 				r["pass"] = r["channel"] == true && r["healed"].get<float>() > 0.0f && r["logged"] == true && std::abs(r["channel_seconds"].get<double>()-r["expected_seconds"].get<double>())<.25 && r["animation_samples"].get<int>()>10 && r["animation_failures"]==0;
 				return true;
 			} });
-			// Rebirth: her follower, dead, back on its feet after the cast; one Ironwood Seed spent.
+			// Rebirth: their follower, dead, back on its feet after the cast; one Ironwood Seed spent.
             g_steps.push_back({ "wow_rebirth_targeting", 22, [](double t, json& r) {
                 auto* player=RE::PlayerCharacter::GetSingleton();
                 auto* wolf=g_ctx.contains("wolf") ? RE::TESForm::LookupByID<RE::Actor>(g_ctx["wolf"].get<RE::FormID>()) : nullptr;
+                auto* seed=g_ctx.contains("seed") ? RE::TESForm::LookupByID<RE::TESBoundObject>(g_ctx["seed"].get<RE::FormID>()) : nullptr;
                 auto error=[] { return WowUi::Eval("WBTestLastError"); };
                 auto clear=[] { WowUi::Eval("(function() WBTestLastError=nil return 1 end)()"); };
                 auto cleanup=[&] {
                     if (wolf) { wolf->StopCombat(); wolf->Disable(); }
                     Bridge::SetTarget(nullptr); Cast::RefreshCooldownsForTesting();
+                    if (seed) { // the spent Ironwood Seed comes back; FinishDruidTalentTest restores the rest
+                        const int delta=g_ctx["seeds"].get<int>()-Gear::ReagentCounts()[17038];
+                        if (delta>0) player->AddObjectToContainer(seed,nullptr,delta,nullptr);
+                        else if (delta<0) Gear::Consume(17038,-delta);
+                    }
                 };
                 if (t==0.0) {
-                    BookReady(); Cast::RefreshCooldownsForTesting(); Melee::Stop(); Forms::Leave();
+                    // Talent-audit restoration (RunSuite's talentAudit): magicka, the native Restoration
+                    // XP the paid cast trains, progression, cooldowns and cast state.
+                    BeginFormProbe(); Cast::RefreshCooldownsForTesting(); Forms::Leave();
                     wolf=SpawnWolf(190.f,80.f);
                     if (!wolf) { r={{"pass",false},{"error","no owned wolf fixture"}}; return true; }
-                    g_ctx={{"wolf",wolf->GetFormID()},{"stage",0},{"seeds",Gear::ReagentCounts()[17038]}};
+                    g_ctx["wolf"]=wolf->GetFormID(); g_ctx["stage"]=0; g_ctx["seeds"]=Gear::ReagentCounts()[17038];
+                    for (const auto& [form,data] : player->GetInventory()) if (Gear::EntryOf(form)==17038) { g_ctx["seed"]=form->GetFormID(); break; }
                     WowUi::Eval("(function() if not __wbErrFrame then __wbErrFrame=CreateFrame('Frame') __wbErrFrame:RegisterEvent('UI_ERROR_MESSAGE') __wbErrFrame:SetScript('OnEvent',function() WBTestLastError=arg1 end) end WBTestLastError=nil return 1 end)()");
                     return false;
                 }
@@ -9832,7 +14562,12 @@ return 1 end)())");
                         {"mana",Cast::Mana()},{"error",WowUi::Eval("WBTestLastError")}});
                     if (!wolf || t>18) { r={{"pass",false},{"error","Rebirth edge did not settle"},{"evidence",g_ctx}}; cleanup(); return true; }
                     if (stage==0) { if (t<1 || !wolf->Is3DLoaded()) return false; wolf->EnableAI(true); wolf->KillImmediate(); g_ctx["stage"]=1; return false; }
-                    if (stage==1) { if (!wolf->IsDead()) return false; Bridge::SetTarget(wolf); ObserveCast(); Cast::Use(20748); g_ctx["stage"]=2; return false; }
+                    if (stage==1) {   // its ragdoll at rest first (a moving one drags a moved corpse back)
+                        if (!wolf->IsDead()) return false;
+                        if (!g_ctx.contains("dead_at")) g_ctx["dead_at"]=t;
+                        if (mode==2 && t-g_ctx["dead_at"].get<double>()<3) return false;
+                        Bridge::SetTarget(wolf); ObserveCast(); Cast::Use(20748); g_ctx["stage"]=2; return false;
+                    }
                     if (stage==2) {
                         if (WowUi::Eval("__WB.casting and __WB.casting.spell==20748 and 1 or 0")!="1") return false;
                         g_ctx["started"]=true;
@@ -9840,10 +14575,16 @@ return 1 end)())");
                         g_ctx["before_mana"]=Cast::Mana();
                         if (mode==0) Gear::Consume(17038,Gear::ReagentCounts()[17038]);
                         if (mode==1) p->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kMagicka,100000.f);
-                        if (mode==2) { wolf->SetPosition(wolf->GetPosition()+RE::NiPoint3{4000,0,0},true);
-                            g_ctx["distance_yd"]=wolf->GetPosition().GetDistance(p->GetPosition())/64.f; }
+                        if (mode==2) { const auto away=wolf->GetPosition()+RE::NiPoint3{4000,0,0}; g_ctx["away"]={away.x,away.y,away.z}; }
                         if (mode==3) wolf->Resurrect(false,true);
                         g_ctx["mutated"]=t; g_ctx["stage"]=3; return false;
+                    }
+                    if (mode==2 && stage==3) {   // a moving ragdoll pulls the corpse back: hold it away until the release
+                        const auto& away=g_ctx["away"];
+                        if (wolf->GetPosition().GetDistance(p->GetPosition())<50*64.f) {
+                            wolf->SetPosition({away[0].get<float>(),away[1].get<float>(),away[2].get<float>()},true); wolf->Update3DPosition(true);
+                        }
+                        g_ctx["distance_yd"]=wolf->GetPosition().GetDistance(p->GetPosition())/64.f;
                     }
                     if (t-g_ctx["mutated"].get<double>()<1 || Cast::Casting()) return false;
                     const std::array<const char*,4> errors={"ERR_SPELL_FAILED_REAGENTS_GENERIC","ERR_OUT_OF_MANA","SPELL_FAILED_OUT_OF_RANGE","SPELL_FAILED_TARGET_NOT_DEAD"};
@@ -9855,7 +14596,13 @@ return 1 end)())");
                     const bool noCooldown=WowUi::Eval("(not __WB.cooldowns[20748] and 1 or 0)") == "1";
                     r["no_cooldown"]=noCooldown;
                     if (mode==2) r["distance_yd"]=g_ctx["distance_yd"];
-                    r["pass"]=rejected && seeds && noCooldown && (mode==3 || wolf->IsDead());
+                    // A rejected Rebirth pays no magicka. Regeneration can only raise it (BookReady filled it),
+                    // and the few seconds' regen cannot hide Rebirth's cost; 1 point covers integer rounding.
+                    // The drained-mana case empties magicka itself.
+                    const int mana=Cast::Mana();
+                    const bool noMana=mode==1 || mana>=g_ctx["before_mana"].get<int>()-1;
+                    r["mana_before"]=g_ctx["before_mana"]; r["mana_after"]=mana; r["no_mana_spent"]=noMana;
+                    r["pass"]=rejected && seeds && noCooldown && noMana && (mode==3 || wolf->IsDead());
                     cleanup(); return true;
                 }});
             }
@@ -9885,7 +14632,7 @@ return 1 end)())");
                     friendly->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kPlayerTeammate);
                     return true;
                 }
-				if (!g_ctx.contains("killed")) {   // beside her first (MoveTo takes a frame or two), then dead
+				if (!g_ctx.contains("killed")) {   // beside the player first (MoveTo takes a frame or two), then dead
 					if (t < 1.0) {
 						return false;
 					}
@@ -9915,7 +14662,7 @@ return 1 end)())");
 				friendly->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kPlayerTeammate);
                 friendly->EnableAI(g_ctx["ai"].get<bool>());
 				Bridge::SetTarget(nullptr);
-				for (const std::uint32_t spell : { 9858u, 9885u, 21850u, 9910u, 29166u, 22812u }) {   // the later steps' her
+				for (const std::uint32_t spell : { 9858u, 9885u, 21850u, 9910u, 29166u, 22812u }) {   // the later steps' player
 					Cast::EndAura(spell);
 				}
 				return true;
@@ -9928,7 +14675,7 @@ return 1 end)())");
 				auto  wolfAt = [](const char* k) { return RE::TESForm::LookupByID<RE::Actor>(g_ctx[k].get<RE::FormID>()); };
 				auto  hp = [](RE::Actor* a) { return a ? a->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) : -1.0f; };
 				if (t == 0.0) {
-					BookReady();   // her magicka is Skyrim's: the steps before may have spent it
+					BookReady();   // their magicka is Skyrim's: the steps before may have spent it
 					Input::SetCursorMode(true);
 					const std::pair<const char*, std::pair<float, float>> kWolves[] = { { "a", { 640.0f, -120.0f } },
 						{ "b", { 640.0f, 120.0f } }, { "outside", { 640.0f, 1300.0f } } };
@@ -10004,8 +14751,10 @@ return 1 end)())");
 				if (since < 3.2) {
 					return false;
 				}
+				auto speed = [](RE::Actor* w) { return w->AsActorValueOwner()->GetActorValue(RE::ActorValue::kWeaponSpeedMult); };
 				if (!g_ctx.contains("hp1")) {
 					g_ctx["hp1"] = { hp(a), hp(b), hp(outside) };
+					g_ctx["speed1"] = { speed(a), speed(b), speed(outside) };   // the storm's slow on the two inside
 					g_ctx["channel_timing"] = Cast::TalentDiagnostics().value("channel",json::object());
 					g_ctx["walk"] = Action("key:w:0.4");
 					return false;
@@ -10028,21 +14777,25 @@ return 1 end)())");
 				r["mid"] = g_ctx["mid"];
 				r["under"] = g_ctx["under"];
 				r["cooldown"] = WowUi::Eval("(function() local s, d = GetActionCooldown(__WBSlotOf(17402)) return d end)()");   // its minute
+				const auto& s1 = g_ctx["speed1"];
+				r["attack_speed"] = { { "storm", s1 }, { "after", { speed(a), speed(b), speed(outside) } } };
+				const bool slowed = s1[0].get<float>() <= s1[2].get<float>() - 0.19f && s1[1].get<float>() <= s1[2].get<float>() - 0.19f;   // x 1/1.25
+				const bool restored = std::abs(speed(a) - speed(outside)) < 0.01f && std::abs(speed(b) - speed(outside)) < 0.01f;
 				r["pass"] = r["bar_text"] == "Channeling" && r["targeting"] == "1" && r["channel"] == "1" && r["still_targeting"] == "nil" &&
 				            r["area"][0].get<float>() > 1.0f && r["area"][1] == true && r["cooldown"] == "60" &&
-				            r["mana_spent"].get<int>() >= 200 && r["hurt"][0].get<float>() > 5.0f && r["hurt"][1].get<float>() > 5.0f &&   // a fifth of 1495 (299), less her regeneration meanwhile
+				            r["mana_spent"].get<int>() >= 200 && r["hurt"][0].get<float>() > 5.0f && r["hurt"][1].get<float>() > 5.0f &&   // a fifth of 1495 (299), less their regeneration meanwhile
 				            r["hurt"][2].get<float>() == 0.0f && r["after_walk"] == "nil" &&
                             r["channel_timing"].value("spell",0u)==17402 && r["channel_timing"].value("period",0.0)==1.0 &&
                             r["channel_timing"].value("tick",0)>=2 && r["channel_timing"].value("tick",0)<=4 &&
-                            r["hurt"][0].get<float>()<=200 && r["hurt"][1].get<float>()<=200;
+                            r["hurt"][0].get<float>()<=200 && r["hurt"][1].get<float>()<=200 && slowed && restored;
 				for (auto* w : { a, b, outside }) {
 					w->KillImmediate();
 				}
 				Input::SetCursorMode(false);
 				return true;
 			} });
-			// Her forms: Cat Form (energy, the cat's model and page), Claw on a wolf (a combo point), Dire Bear Form (rage, the
-			// bear), and Dire Bear again to leave (mana, herself). Each form captured.
+			// Their forms: Cat Form (energy, the cat's model and page), Claw on a wolf (a combo point), Dire Bear Form (rage, the
+			// bear), and Dire Bear again to leave (mana, the player). Each form captured.
 			g_steps.push_back({ "wow_forms", 48, [](double t, json& r) {
 				auto body = [] {
 					const auto* data = Avatar::Data();
@@ -10063,7 +14816,7 @@ return 1 end)())");
 					return false;
 				}
 				if (!g_ctx.contains("cat")) {
-					if (wait("cat_at", 4.0)) {   // the shift, her cat's model loaded, energy coming in
+					if (wait("cat_at", 4.0)) {   // the shift, their cat's model loaded, energy coming in
 						return false;
 					}
 					g_ctx["cat"] = { Forms::Current(), ui("UnitPowerType('player')"), body(), ui("(function() local _, _, a = GetShapeshiftFormInfo(3) return a end)()"),
@@ -10074,7 +14827,7 @@ return 1 end)())");
 					Bridge::SetTarget(wolf);
 					return false;
 				}
-				if (!g_ctx.contains("prowl")) {   // Prowl: the prowl page, Skyrim's invisibility on her
+				if (!g_ctx.contains("prowl")) {   // Prowl: the prowl page, Skyrim's invisibility on the player
 					if (wait("prowl_at", 1.6)) {
 						return false;
 					}
@@ -10091,7 +14844,7 @@ return 1 end)())");
 					return false;
 				}
 				if (!g_ctx.contains("claw")) {
-					if (wait("claw_at", 3.0)) {   // energy for Claw (45); Claw breaks her prowl
+					if (wait("claw_at", 3.0)) {   // energy for Claw (45); Claw breaks their prowl
 						return false;
 					}
 					WowUi::Eval("(function() __wbClawError = '' if not __wbClawFrame then __wbClawFrame = CreateFrame('Frame') "
@@ -10099,7 +14852,7 @@ return 1 end)())");
 								"__wbClawFrame:SetScript('OnEvent', function() __wbClawError = __wbClawError .. arg1 .. '|' end) end return 1 end)()");
 					g_ctx["energy"] = ui("UnitMana('player')");
 					Cast::Use(9850);
-					g_ctx["claw"] = t;
+					g_ctx["claw"] = t; g_ctx["claw_attempts"]=1;
 					return false;
 				}
 				if (!g_ctx.contains("combo")) {
@@ -10108,19 +14861,19 @@ return 1 end)())");
 					}
 					g_ctx["combo"] = ui("GetComboPoints()");
 					g_ctx["claw_error"] = ui("__wbClawError");
-					// A wolf dodges or parries one blow in ten or so, and then no point is gained, as in WoW: Claw again.
+					// Avoided attacks gain no combo point. Allow up to four real attempts.
 					const auto log = g_ctx["claw_error"].get<std::string>();
-					if (g_ctx["combo"] == "0" && !g_ctx.contains("claw_again") &&
+					if (g_ctx["combo"] == "0" && g_ctx.value("claw_attempts",1)<4 &&
 						(log.find("dodged") != std::string::npos || log.find("parried") != std::string::npos ||
 							log.find("blocked") != std::string::npos || log.find("missed") != std::string::npos)) {
-						g_ctx["claw_again"] = log;
-						WowUi::Eval("__wbClawError = ''");
+						g_ctx["claw_again"] = log; g_ctx["claw_attempts"]=g_ctx.value("claw_attempts",1)+1;
+						WowUi::Eval("(function() __wbClawError='' return 1 end)()");
 						Cast::Use(9850);
 						g_ctx["claw"] = t;
 						g_ctx.erase("combo");
 						return false;
 					}
-					// What she sees: the target frame's combo point lit (the frame and its highlight fade in).
+					// What the player sees: the target frame's combo point lit (the frame and its highlight fade in).
 					g_ctx["combo_shown"] = ui("(function() return (ComboFrame:IsVisible() and ComboFrame:GetAlpha() > 0.9 and "
 											  "ComboPoint1Highlight:GetAlpha() > 0.9) and 1 or string.format('%s %.2f %.2f', ComboFrame:IsVisible() and 'shown' or 'hidden', "
 											  "ComboFrame:GetAlpha(), ComboPoint1Highlight:GetAlpha()) end)()");
@@ -10143,7 +14896,7 @@ return 1 end)())");
 					if (t - g_ctx["bear_at"].get<double>() < 6.0) {   // the shift's global cooldown, the capture
 						return false;
 					}
-					Cast::Use(9634);   // its own form again: she leaves it
+					Cast::Use(9634);   // its own form again: the player leaves it
 					g_ctx["left"] = t;
 					return false;
 				}
@@ -10172,8 +14925,8 @@ return 1 end)())");
 				return true;
 			} });
 			// The playtest's form rules: Barkskin and a form ignore a friendly target (no "Out of range"); Travel Form's
-			// speed is felt (SpeedMult 140) and the shift is at once (her forms dressed ahead); Aquatic Form refused on land;
-			// Prowl is Skyrim's sneak and fades her; a bear does not sneak.
+			// speed is felt (SpeedMult 140) and the shift is at once (their forms dressed ahead); Aquatic Form refused on land;
+			// Prowl is Skyrim's sneak and fades the player; a bear does not sneak.
 			g_steps.push_back({ "wow_form_rules", 24, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto  ui = [](const char* a_lua) { return WowUi::Eval(a_lua); };
@@ -10301,7 +15054,7 @@ return 1 end)())");
 				auto* player=RE::PlayerCharacter::GetSingleton(); auto* av=player->AsActorValueOwner();
 				const auto aura=[](int spell) { const auto diagnostic=Cast::TalentDiagnostics(); for (const auto& a : diagnostic["auras"]) if (a["spell"]==spell) return true; return false; };
 				auto next=[&](int stage) { g_ctx["stage"]=stage; g_ctx["since"]=t; };
-				if (t==0) { BeginFormProbe(); next(0); return false; }
+				if (t==0) { BeginFormProbe(); Forms::HoldCastingRegenForTesting(true); next(0); return false; }   // exact magicka (their Stormrage set)
 				const int stage=g_ctx.value("stage",0);
 				if (stage==6 && Forms::Current()=="cat") { Cast::Stop(); next(7); return false; }
 				if (t-g_ctx.value("since",0.0)<(stage==0 ? 1.0 : stage==4 ? 3.0 : 2.2)) return false;
@@ -10528,6 +15281,1529 @@ return 1 end)())");
                 return finish();
             }});
 
+            // Soothe Animal as the user decided it: an unengaged beast does not attack the player while it lasts; hurting it ends
+            // that, and a beast already fighting the player is not calmed.
+            g_steps.push_back({"wow_soothe_animal",60,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton(); auto* av=player->AsActorValueOwner();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto wolfAt=[&](const char* key) { return RE::TESForm::LookupByID<RE::Actor>(g_ctx.value(key,RE::FormID{})); };
+                auto calmed=[](RE::Actor* a) {
+                    if (a) if (auto* list=a->GetActiveEffectList()) for (const auto* effect : *list) {
+                        const auto* base=effect ? effect->GetBaseObject() : nullptr;
+                        if (base && base->data.archetype==RE::EffectSetting::Archetype::kCalm &&
+                            !effect->flags.any(RE::ActiveEffect::Flag::kDispelled,RE::ActiveEffect::Flag::kInactive)) return true;
+                    }
+                    return false;
+                };
+                auto soothed=[](RE::Actor* a) {   // the WoW aura, and whether it calmed natively
+                    for (const auto& x : Cast::TalentDiagnostics()["auras"])
+                        if (a && x["spell"]==9901 && x["target"]==a->GetFormID()) return json{{"aura",true},{"calm",x["calm"]}};
+                    return json{{"aura",false},{"calm",false}};
+                };
+                auto finish=[&](const char* error=nullptr) {
+                    for (const auto* key : {"calm","engaged"}) if (auto* wolf=wolfAt(key)) {
+                        if (Bridge::Target()==wolf) Bridge::SetTarget(nullptr);
+                        Cast::EndAura(9901,wolf);   // its live Soothe would fail the probe's Cast restore (3/3 alone, October 16)
+                        wolf->StopCombat(); wolf->Disable();
+                    }
+                    av->RestoreActorValue(RE::ActorValue::kHealth,100000.f);
+                    r={{"checks",g_ctx["checks"]},{"pass",error==nullptr}};
+                    if (error) { r["error"]=error; r["native"]=Cast::TalentDiagnostics(); }
+                    for (const auto& [key,ok] : g_ctx["checks"].items()) if (ok!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe(); BookReady();
+                    auto* wolf=SpawnWolf(12*Avatar::kUnitsPerYard,0);
+                    if (!wolf) return finish("missing Soothe fixture");
+                    g_ctx["calm"]=wolf->GetFormID(); g_ctx["checks"]=json::object(); next(0); return false;
+                }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                auto* wolf=wolfAt("calm"); auto* fighter=wolfAt("engaged"); auto& checks=g_ctx["checks"];
+                if (!wolf || since>12) return finish("Soothe stage did not settle");
+                ProbeWait("wow_soothe_animal",t,{{"stage",stage},{"casting",Cast::Casting()},{"calmed",calmed(wolf)},
+                    {"combat",wolf->IsInCombat()},{"soothed",soothed(fighter ? fighter : wolf)}});
+                if (stage==0) {   // it has not noticed the player: soothe it, then let its AI run
+                    if (since<1.5 || !wolf->Is3DLoaded() || !Progression::Ready()) return false;
+                    Bridge::SetTarget(wolf); Cast::Use(9901); next(1); return false;
+                }
+                if (stage==1) {
+                    if (Cast::Casting() || !calmed(wolf)) return false;
+                    checks["unengaged_beast_calmed"]=soothed(wolf)["calm"]==true;
+                    g_ctx["health"]=av->GetActorValue(RE::ActorValue::kHealth);
+                    wolf->EnableAI(true); next(2); return false;
+                }
+                if (stage==2) {
+                    if (since<6) return false;
+                    checks["calmed_beast_keeps_the_peace"]=!wolf->IsInCombat() && av->GetActorValue(RE::ActorValue::kHealth)>=g_ctx["health"].get<float>()-.5f;
+                    Bridge::SetTarget(wolf); Carriers::Damage(wolf,5); Cast::Damaged(wolf,5); next(3); return false;
+                }
+                if (stage==3) {
+                    if ((calmed(wolf) || soothed(wolf)["aura"]==true || !wolf->IsInCombat()) && since<6) return false;
+                    checks["hurt_ends_soothing"]=!calmed(wolf) && soothed(wolf)["aura"]==false;
+                    checks["hurt_beast_fights"]=wolf->IsInCombat();
+                    wolf->StopCombat(); wolf->Disable(); av->RestoreActorValue(RE::ActorValue::kHealth,100000.f);
+                    auto* engaged=SpawnWolf(8*Avatar::kUnitsPerYard,120);
+                    if (!engaged) return finish("missing engaged Soothe fixture");
+                    g_ctx["engaged"]=engaged->GetFormID(); next(4); return false;
+                }
+                if (stage==4) {   // a second wolf, already fighting the player
+                    if (!fighter || !fighter->Is3DLoaded() || since<1.5) return false;
+                    fighter->EnableAI(true); Console::Execute("startcombat player",fighter); next(5); return false;
+                }
+                if (stage==5) {
+                    if (!fighter || !fighter->IsInCombat()) { if (since<6) return false; return finish("engaged Soothe fixture never fought"); }
+                    // Facing it (it came at the player from the side): a cast refused for facing never showed its aura (October 16).
+                    const auto to=fighter->GetPosition()-player->GetPosition();
+                    player->SetAngle({0.f,0.f,std::atan2(to.x,to.y)});
+                    ObserveCast(); Bridge::SetTarget(fighter); Cast::Use(9901); next(6); return false;
+                }
+                if (stage==6) {
+                    if (since>2 && !g_ctx.contains("engaged_cast")) g_ctx["engaged_cast"]={{"starts",WowUi::Eval("__wbCastProbe and __wbCastProbe.starts or -1")},
+                        {"last_error",WowUi::Eval("WBTestLastError or ''")},{"event",WowUi::Eval("__wbCastProbe and __wbCastProbe.event or ''")}};
+                    if (Cast::Casting() || soothed(fighter)["aura"]!=true) return false;
+                    checks["engaged_beast_not_calmed"]=soothed(fighter)["calm"]==false && !calmed(fighter) && fighter->IsInCombat();
+                    return finish();
+                }
+                return finish("unknown Soothe stage");
+            }});
+
+			// Their crowd control and anyone else's damage (Unit::DealDamage, HandleRemoveByDamageChanceProc): Skyrim's spell
+			// from another wolf wakes Hibernate, a stranger's blows break a root by the service's roll (its own ticks never
+			// do), a trap's damage ends Soothe Animal. Hibernate and Entangling Roots hold one unit at a time, any rank
+			// (SpellMgr::IsSingleTargetSpell). Real outcomes from the service, landed as their casts land them.
+			g_steps.push_back({ "wow_cc_native_damage", 45, [](double t, json& r) {
+				auto next = [&](int n) { g_ctx["stage"] = n; g_ctx["at"] = t; };
+				auto wolf = [](const char* key) { return RE::TESForm::LookupByID<RE::Actor>(g_ctx["wolves"].value(key, RE::FormID{})); };
+				auto aura = [](RE::Actor* a, std::uint32_t spell) {   // their aura of that spell on it, from their own table ({}: none)
+					const auto diagnostics = Cast::TalentDiagnostics();
+					if (a) for (const auto& x : diagnostics.at("auras")) if (x["spell"] == spell && x["target"] == a->GetFormID()) return x;
+					return json::object();
+				};
+				auto reports = [] { return Cast::TalentDiagnostics().value("native_damage", 0); };
+				auto health = [](RE::Actor* a) { return a->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth); };
+				auto finish = [&](const char* error = nullptr) {
+					for (const auto& [key, id] : g_ctx["wolves"].items()) {
+						if (auto* a = RE::TESForm::LookupByID<RE::Actor>(id.get<RE::FormID>())) {
+							if (Bridge::Target() == a) Bridge::SetTarget(nullptr);
+							a->StopCombat(); a->Disable();
+						}
+					}
+					r = { { "checks", g_ctx["checks"] }, { "evidence", g_ctx["evidence"] }, { "pass", error == nullptr } };
+					if (error) { r["error"] = error; r["native"] = Cast::TalentDiagnostics(); }
+					for (const auto& [key, ok] : g_ctx["checks"].items()) if (ok != true) r["pass"] = false;
+					return true;
+				};
+				// The spells: Hibernate ranks 3 and 2, Entangling Roots rank 6, Soothe Animal rank 3; seeds to find a landing.
+				static constexpr std::pair<const char*, std::uint32_t> kSpells[] = { { "hibernate3", 18658 }, { "hibernate2", 18657 },
+					{ "roots", 9853 }, { "soothe", 9901 } };
+				if (t == 0.0) {
+					BookReady(); ClearCorpses(); Bridge::SetTarget(nullptr);
+					g_ctx["wolves"] = json::object(); g_ctx["replies"] = json::object();
+					g_ctx["checks"] = json::object(); g_ctx["evidence"] = json::object();
+					for (const auto& [key, forward, right] : { std::tuple{ "a", 8.f, -4.f }, std::tuple{ "b", 8.f, 4.f }, std::tuple{ "c", 12.f, -4.f },
+							 std::tuple{ "d", 12.f, 4.f }, std::tuple{ "e", 16.f, 0.f }, std::tuple{ "stranger", 6.f, 0.f } }) {
+						auto* w = SpawnWolf(forward * Avatar::kUnitsPerYard, right * Avatar::kUnitsPerYard);   // AI off: still, no fight
+						if (!w) return finish("missing crowd control fixture wolf");
+						w->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth, 1000.0f);
+						w->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealRate, 0.0f);
+						w->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth, 100000.0f);
+						g_ctx["wolves"][key] = w->GetFormID();
+					}
+					auto caster = Character::Caster(); caster["level"] = 60; caster["talents"] = json::object(); caster["auras"] = json::array();
+					caster["prowling"] = false; caster["in_combat"] = false; caster["form"] = "none"; caster.erase("next_swing");
+					const json beast = { { "kind", "unit" }, { "level", 1 }, { "alive", true }, { "reaction", "hostile" }, { "distance_yd", 10 },
+						{ "los", true }, { "in_front", true }, { "creature_type", "Beast" }, { "attackable", true }, { "friendly", false } };
+					for (const auto& [key, spell] : kSpells) for (int seed = 1; seed <= 6; ++seed) {
+						Service::Request({ { "op", "resolve" }, { "spell", spell }, { "caster", caster }, { "target", beast }, { "seed", seed } },
+							[index = g_index, name = std::format("{}_{}", key, seed)](const json& out) { if (index == g_index) g_ctx["replies"][name] = out; });
+					}
+					next(0); return false;
+				}
+				const int    stage = g_ctx["stage"];
+				const double since = t - g_ctx["at"].get<double>();
+				auto* a = wolf("a"); auto* b = wolf("b"); auto* c = wolf("c"); auto* d = wolf("d"); auto* e = wolf("e"); auto* stranger = wolf("stranger");
+				if (!a || !b || !c || !d || !e || !stranger) return finish("crowd control fixture wolf disappeared");
+				auto& checks = g_ctx["checks"]; auto& evidence = g_ctx["evidence"];
+				ProbeWait("wow_cc_native_damage", t, { { "gate", std::format("stage {}", stage) }, { "a", aura(a, 18658) }, { "b", aura(b, 18657) },
+					{ "c", aura(c, 9853) }, { "d", aura(d, 9853) }, { "e", aura(e, 9901) }, { "reports", reports() } });
+				// The first seed whose outcome lands (no miss or resist), without its heartbeat resist: only damage may end it early.
+				auto outcome = [&](const char* key) {
+					for (int seed = 1; seed <= 6; ++seed) {
+						auto out = g_ctx["replies"].value(std::format("{}_{}", key, seed), json());
+						if (!out.value("ok", false) || out.value("auras", json::array()).empty()) continue;
+						for (auto& x : out["auras"]) x.erase("heartbeat");
+						return out;
+					}
+					return json();
+				};
+				auto land = [&](const char* key, std::uint32_t spell, RE::Actor* on) {
+					const auto out = outcome(key);
+					if (out.is_null()) return false;
+					Cast::ApplyForTesting(spell, out, on);
+					return true;
+				};
+				if (stage == 0) {
+					if (since < 1.5 || g_ctx["replies"].size() < std::size(kSpells) * 6) return since > 10 ? finish("service replies missing") : false;
+					for (auto* w : { a, b, c, d, e, stranger }) if (!w->Is3DLoaded()) return false;
+					if (!land("hibernate3", 18658, a)) return finish("no landing Hibernate rank 3 outcome");
+					next(1); return false;
+				}
+				if (stage == 1) {
+					if (since < 0.5) return false;
+					checks["hibernate_sleeps"] = aura(a, 18658).value("stun", false) && SleepCarrier(a);
+					if (!land("hibernate2", 18657, b)) return finish("no landing Hibernate rank 2 outcome");
+					next(2); return false;
+				}
+				if (stage == 2) {
+					if (since < 0.5) return false;
+					// Rank 2 on another beast: rank 3's sleeper wakes (IsSingleTargetSpells: one chain).
+					checks["hibernate_one_target"] = aura(a, 18658).empty() && !SleepCarrier(a) && aura(b, 18657).value("stun", false) && SleepCarrier(b);
+					evidence["b_health"] = health(b);
+					Carriers::NativeHitForTesting(stranger, b, 5.0f);   // Skyrim's fire, cast by another wolf
+					next(3); return false;
+				}
+				if (stage == 3) {
+					if ((!aura(b, 18657).empty() || SleepCarrier(b)) && since < 2) return false;
+					evidence["b_hurt"] = evidence["b_health"].get<float>() - health(b);
+					checks["native_spell_wakes"] = aura(b, 18657).empty() && !SleepCarrier(b) && evidence["b_hurt"].get<float>() > 0;
+					if (!land("roots", 9853, d)) return finish("no landing Entangling Roots outcome");
+					next(4); return false;
+				}
+				if (stage == 4) {
+					if (since < 0.5) return false;
+					if (!land("roots", 9853, c)) return finish("no landing Entangling Roots outcome");
+					next(5); return false;
+				}
+				if (stage == 5) {
+					if (since < 0.5) return false;
+					checks["roots_one_target"] = aura(d, 9853).empty() && aura(c, 9853).value("root", false);
+					evidence["c_health"] = health(c); evidence["reports_before_ticks"] = reports();
+					next(6); return false;
+				}
+				if (stage == 6) {   // its first tick is 3 seconds after it took hold: their carrier's damage, no break roll
+					if (since < 3.2) return false;
+					evidence["c_tick"] = evidence["c_health"].get<float>() - health(c);
+					checks["own_ticks_keep_root"] = evidence["c_tick"].get<float>() > 0 && aura(c, 9853).value("root", false) &&
+						reports() == evidence["reports_before_ticks"].get<int>();
+					g_ctx["hits"] = 0; next(7); return false;
+				}
+				if (stage == 7) {   // a stranger's blows: 5 health (20 of WoW's) against a level 1 beast is a 40% break each
+					const int hits = g_ctx["hits"];
+					if (aura(c, 9853).empty()) {
+						evidence["hits_to_break"] = hits; evidence["reports_after_hits"] = reports();
+						checks["native_damage_breaks_root"] = hits > 0 && reports() > evidence["reports_before_ticks"].get<int>();
+						next(8); return false;
+					}
+					if (since < 0.4 * (hits + 1)) return false;
+					if (hits >= 20) { checks["native_damage_breaks_root"] = false; evidence["hits_to_break"] = hits; next(8); return false; }
+					c->DoDamage(5.0f, stranger, true);
+					g_ctx["hits"] = hits + 1; return false;
+				}
+				if (stage == 8) {
+					if (!land("soothe", 9901, e)) return finish("no landing Soothe Animal outcome");
+					next(9); return false;
+				}
+				if (stage == 9) {
+					if (since < 0.5) return false;
+					checks["soothe_calms"] = aura(e, 9901).value("calm", false);
+					e->DoDamage(3.0f, nullptr, true);   // no one's: a trap's or a fall's
+					next(10); return false;
+				}
+				if (stage == 10) {
+					if (!aura(e, 9901).empty() && since < 2) return false;
+					evidence["e_in_combat"] = e->IsInCombat();   // false: its damage ended it, not TickAuras' combat rule
+					checks["native_damage_ends_soothe"] = aura(e, 9901).empty();
+					return finish();
+				}
+				return finish("unknown crowd control stage");
+			} });
+
+            // "I'm being detected from a distance while prowling." Skyrim's own detection of the player, by a wolf that sees and
+            // hears but never attacks (Aggression 0, so no fight spoils the baseline as in two earlier experiments): the
+            // same spots standing, sneaking natively and prowling. Prowl must hide the player at least as well as native sneak.
+            g_steps.push_back({"wow_prowl_detection",90,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                constexpr std::array<float,5> yards={4,8,12,16,24};
+                constexpr std::array<const char*,3> modes={"standing","sneaking","prowling"};
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto sneak=[&](bool on) {
+                    auto* controls=RE::PlayerControls::GetSingleton();
+                    if (!controls || !controls->sneakHandler || player->IsSneaking()==on) return;
+                    if (auto* press=RE::ButtonEvent::Create(RE::INPUT_DEVICE::kKeyboard,RE::UserEvents::GetSingleton()->sneak,0x1D,1.0f,0.0f)) {
+                        controls->sneakHandler->ProcessButton(press,&controls->data); RE::free(press);
+                    }
+                };
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx.value("wolf",RE::FormID{}));
+                auto finish=[&](const char* error=nullptr) {
+                    if (wolf) { wolf->StopCombat(); wolf->Disable(); }
+                    sneak(false);
+                    r={{"detection",g_ctx["detection"]},{"walking_state",g_ctx.value("walking_state",json::object())},{"checks",g_ctx["checks"]},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& [key,ok] : g_ctx["checks"].items()) if (ok!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BeginFormProbe();
+                    if (g_startPos) player->SetPosition(*g_startPos,true);   // open ground, as at the suite's start
+                    auto* spawned=SpawnWolf(24*Avatar::kUnitsPerYard,0);
+                    if (!spawned) return finish("missing detection fixture");
+                    auto* values=spawned->AsActorValueOwner();
+                    values->SetBaseActorValue(RE::ActorValue::kAggression,0); values->SetBaseActorValue(RE::ActorValue::kHealth,10000);
+                    g_ctx["wolf"]=spawned->GetFormID(); g_ctx["detection"]=json::object(); g_ctx["checks"]=json::object();
+                    g_ctx["mode"]=0; g_ctx["spot"]=0; next(0); return false;
+                }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                if (!wolf || since>12) return finish("detection stage did not settle");
+                const int mode=g_ctx["mode"], spot=g_ctx["spot"];
+                ProbeWait("wow_prowl_detection",t,{{"stage",stage},{"mode",modes[std::min(mode,2)]},{"spot",spot},
+                    {"sneaking",player->IsSneaking()},{"form",Forms::Current()},{"combat",wolf->IsInCombat()}});
+                if (stage==0) {   // their stance for this mode
+                    if (since<1.5 || !wolf->Is3DLoaded()) return false;
+                    if (mode==1) sneak(true);
+                    if (mode==2) { sneak(false); Cast::Use(768); }
+                    next(1); return false;
+                }
+                if (stage==1) {
+                    if (mode==2) {
+                        if (Forms::Current()!="cat") return false;
+                        if (!g_ctx.contains("prowl_used")) { if (since<1.6) return false; Cast::Use(9913); g_ctx["prowl_used"]=true; return false; }
+                        if (!player->IsSneaking() || since<2.5) return false;
+                    } else if (mode==1 && !player->IsSneaking()) return false;
+                    next(2); return false;
+                }
+                if (stage==2 || stage==4) {   // the wolf at this distance (or 14 yards, to walk towards), facing the player
+                    const auto at=player->GetPosition(); const float heading=player->GetAngleZ(), d=(stage==4 ? 14 : yards[spot])*Avatar::kUnitsPerYard;
+                    wolf->SetPosition({at.x+std::sin(heading)*d,at.y+std::cos(heading)*d,at.z},true);
+                    wolf->data.angle.z=heading+RE::NI_PI; wolf->Update3DPosition(true);
+                    g_ctx["best"]=-1000;
+                    if (stage==4) g_ctx["walk"]=Action("key:w:1.5");   // footsteps are what sneaking hides worst
+                    next(stage+1); return false;
+                }
+                if (stage==5) {   // the most it notices the player while the player walks towards it
+                    g_ctx["best"]=std::max(g_ctx["best"].get<int>(),wolf->RequestDetectionLevel(player));
+                    if (!Settled(g_ctx["walk"])) return false;
+                    g_ctx["detection"][modes[mode]]["walking"]=g_ctx["best"];
+                    auto* values=player->AsActorValueOwner();   // what Skyrim hears and sees of the player as the player walks
+                    g_ctx["walking_state"][modes[mode]]={{"noise",values->GetActorValue(RE::ActorValue::kMovementNoiseMult)},
+                        {"invisible",values->GetActorValue(RE::ActorValue::kInvisibility)},{"sneak",values->GetActorValue(RE::ActorValue::kSneak)},{"sneak_bonus",values->GetActorValue(RE::ActorValue::kSneakingModifier)},
+                        {"sneaking",player->IsSneaking()},{"running",player->IsRunning()}};
+                    if (wolf->IsInCombat()) return finish("the observer started a fight");
+                    g_ctx["mode"]=mode+1;
+                    if (mode+1<static_cast<int>(modes.size())) { next(0); return false; }
+                    auto& checks=g_ctx["checks"]; const auto& d=g_ctx["detection"];
+                    bool atMost=true, seenStanding=false;
+                    for (const auto& [at,level] : d["prowling"].items()) {
+                        atMost=atMost && level.get<int>()<=d["sneaking"][at].get<int>();
+                        seenStanding=seenStanding || d["standing"][at].get<int>()>0;
+                    }
+                    checks["standing_baseline_detects"]=seenStanding;   // the observer works
+                    checks["prowl_no_worse_than_native_sneak"]=atMost;
+                    checks["prowl_walking_unnoticed"]=d["prowling"]["walking"].get<int>()<=0;   // silent, as WoW's Prowl
+                    return finish();
+                }
+                if (stage==3) {   // the most it notices the player over a second
+                    g_ctx["best"]=std::max(g_ctx["best"].get<int>(),wolf->RequestDetectionLevel(player));
+                    if (since<1.2) return false;
+                    g_ctx["detection"][modes[mode]][std::format("{:.0f}",yards[spot])]=g_ctx["best"];
+                    if (wolf->IsInCombat()) return finish("the observer started a fight");
+                    if (spot+1<static_cast<int>(yards.size())) { g_ctx["spot"]=spot+1; next(2); return false; }
+                    g_ctx["spot"]=0; next(4); return false;
+                }
+                return finish("unknown detection stage");
+            }});
+
+            // Indoors the minimap shows their storey's floor plan (the cell's navmesh), as the client shows a building's; back
+            // outside the plan is gone and the terrain returns.
+            g_steps.push_back({"wow_minimap_interior",90,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton(); auto* ui=RE::UI::GetSingleton();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                if (t==0) { TravelCell("coc RiverwoodSleepingGiantInn"); next(0); return false; }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                const auto* cell=player->GetParentCell();
+                const bool settled=cell && player->Is3DLoaded() && !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) && WowUi::Ready();
+                ProbeWait("wow_minimap_interior",t,{{"stage",stage},{"interior",cell && cell->IsInteriorCell()},{"floor",WowUi::MinimapFloorSize()}});
+                if (stage==0) {
+                    if (!settled || !cell->IsInteriorCell() || WowUi::MinimapFloorSize()==0 || since<4) {
+                        if (since>40) { r={{"pass",false},{"error","no interior floor plan"},{"floor",WowUi::MinimapFloorSize()}}; return true; }
+                        return false;
+                    }
+                    g_ctx["floor"]=WowUi::MinimapFloorSize(); g_ctx["cell"]=cell->GetFormEditorID();
+                    g_ctx["shown"]=WowUi::Eval("Minimap:IsVisible() and 1 or 0");
+                    g_ctx["drawn"]=WowUi::Eval("tostring(__WBFloorState)..' '..tostring(__WBFloorDrawn)");
+                    g_ctx["snap"]=Snap("wow_minimap_interior"); next(1); return false;
+                }
+                if (stage==1) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    TravelCell("coc "+Config::Get().testCell); next(2); return false;
+                }
+                if (!settled || cell->IsInteriorCell() || since<3) {
+                    if (since>40) { r={{"pass",false},{"error","did not return outdoors"}}; return true; }
+                    return false;
+                }
+                r={{"cell",g_ctx["cell"]},{"floor",g_ctx["floor"]},{"shown",g_ctx["shown"]},{"drawn",g_ctx["drawn"]},{"cleared",WowUi::MinimapFloorSize()==0}};
+                r["pass"]=r["floor"].get<std::size_t>()>50 && r["shown"]=="1" && r["cleared"]==true;
+                return true;
+            }});
+
+            // Text emotes as the client sends them: their line in chat, their animation, held until the player moves (/dance, /sit),
+            // at their target (/wave) or alone (/spit).
+            g_steps.push_back({"wow_emotes",45,[](double t,json& r) {
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto said=[](const char* text) { return WowUi::Eval(std::format("(function() for _,l in ipairs(__wbEmotes or {{}}) do "
+                    "if l=={} then return 1 end end return 0 end)()",LuaQuote(text)))=="1"; };
+                auto finish=[&](const char* error=nullptr) {
+                    if (auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx.value("wolf",RE::FormID{}))) { Bridge::SetTarget(nullptr); wolf->Disable(); }
+                    Avatar::StopActing();
+                    WowUi::Eval("(function() if __wbEmoteFrame then __wbEmoteFrame:UnregisterAllEvents() end __wbEmotes=nil return 1 end)()");
+                    r={{"checks",g_ctx["checks"]},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& [key,ok] : g_ctx["checks"].items()) if (ok!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    Bridge::SetTarget(nullptr);
+                    WowUi::Eval("(function() __wbEmotes={} if not __wbEmoteFrame then __wbEmoteFrame=CreateFrame('Frame') end "
+                        "__wbEmoteFrame:RegisterEvent('CHAT_MSG_TEXT_EMOTE') __wbEmoteFrame:SetScript('OnEvent',function() tinsert(__wbEmotes,arg1) end) "
+                        "local box=DEFAULT_CHAT_FRAME.editBox or ChatFrameEditBox box:Show() box:SetText('/dance') ChatEdit_SendText(box) box:Hide() return 1 end)()");
+                    g_ctx["checks"]=json::object(); next(0); return false;
+                }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                auto& checks=g_ctx["checks"];
+                if (since>10) return finish("emote stage did not settle");
+                ProbeWait("wow_emotes",t,{{"stage",stage},{"acting",Avatar::Acting()},{"lines",WowUi::Eval("table.getn(__wbEmotes or {})")}});
+                if (stage==0) {   // /dance, typed
+                    if (since<1) return false;
+                    checks["dance_line"]=said("You burst into dance."); checks["dance_animation"]=Avatar::Acting()==69;
+                    g_ctx["walk"]=Action("key:w:0.4"); next(1); return false;
+                }
+                if (stage==1) {
+                    if (!Settled(g_ctx["walk"])) return false;
+                    checks["moving_ends_dance"]=Avatar::Acting()!=69;
+                    WowUi::Eval("DoEmote('SIT')"); next(2); return false;
+                }
+                if (stage==2) {
+                    if (since<2.5) return false;
+                    checks["sits_down_then_sits"]=Avatar::Acting()==97;
+                    WowUi::Eval("DoEmote('STAND')");   // each emote reaches the plugin a frame or two later
+                    auto* wolf=SpawnWolf(6*Avatar::kUnitsPerYard,0);
+                    if (!wolf) return finish("no emote target");
+                    g_ctx["wolf"]=wolf->GetFormID(); next(3); return false;
+                }
+                if (stage==3) {
+                    auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["wolf"].get<RE::FormID>());
+                    if (!wolf || !wolf->Is3DLoaded() || since<1) return false;
+                    checks["stands"]=Avatar::Acting()<0;
+                    Bridge::SetTarget(wolf); WowUi::Eval("DoEmote('WAVE')"); next(4); return false;
+                }
+                if (stage==4) {
+                    if (since<0.5) return false;
+                    auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx["wolf"].get<RE::FormID>());
+                    checks["wave_at_target"]=wolf && said(std::format("You wave at {}.",wolf->GetDisplayFullName()).c_str());
+                    checks["wave_animation"]=Avatar::Acting()==67;
+                    Bridge::SetTarget(nullptr); WowUi::Eval("DoEmote('SPIT')"); next(5); return false;
+                }
+                if (stage==5) {
+                    if (since<0.5) return false;
+                    checks["spit_alone"]=said("You spit on the ground.");
+                    // What the player says reaches chat and their bubble, over their head.
+                    WowUi::Eval("(function() __wbSaid=nil if not __wbSayFrame then __wbSayFrame=CreateFrame('Frame') end "
+                        "__wbSayFrame:RegisterEvent('CHAT_MSG_SAY') __wbSayFrame:SetScript('OnEvent',function() __wbSaid=arg1 end) "
+                        "local box=DEFAULT_CHAT_FRAME.editBox or ChatFrameEditBox box:Show() box:SetText('/s Well met.') ChatEdit_SendText(box) box:Hide() return 1 end)()");
+                    next(6); return false;
+                }
+                if (stage==6) {
+                    if (since<0.6) return false;
+                    checks["say_in_chat"]=WowUi::Eval("__wbSaid")=="Well met.";
+                    checks["say_bubble"]=WowUi::Eval("(WBChatBubble and WBChatBubble:IsShown() and WBChatBubbleText:GetText()=='Well met.' and __WB.playerHead) and 1 or 0")=="1";
+                    g_ctx["snap"]=Snap("wow_chat_bubble"); next(7); return false;
+                }
+                if (stage==7) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() if __wbSayFrame then __wbSayFrame:UnregisterAllEvents() end return 1 end)()");
+                    return finish();
+                }
+                return finish("unknown emote stage");
+            }});
+
+            // The WoW character creation window for their look (wb appearance / the panel): it opens, its own arrows change
+            // the look, Accept keeps it on the player; then their look as it was.
+            if ((","+Config::Get().testOnly+",").find(",wow_customize,")!=std::string::npos)
+            g_steps.push_back({"wow_customize",40,[](double t,json& r) {
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                const auto looks=CustomizationLooks;
+                auto finish=[&](const char* error=nullptr) {
+                    WowUi::Eval("(function() if __WBCustomizeClose then __WBCustomizeClose() end return 1 end)()");
+                    if (g_ctx.contains("before")) { const auto& b=g_ctx["before"];
+                        Character::SetLooks({b[0].get<std::uint32_t>(),b[1].get<std::uint32_t>(),b[2].get<std::uint32_t>(),b[3].get<std::uint32_t>(),
+                            b[4].get<std::uint32_t>(),b[5].get<std::uint32_t>(),b[6].get<std::uint32_t>()}); }
+                    r={{"checks",g_ctx.value("checks",json::object())},{"before",g_ctx.value("before",json())},{"accepted",g_ctx.value("accepted",json())},
+                        {"restored",looks()==g_ctx.value("before",json())},{"pass",error==nullptr}};
+                    for (const auto& [k,v] : r["checks"].items()) if (v!=true) r["pass"]=false;
+                    if (r["restored"]!=true) r["pass"]=false;
+                    if (error) r["error"]=error;
+                    return true;
+                };
+                if (t==0) { g_ctx["before"]=looks(); g_ctx["checks"]=json::object(); WowUi::Run("__WBCustomizeAppearance()"); next(0); return false; }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                if (since>15) return finish("customization stage did not settle");
+                if (stage==0) {
+                    if (since<1.5) return false;
+                    g_ctx["checks"]["window_opens"]=WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible() and WBCustomizeModel:IsVisible()) and 1 or 0")=="1";
+                    g_ctx["snap"]=Snap("wow_customize"); next(1); return false;
+                }
+                if (stage==1) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() CharacterCustomization_Right(1) CharacterCustomization_Right(3) CharacterCustomization_Right(3) return 1 end)()");
+                    next(2); return false;
+                }
+                if (stage==2) {
+                    if (since<1) return false;
+                    g_ctx["checks"]["arrows_change_preview_not_her"]=looks()==g_ctx["before"];
+                    WowUi::Eval("(function() WBCustomizeAccept:Click() return 1 end)()"); next(3); return false;
+                }
+                if (stage==3) {
+                    if (since<1.5) return false;
+                    const auto after=looks(), before=g_ctx["before"];
+                    g_ctx["accepted"]=after;
+                    g_ctx["checks"]["accept_changes_her"]=after!=before && after[1]==before[1];
+                    g_ctx["checks"]["window_closes"]=WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible()) and 1 or 0")=="0";
+                    g_ctx["snap"]=Snap("wow_customize_after"); next(4); return false;
+                }
+                if (stage==4) { if (!Settled(g_ctx["snap"])) return false; return finish(); }
+                return finish("unknown customization stage");
+            }});
+
+			for (const auto& step : std::vector<Step>{
+				{"wow_paladin_party_auras", 150, PaladinPartyAuras},
+				{"wow_paladin_greater_blessing", 60, PaladinGreaterBlessing},
+				{"wow_paladin_party_hits", 90, PaladinPartyHits},
+				{"wow_paladin_damage_pipeline", 120, PaladinDamagePipeline},
+				{"wow_paladin_freedom", 60, PaladinFreedom},
+				{"wow_paladin_holy_shock", 60, PaladinHolyShock},
+				{"wow_paladin_talent_auras", 150, PaladinTalentAuras},
+				{"wow_paladin_coverage", 150, PaladinCoverage},
+				{"wow_paladin_mechanics", 180, PaladinMechanics},
+				{"wow_paladin_treasure", 90, PaladinTreasure},
+				{"wow_paladin_native_procs", 240, PaladinNativeProcs},
+				{"wow_paladin_intervention", 45, PaladinIntervention},
+				{"wow_race_models", 300, RaceModels},
+				{"wow_scale_probe", 40, ScaleProbe},
+				{"wow_stray_menu", 20, StrayMenu}}) {
+				if (("," + Config::Get().testOnly + ",").find("," + step.name + ",") != std::string::npos) g_steps.push_back(step);
+			}
+			if (("," + Config::Get().testOnly + ",").find(",wow_paladin_heals,") != std::string::npos)
+				g_steps.push_back({"wow_paladin_heals", 75, PaladinHeals});
+			if (("," + Config::Get().testOnly + ",").find(",wow_paladin_seals,") != std::string::npos)
+				g_steps.push_back({"wow_paladin_seals", 180, PaladinSeals});
+			if (("," + Config::Get().testOnly + ",").find(",wow_paladin_immunity,") != std::string::npos)
+				g_steps.push_back({"wow_paladin_immunity", 100, PaladinImmunity});
+
+			if (("," + Config::Get().testOnly + ",").find(",wow_paladin_control,") != std::string::npos)
+				g_steps.push_back({"wow_paladin_control", 120, PaladinControl});
+
+			if (("," + Config::Get().testOnly + ",").find(",wow_paladin_defense,") != std::string::npos)
+				g_steps.push_back({"wow_paladin_defense", 150, PaladinDefense});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_paladin_identity,")!=std::string::npos)
+            g_steps.push_back({"wow_paladin_identity",240,[](double t,json& r) {
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"pass",error==nullptr},{"checks",g_ctx.value("checks",json::object())}};
+                    if (error) r["error"]=error;
+                    for (const auto& [key,ok] : r["checks"].items()) if (ok!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    if (!Integration::Active() || Character::Get().classId!=11 || Character::Looks().race!=4)
+                        return finish("requires the fresh Night Elf druid fixture");
+                    BeginTaurenProbe(); g_ctx["index"]=0;
+                    Character::OfferCustomization(false);
+                    const auto progression=Progression::SnapshotForTesting(),cast=Cast::Snapshot();
+                    const bool refused=!Character::SetIdentity(2,1,0);
+                    g_ctx["checks"]["existing_class_change_refused"]=refused && Character::Get().classId==11;
+                    g_ctx["checks"]["existing_class_change_keeps_progression"]=Progression::SnapshotForTesting()==progression;
+                    auto casts=Cast::Snapshot(),castsBefore=cast;   // when it was taken aside
+                    casts.erase("saved_at"); castsBefore.erase("saved_at");
+                    g_ctx["checks"]["existing_class_change_keeps_casts"]=casts==castsBefore;
+                    if (casts!=castsBefore) g_ctx["cast_diff"]=json::diff(castsBefore,casts);
+                    Console::Command("appearance","2","1,0,0,0,0,0,0");
+                    g_ctx["checks"]["appearance_class_change_refused"]=!Console::Snapshot().value("ok",true) &&
+                        Character::Get().classId==11 && Progression::SnapshotForTesting()==progression;
+                    // These restoration paths apply the catalog even without the selection validator's metadata.
+                    Character::ResetSex();
+                    g_ctx["checks"]["new_game_applies_catalog"]=Character::Get().classId==11 && Character::Looks().race==4 && Character::Looks().sex==1;
+                    Character::PrepareLoad(); Character::OnGameLoaded();
+                    g_ctx["checks"]["legacy_load_keeps_progression"]=Character::Get().classId==11 &&
+                        Character::Looks().race==4 && Character::Looks().sex==1 && Progression::SnapshotForTesting()==progression;
+                    g_startDialogClass=2; g_startDialogRace=4;
+                    g_startDialogAnswered=-1; g_startDialogChoice=2; g_allowStartDialog=true;
+                    Console::Command("start"); next(10); return false;
+                }
+                const int stage=g_ctx["stage"],index=g_ctx["index"];
+                const auto race=index<2 ? 1u : 3u,sex=static_cast<std::uint32_t>(index%2);
+                const double since=t-g_ctx["at"].get<double>();
+                if (since>30) return finish("Paladin identity stage did not settle");
+                auto& checks=g_ctx["checks"];
+                const auto suffix=std::format("{}_{}",race,sex);
+                const auto ready=[&] {
+                    const auto* data=Avatar::Data();
+                    return data && Character::Get().classId==2 && data->appearance==Character::Looks() &&
+                        data->appearance.race==race && data->appearance.sex==sex && Forms::Current()=="none";
+                };
+                if (stage==0) {
+                    Character::OfferCustomization(true); // a first-time setup fixture, not an established character
+                    g_startDialogClass=2; g_startDialogRace=race;
+                    g_startDialogAnswered=-1; g_startDialogChoice=sex ? 2 : 1; g_allowStartDialog=true;
+                    Console::Command("start"); next(1); return false;
+                }
+                if (stage==1) {
+                    if (g_startDialogAnswered!=(sex ? 2 : 1) || !ready()) return false;
+                    g_allowStartDialog=false; checks["native_setup_"+suffix]=true;
+                    if (index==0) {
+                        if (!Character::SetIdentity(11,4,1,true)) return finish("Druid fixture unavailable before window selection");
+                        Character::OfferCustomization(true); // exercise the window's class-change host route too
+                    }
+                    Console::Command("appearance"); next(6); return false;
+                }
+                if (stage==10) {
+                    if (g_startDialogAnswered!=2 || RE::UI::GetSingleton()->IsMenuOpen(RE::MessageBoxMenu::MENU_NAME)) return false;
+                    g_allowStartDialog=false;
+                    checks["existing_setup_skips_class"]=Character::Get().classId==11 && Character::Looks().race==4 &&
+                        Progression::SnapshotForTesting()==g_ctx["saved"]["progression"];
+                    Console::Command("appearance"); next(11); return false;
+                }
+                if (stage==11) {
+                    if (WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible()) and 1 or 0")!="1") return false;
+                    checks["existing_class_buttons_disabled"]=WowUi::Eval("(WBCustomizeClass11:IsEnabled()==0 and WBCustomizeClass2:IsEnabled()==0) and 1 or 0")=="1";
+                    WowUi::Eval("(function() WBCustomizeCancel:Click() return 1 end)()");
+                    next(0); return false;
+                }
+                if (stage==6) {
+                    if (WowUi::Eval("(WBCustomizeFrame and WBCustomizeFrame:IsVisible()) and 1 or 0")!="1") return false;
+                    checks["window_class_policy_"+suffix]=WowUi::Eval("WBCustomizeClass2:IsEnabled()")== (index==0 ? "1" : "0");
+                    WowUi::Eval(std::format("(function() WBCustomizeClass2:Click() WBCustomizeRace{}:Click() WBCustomizeGender{}:Click() WBCustomizeAccept:Click() return 1 end)()",race,sex ? "Female" : "Male"));
+                    next(2); return false;
+                }
+                if (stage==2) {
+                    if (!ready() || since<1) return false;
+                    const auto size=Surrogate::ClientSize(race,sex),nightElf=Surrogate::ClientSize(4,sex);
+                    if (!size || !nightElf) return finish("client body size unavailable");
+                    auto* player=RE::PlayerCharacter::GetSingleton();
+                    if (!player->Is3DLoaded()) return false;
+                    // Their surrogate's head at their 1.12 head; the body calibrated to Skyrim's average human (Surrogate).
+                    const float expectedScale=Surrogate::ReferenceScale(race,sex).value_or(0);
+                    checks["surrogate_scale_"+suffix]=std::abs(player->GetReferenceRuntimeData().refScale/100.f-expectedScale)<.011f;
+                    g_ctx["sizes"][suffix]={{"client_height",size->height},{"client_scale",size->modelScale},{"native",Sizes(player)}};
+                    checks["body_scale_"+suffix]=std::abs(Avatar::Data()->look.scale-Surrogate::DrawScale(race,sex).value_or(0))<.0001f;
+                    const auto expected=std::format("Character\\{}\\{}\\{}{}.m2",race==1 ? "Human" : "Dwarf",sex ? "Female" : "Male",race==1 ? "Human" : "Dwarf",sex ? "Female" : "Male");
+                    checks["model_"+suffix]=Avatar::Data()->look.body==expected;
+                    // Their Paladin book comes from their skills (Progression, as the Druid's); none of the Druid's kit stays:
+                    // no forms, none of Wrath, Healing Touch, Bear Form or Moonfire, no Druid talents.
+                    checks["identity_and_no_druid_kit_"+suffix]=WowUi::Eval(std::format(R"((function()
+                        local name,token=UnitClass('player')
+                        if name~='Paladin' or token~='PALADIN' or UnitRace('player')~='{}' or UnitSex('player')~={} or UnitClassification('player')~='normal' then return 0 end
+                        for _,f in ipairs(__WB.forms or {{}}) do   -- their auras may ride the bar; no Druid form does
+                          if f.spell==5487 or f.spell==9634 or f.spell==768 or f.spell==783 or f.spell==1066 or f.spell==24858 then return 0 end
+                        end
+                        for _,id in ipairs(__WB.spellbook or {{}}) do if id==5176 or id==5185 or id==5487 or id==8921 then return 0 end end
+                        PaperDollFrame_SetLevel() return string.find(CharacterLevelText:GetText(),'Paladin',1,true) and 1 or 0
+                    end)())",race==1 ? "Human" : "Dwarf",sex+2))=="1";
+                    checks["native_no_druid_kit_"+suffix]=!Progression::Knows(5176) && !Progression::Knows(5185) && Character::Caster()["talents"].empty();
+                    const auto before=TaurenLook();
+                    Console::Command("identity","2","4,1,0,0,0,0,0");
+                    checks["illegal_pair_"+suffix]=!Console::Snapshot().value("ok",true) && TaurenLook()==before && Character::Get().classId==2;
+                    g_ctx["captures"].push_back("wow_paladin_"+suffix);
+                    g_ctx["snap"]=Snap("wow_paladin_"+suffix); next(3); return false;
+                }
+                if (stage==3) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    if (index==0) {   // a novice Paladin's book: Holy Light, Seal of Righteousness, Devotion Aura; their three trees
+                        if (!(Progression::Knows(635) && Progression::Knows(20154) && Progression::Knows(465)) && since<10) return false;
+                        checks["paladin_book"]=Progression::Knows(635) && Progression::Knows(20154) && Progression::Knows(465);
+                        checks["paladin_talent_tabs"]=WowUi::Eval("GetNumTalentTabs()")=="3";
+                    }
+                    if (index<3) { g_ctx["index"]=index+1; next(0); return false; }
+                    g_ctx["persisted_look"]=TaurenLook();
+                    // Synthetic helpful aura and timer exercise CAST persistence without class abilities or a service reply.
+                    Cast::Restore({{"cooldowns",{{"6603",600.0}}},
+                        {"auras",{{{"spell",6603u},{"name","Identity persistence probe"},{"remaining",600.0}}}}});
+                    checks["cast_fixture"]=!Cast::ItemReady(6603) &&
+                        std::ranges::any_of(Cast::Snapshot()["auras"],[](const json& a) { return a["spell"]==6603; });
+                    g_ctx["save"]=std::format("WBPaladinIdentity_{}_{}",std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()),Frame::Count());
+                    WowUi::SaveVariables(); RE::BGSSaveLoadManager::GetSingleton()->Save(g_ctx["save"].get<std::string>().c_str()); next(4); return false;
+                }
+                if (stage==4) {
+                    if (since<1 || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+                    if (!Character::SetIdentity(11,4,1,true)) return finish("Druid fixture unavailable before reload");
+                    g_ctx["tauren_loads"]=g_loads.loads.load(); g_ctx["tauren_load_at"]=t;
+                    RE::BGSSaveLoadManager::GetSingleton()->Load(g_ctx["save"].get<std::string>().c_str()); next(5); return false;
+                }
+                if (stage==5) {
+                    if (g_loads.loads.load()<=g_ctx["tauren_loads"].get<std::uint64_t>() || !Integration::Active() || !ready()) return false;
+                    checks["save_identity_and_look"]=TaurenLook()==g_ctx["persisted_look"];
+                    const auto* player=RE::PlayerCharacter::GetSingleton();
+                    checks["save_surrogate_scale"]=std::abs(player->GetScale()-g_ctx["sizes"]["3_1"]["native"]["scale"].get<float>())<.011f;
+                    checks["save_has_no_druid_spells"]=!Progression::Knows(5176) && !Progression::Knows(5185) && Character::Caster()["talents"].empty();
+                    checks["save_keeps_cast_cooldown"]=!Cast::ItemReady(6603);
+                    checks["save_keeps_cast_aura"]=std::ranges::any_of(Cast::Snapshot()["auras"],[](const json& a) { return a["spell"]==6603; });
+                    g_ctx["restore_index"]=0; next(12); return false;
+                }
+                // Load a male Tauren cat after a Paladin, then a male Night Elf cat after a Tauren.
+                // The saved race must choose the display before Forms::Reset; activation must keep that form.
+                if (stage==12) {
+                    const auto savedRace=g_ctx["restore_index"]==0 ? 6u : 4u;
+                    if (!Character::SetIdentity(11,savedRace,0,true)) return finish("Druid restore fixture unavailable");
+                    const json form={{"spell",768u},{"auras",json::array({{{"type","shapeshift"},{"form","cat"},
+                        {"power","energy"},{"duration_ms",-1},{"display_id",892u}}})},{"events",json::array()}};
+                    Cast::Restore({{"auras",json::array({{{"spell",768u},{"remaining",600.0},{"form_outcome",form}}})}});
+                    Forms::Reset();
+                    g_ctx["druid_restore_look"]=TaurenLook();
+                    g_ctx["save"]=std::format("WBDruidIdentityRestore_{}_{}",std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()),Frame::Count());
+                    RE::BGSSaveLoadManager::GetSingleton()->Save(g_ctx["save"].get<std::string>().c_str()); next(13); return false;
+                }
+                if (stage==13) {
+                    if (since<1 || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+                    const bool afterPaladin=g_ctx["restore_index"]==0;
+                    if (!Character::SetIdentity(afterPaladin ? 2u : 11u,afterPaladin ? 1u : 6u,1,true))
+                        return finish("previous identity fixture unavailable before Druid reload");
+                    g_ctx["tauren_loads"]=g_loads.loads.load(); g_ctx["tauren_load_at"]=t;
+                    RE::BGSSaveLoadManager::GetSingleton()->Load(g_ctx["save"].get<std::string>().c_str()); next(14); return false;
+                }
+                if (stage==14) {
+                    if (g_loads.loads.load()<=g_ctx["tauren_loads"].get<std::uint64_t>() || !Integration::Active() || !WowUi::Ready() || since<2) return false;
+                    const auto* data=Avatar::Data();
+                    const auto label=g_ctx["restore_index"]==0 ? "druid_after_paladin" : "druid_after_other_race";
+                    checks[std::string(label)+"_identity"]=Character::Get().classId==11 && TaurenLook()==g_ctx["druid_restore_look"];
+                    checks[std::string(label)+"_form"]=Forms::Current()=="cat" && data && data->display==(g_ctx["restore_index"]==0 ? 8571u : 892u);
+                    checks[std::string(label)+"_aura"]=std::ranges::any_of(Cast::Snapshot()["auras"],[](const json& a) { return a["spell"]==768; });
+                    if (g_ctx["restore_index"]==0) { g_ctx["restore_index"]=1; next(12); return false; }
+                    return finish();
+                }
+                return finish("unknown Paladin identity stage");
+            }});
+
+            // The Paladin's class mounts (Mounts.cpp, data/mounts.json CLASS_MOUNTS): as a Paladin the player knows Summon
+            // Warhorse (not yet the Charger, refused), stands still three seconds and rides at +60 SpeedMult, the
+            // service's magicka price taken on completion. FinishTaurenProbe restores their identity and progression.
+            if ((","+Config::Get().testOnly+",").find(",wow_paladin_mount,")!=std::string::npos)
+            g_steps.push_back({"wow_paladin_mount",90,[](double t,json& r) {
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto finish=[&](const char* error=nullptr) {
+                    std::string message; Mounts::Select("none",message);
+                    r={{"pass",error==nullptr},{"checks",g_ctx.value("checks",json::object())},{"evidence",g_ctx.value("evidence",json::object())}};
+                    if (error) r["error"]=error;
+                    for (const auto& [key,ok] : r["checks"].items()) if (ok!=true) r["pass"]=false;
+                    return true;
+                };
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto* av=player->AsActorValueOwner();
+                if (t==0) {
+                    if (!Integration::Active() || Character::Get().classId!=11)
+                        return finish("requires the fresh Night Elf druid fixture");
+                    BeginTaurenProbe();
+                    if (!Character::SetIdentity(2,1,0,true)) return finish("Paladin identity unavailable");
+                    const int spells[]={13819};
+                    Progression::Acquire(spells);
+                    next(1); return false;
+                }
+                const int stage=g_ctx["stage"];
+                const double since=t-g_ctx["at"].get<double>();
+                if (since>30) return finish("Paladin mount stage did not settle");
+                auto& checks=g_ctx["checks"];
+                if (stage==1) {
+                    if (!Progression::Knows(13819) || Forms::Current()!="none" || since<1) return false;
+                    std::string message;
+                    checks["charger_not_known"]=!Mounts::Select("summon_charger",message) && message=="Spell not learned";
+                    av->RestoreActorValue(RE::ActorValue::kMagicka,1000000.0f);
+                    g_ctx["speed_before"]=av->GetActorValue(RE::ActorValue::kSpeedMult);
+                    g_ctx["magicka_max"]=av->GetActorValue(RE::ActorValue::kMagicka);
+                    checks["summon_started"]=Mounts::Select("summon_warhorse",message);
+                    g_ctx["evidence"]["message"]=message;
+                    next(2); return false;
+                }
+                if (stage==2) {
+                    const auto state=Mounts::Snapshot();
+                    if (!state["active"].is_object()) return false;
+                    const auto& active=state["active"];
+                    const float cost=active.value("skyrim_cost",0.0f),spent=g_ctx["magicka_max"].get<float>()-av->GetActorValue(RE::ActorValue::kMagicka);
+                    const float speed=av->GetActorValue(RE::ActorValue::kSpeedMult)-g_ctx["speed_before"].get<float>();
+                    g_ctx["evidence"].update({{"key",active.value("key","")},{"cost",cost},{"spent",spent},{"speed_added",speed}});
+                    checks["warhorse"]=active.value("key","")=="summon_warhorse";
+                    checks["speed_60"]=std::abs(speed-60.0f)<0.5f;
+                    checks["mana_taken"]=cost>0 && spent>=cost-2.0f;   // regeneration may return a little meanwhile
+                    UiPass::RequestCapture("wow_paladin_mount");
+                    next(3); return false;
+                }
+                if (stage==3) { if (since<1.5) return false; return finish(); }
+                return finish("unknown Paladin mount stage");
+            }});
+
+            // Explicit disposable fixtures: the window's real controls, then service-backed model/racial probes.
+            // FinishTaurenProbe owns every exit, including RunSuite's timeout outside these poll functions.
+            if ((","+Config::Get().testOnly+",").find(",wow_tauren_creation,")!=std::string::npos)
+            g_steps.push_back({"wow_tauren_creation",90,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; g_ctx["frames"]=WowModels::GetStats().frames; };
+                auto shot=[&](const std::string& name) { g_ctx["captures"].push_back(name); g_ctx["snap"]=Snap(name); };
+                auto preview=[] {
+                    const auto value=WowUi::Eval("(function() local l=__wbTaurenLook if not l then return '' end return table.concat({l.race,l.sex,l.skin,l.face,l.hairStyle,l.hairColor,l.facialHair},',') end)()");
+                    return json::parse("["+value+"]",nullptr,false);
+                };
+                auto modelChange=[](const json& before,const json& after,bool style) {
+                    if (!before.is_array() || before.size()!=7 || !after.is_array() || after.size()!=7) return false;
+                    auto look=[](const json& l) { return wowcore::Appearance{l[0].get<unsigned>(),l[1].get<unsigned>(),l[2].get<unsigned>(),
+                        l[3].get<unsigned>(),l[4].get<unsigned>(),l[5].get<unsigned>(),l[6].get<unsigned>()}; };
+                    const wowcore::Mpq mpq(Config::ClientData());
+                    const auto a=wowcore::dressCharacter(mpq,look(before),{}),b=wowcore::dressCharacter(mpq,look(after),{});
+                    return style ? a.geosets!=b.geosets : a.hair!=b.hair || a.skin.rgba!=b.skin.rgba || a.replaceableTextures!=b.replaceableTextures;
+                };
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"pass",error==nullptr},{"checks",g_ctx.value("checks",json::object())},
+                        {"review","Compare both sexes' horns before/style/color; accepted captures must show Tauren body, portrait, paper doll and helm dressing room. Both accepted Tauren bodies must be taller/broader with feet grounded and camera pivot at the head; Night Elf captures must restore the original size/framing. Reload must keep the female Tauren look and size."}};
+                    if (error) r["error"]=error;
+                    for (const auto& v : r["checks"]) if (v!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    if (!Integration::Active() || Character::Looks().race!=4 || Character::Get().classId!=11)
+                        return finish("requires the fresh Night Elf druid integration fixture");
+                    BeginTaurenProbe(); g_ctx["sex"]=0;
+                    // Observe the payload sent to the existing preview renderer without replacing its behavior.
+                    WowUi::Eval("(function() __wbTaurenHost=__WBCustomizeLook __WBCustomizeLook=function(l) "
+                        "__wbTaurenLook={} for k,v in pairs(l) do __wbTaurenLook[k]=v end "
+                        "return __wbTaurenHost(l) end return 1 end)()");
+                    Console::Execute("wb appearance"); next(0); return false;
+                }
+                if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
+                if (t>68) return finish("creation budget reserved for restoration");
+                const int stage=g_ctx["stage"],sex=g_ctx["sex"];
+                const std::string suffix=sex ? "female" : "male";
+                const double since=t-g_ctx["at"].get<double>();
+                auto& checks=g_ctx["checks"];
+                auto bodyReady=[&](bool tauren) {
+                    const auto* data=Avatar::Data();
+                    const auto body=std::format("Character\\{}\\{}\\{}{}.m2",tauren ? "Tauren" : "NightElf",sex ? "Female" : "Male",tauren ? "Tauren" : "NightElf",sex ? "Female" : "Male");
+                    return data && data->look.body==body && data->appearance==Character::Looks() && Character::Looks().race==(tauren ? 6u : 4u) &&
+                        Character::Looks().sex==static_cast<unsigned>(sex) && WowModels::Portrait() && WowModels::GetStats().batches>0 &&
+                        WowModels::GetStats().frames>=g_ctx["frames"].get<std::uint64_t>()+10;
+                };
+                if (since>12 && stage<12) return finish("creation stage did not settle");
+                if (since<.6 || !WowUi::Ready()) return false;
+                ProbeWait("wow_tauren_creation",t,{{"stage",stage},{"sex",sex},{"look",TaurenLook()}});
+                if (stage==0) {
+                    if (WowUi::Eval("WBCustomizeFrame and WBCustomizeFrame:IsVisible() and 1 or 0")!="1") return false;
+                    WowUi::Eval(std::format("(function() WBCustomizeGender{}:Click() WBCustomizeRace4:Click() WBCustomizeAccept:Click() return 1 end)()",sex ? "Female" : "Male"));
+                    next(1); return false;
+                }
+                if (stage==1) {
+                    if (!bodyReady(false)) return false;
+                    checks["nightelf_"+suffix]=true;
+                    g_ctx["sizes"][suffix]["nightelf"]=Sizes(player);
+                    Console::Execute("wb appearance"); next(2); return false;
+                }
+                if (stage==2) {
+                    if (WowUi::Eval("WBCustomizeFrame:IsVisible() and 1 or 0")!="1") return false;
+                    WowUi::Eval("(function() WBCustomizeRace6:Click() return 1 end)()");
+                    const auto l=preview(); if (!l.is_array() || l.size()!=7) return finish("missing creation preview payload");
+                    g_ctx["horn_before"]=l;
+                    try {
+                        const wowcore::Mpq mpq(Config::ClientData()); const auto c=wowcore::customization(mpq,6,sex);
+                        g_ctx["ranges"][suffix]={{"skin",c.skins},{"face",c.faces},{"hair",c.hairStyles},{"color",c.hairColors},{"facial",c.facialHairs}};
+                        checks["client_ranges_"+suffix]=c.skins==(sex ? 11u : 19u) && c.hairStyles==(sex ? 7u : 8u) && c.facialHairs==(sex ? 5u : 7u) &&
+                            !c.faces.empty() && std::ranges::all_of(c.faces,[sex](auto n) { return n==(sex ? 4u : 5u); }) &&
+                            !c.hairColors.empty() && std::ranges::all_of(c.hairColors,[](auto n) { return n==3; });
+                    } catch (const std::exception& e) { return finish(e.what()); }
+                    checks["horn_options_"+suffix]=WowUi::Eval("WBCustomizeOption3:IsVisible() and WBCustomizeOption4:IsVisible() and WBCustomizeOption3Text:GetText()=='Horn Style' and WBCustomizeOption4Text:GetText()=='Horn Color' and 1 or 0")=="1";
+                    shot("wow_tauren_creation_"+suffix+"_horn_before"); next(3); return false;
+                }
+                if (stage==3) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() CharacterCustomization_Right(3) return 1 end)()");
+                    const auto l=preview(); g_ctx["horn_style"]=l;
+                    checks["horn_style_payload_"+suffix]=l.is_array() && l.size()==7 && l[4]!=g_ctx["horn_before"][4];
+                    try { checks["horn_style_model_"+suffix]=modelChange(g_ctx["horn_before"],l,true); }
+                    catch (const std::exception& e) { return finish(e.what()); }
+                    shot("wow_tauren_creation_"+suffix+"_horn_style"); next(4); return false;
+                }
+                if (stage==4) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() CharacterCustomization_Right(4) return 1 end)()");
+                    const auto l=preview(); g_ctx["accepted"]=l;
+                    checks["horn_color_payload_"+suffix]=l.is_array() && l.size()==7 && l[5]!=g_ctx["horn_style"][5];
+                    try { checks["horn_color_model_"+suffix]=modelChange(g_ctx["horn_style"],l,false); }
+                    catch (const std::exception& e) { return finish(e.what()); }
+                    shot("wow_tauren_creation_"+suffix+"_horn_color"); next(5); return false;
+                }
+                if (stage==5) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() WBCustomizeAccept:Click() return 1 end)()"); next(6); return false;
+                }
+                if (stage==6) {
+                    if (!bodyReady(true)) return false;
+                    auto* orc=RE::TESForm::LookupByID<RE::TESRace>(0x13747);
+                    checks["accepted_"+suffix]=TaurenLook()==g_ctx["accepted"];
+                    const auto tauren=Surrogate::ClientSize(6,sex),nightElf=Surrogate::ClientSize(4,sex);
+                    if (!tauren || !nightElf) return finish("client race dimensions unavailable");
+                    const float ratio=tauren->height/nightElf->height;
+                    const auto& before=g_ctx["sizes"][suffix]["nightelf"];
+                    g_ctx["sizes"][suffix]["accepted"]=Sizes(player);
+                    g_ctx["sizes"][suffix]["client"]={{"display",tauren->display},{"model",tauren->model},
+                        {"model_scale",tauren->modelScale},{"tauren_height_yards",tauren->height},
+                        {"nightelf_height_yards",nightElf->height},{"surrogate_ratio",ratio}};
+                    // Skyrim stores reference scale in hundredths; height follows that quantized scale. Their surrogate's
+                    // head at their 1.12 head (capped for doorways); the body calibrated to Skyrim's average human (Surrogate).
+                    checks["surrogate_scale_"+suffix]=ratio>1 && std::abs(player->GetReferenceRuntimeData().refScale/100.f-Surrogate::ReferenceScale(6,sex).value_or(0))<.011f;
+                    checks["surrogate_height_"+suffix]=std::abs(player->GetHeight()-before["height"].get<float>()*player->GetScale()/before["scale"].get<float>())<1.f;
+                    checks["drawn_client_scale_"+suffix]=std::abs(Avatar::Data()->look.scale-Surrogate::DrawScale(6,sex).value_or(0))<.0001f;
+                    checks["body_and_portrait_"+suffix]=AvatarWorn() && WowUi::Eval("select(2,UnitRace('player'))")=="Tauren" &&
+                        WowUi::Eval("UnitSex('player')")==(sex ? "3" : "2");
+                    checks["orc_voice_"+suffix]=orc && orc->defaultVoiceTypes[sex] && player->GetActorBase()->voiceType==orc->defaultVoiceTypes[sex] && player->GetActorBase()->IsFemale()==(sex==1);
+                    const auto helm=std::string(R"(Item\ObjectComponents\Head\Helm_Leather_RaidDruid_B_01_Ta)")+(sex ? "F.m2" : "M.m2");
+                    if (ItemPreview::ModelFor(16900)!=helm || ItemPreview::ModelFor(16897)!=Avatar::Data()->look.body) return false;
+                    checks["helm_and_chest_models_"+suffix]=true;
+                    g_ctx["models"][suffix]={{"body",Avatar::Data()->look.body},{"helm",ItemPreview::ModelFor(16900)},
+                        {"chest",ItemPreview::ModelFor(16897)},{"voice",player->GetActorBase()->voiceType ? player->GetActorBase()->voiceType->GetFormID() : 0u}};
+                    WowUi::Eval("(function() ShowUIPanel(CharacterFrame) DressUpItemLink('item:16900:0:0:0') return 1 end)()"); next(7); return false;
+                }
+                if (stage==7) {
+                    if (WowUi::Eval("CharacterFrame:IsVisible() and PaperDollFrame:IsVisible() and __WBPlayerModelReady()==1 and DressUpFrame:IsVisible() and 1 or 0")!="1") return false;
+                    checks["paper_doll_"+suffix]=true;
+                    shot("wow_tauren_creation_"+suffix+"_accepted"); next(8); return false;
+                }
+                if (stage==8) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() HideUIPanel(CharacterFrame) HideUIPanel(DressUpFrame) __WBCustomizeAppearance() WBCustomizeRace4:Click() WBCustomizeAccept:Click() return 1 end)()");
+                    next(9); return false;
+                }
+                if (stage==9) {
+                    if (!bodyReady(false)) return false;
+                    checks["back_to_nightelf_"+suffix]=true;
+                    const auto& before=g_ctx["sizes"][suffix]["nightelf"];
+                    g_ctx["sizes"][suffix]["restored"]=Sizes(player);
+                    checks["surrogate_size_restored_"+suffix]=std::abs(player->GetScale()-before["scale"].get<float>())<.005f &&
+                        std::abs(player->GetHeight()-before["height"].get<float>())<1.f;
+                    checks["nightelf_drawn_scale_"+suffix]=std::abs(Avatar::Data()->look.scale-Surrogate::DrawScale(4,sex).value_or(0))<.0001f;   // calibrated (Surrogate)
+                    shot("wow_tauren_creation_"+suffix+"_nightelf"); next(10); return false;
+                }
+                if (stage==10) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    if (sex==0) { g_ctx["sex"]=1; Console::Execute("wb appearance"); next(0); return false; }
+                    WowUi::Eval("(function() __WBCustomizeAppearance() WBCustomizeRace6:Click() WBCustomizeAccept:Click() return 1 end)()"); next(11); return false;
+                }
+                if (stage==11) {
+                    if (!bodyReady(true)) return false;
+                    g_ctx["persisted_look"]=TaurenLook();
+                    g_ctx["persisted_size"]=Sizes(player);
+                    g_ctx["save"]=std::format("WBTaurenCreation_{}_{}",std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()),Frame::Count());
+                    WowUi::SaveVariables(); RE::BGSSaveLoadManager::GetSingleton()->Save(g_ctx["save"].get<std::string>().c_str()); next(12); return false;
+                }
+                if (stage==12) {
+                    if (since<1 || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+                    WowUi::Eval("(function() __WBCustomizeAppearance() WBCustomizeRace4:Click() WBCustomizeAccept:Click() return 1 end)()"); next(13); return false;
+                }
+                if (stage==13) {
+                    if (!bodyReady(false)) return false;
+                    checks["changed_before_reload"]=true;
+                    g_ctx["tauren_loads"]=g_loads.loads.load(); g_ctx["tauren_load_at"]=t;
+                    RE::BGSSaveLoadManager::GetSingleton()->Load(g_ctx["save"].get<std::string>().c_str()); next(14); return false;
+                }
+                if (stage==14) {
+                    if (g_loads.loads.load()<=g_ctx["tauren_loads"].get<std::uint64_t>() || !Integration::Active() || !Progression::Ready() || !bodyReady(true)) return false;
+                    checks["race_and_look_after_reload"]=TaurenLook()==g_ctx["persisted_look"];
+                    g_ctx["reloaded_size"]=Sizes(player);
+                    checks["surrogate_size_after_reload"]=std::abs(player->GetScale()-g_ctx["persisted_size"]["scale"].get<float>())<.005f &&
+                        std::abs(player->GetHeight()-g_ctx["persisted_size"]["height"].get<float>())<1.f;
+                    shot("wow_tauren_creation_reload"); next(15); return false;
+                }
+                if (!Settled(g_ctx["snap"])) return false;
+                return finish();
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_tauren_forms,")!=std::string::npos)
+            g_steps.push_back({"wow_tauren_forms",90,[](double t,json& r) {
+                // service/feral.py TAUREN_DISPLAY, checked below against the client's CreatureDisplayInfo/ModelData.
+                constexpr std::array<const char*,5> forms={"cat","bear","travel","aquatic","moonkin"};
+                constexpr std::array<unsigned,5> displays={8571,2289,632,2428,15375},spells={768,5487,783,1066,24858};
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"pass",error==nullptr},{"checks",g_ctx.value("checks",json::object())},
+                        {"review","Each capture must show the named Tauren form with the recorded client model/skin. Aquatic uses the console's land-preview path; Moonkin's service quote uses a legal Balance build. These are display fixtures, not learning or water-entry tests."}};
+                    if (error) r["error"]=error;
+                    for (const auto& v : r["checks"]) if (v!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    if (!Integration::Active() || Character::Looks().race!=4 || Character::Get().classId!=11) return finish("requires the fresh Night Elf druid fixture");
+                    BeginTaurenProbe(); g_ctx["index"]=0;
+                    if (!Character::SetLooks({6,1,0,0,0,0,0})) return finish("Tauren appearance unavailable");
+                    next(0); return false;
+                }
+                if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
+                if (t>65) return finish("form budget reserved for restoration");
+                const int stage=g_ctx["stage"],i=g_ctx["index"];
+                const std::string form=forms[i]; const auto display=displays[i];
+                if (t-g_ctx["at"].get<double>()>10) return finish("Tauren form stage did not settle");
+                if (stage==0) {
+                    auto caster=Character::Caster(); caster["race"]=Character::Get().looks.race; caster["form"]=form;
+                    // Same legal Balance allocation as service/tests/test_talents.py; quote only,
+                    // leaving their native level, learned spells and allocation untouched.
+                    if (form=="moonkin") {
+                        caster["level"]=60;
+                        caster["talents"]={{"762",5},{"763",5},{"791",5},{"781",3},{"782",2},{"789",1},{"784",4},{"790",5},{"793",1}};
+                    }
+                    g_ctx.erase("profile");
+                    Service::Request({{"op","stats"},{"caster",caster}},[index=g_index](const json& reply) { if (index==g_index) g_ctx["profile"]=reply; });
+                    next(1); return false;
+                }
+                if (stage==1) {
+                    if (!g_ctx.contains("profile")) return false;
+                    const auto& reply=g_ctx["profile"];
+                    if (!reply.value("ok",false) || !reply.contains("form")) return finish("service form profile unavailable");
+                    auto aura=reply["form"];
+                    g_ctx["checks"][form+"_service_display"]=aura.value("display_id",0u)==display;
+                    try {
+                        const wowcore::Mpq mpq(Config::ClientData()); const auto look=wowcore::dressCreature(mpq,display);
+                        if (!look) return finish("client creature display/model missing");
+                        g_ctx["models"][form]={{"display",display},{"body",look->body},{"skins",look->replaceableTextures},{"scale",look->scale}};
+                    } catch (const std::exception& e) { return finish(e.what()); }
+                    aura["type"]="shapeshift"; aura["action"]="enter"; aura["duration_ms"]=-1;
+                    Cast::FormForTesting(spells[i],{{"spell",spells[i]},{"auras",json::array({aura})}});
+                    g_ctx["frames"]=WowModels::GetStats().frames; next(2); return false;
+                }
+                if (stage==2) {
+                    const auto* data=Avatar::Data(); const auto pose=Avatar::Current(); const auto draw=WowModels::GetStats();
+                    if (t-g_ctx["at"].get<double>()<1 || !data || data->display!=display || draw.frames<g_ctx["frames"].get<std::uint64_t>()+10) return false;
+                    const auto& expected=g_ctx["models"][form];
+                    g_ctx["checks"][form+"_client_model"]=data->look.body==expected["body"].get<std::string>() && json(data->look.replaceableTextures)==expected["skins"] &&
+                        std::abs(data->look.scale-expected["scale"].get<float>())<.001f;
+                    g_ctx["checks"][form+"_drawn"]=Forms::Current()==form && pose.visible && pose.mountDisplay==0 && draw.mountDisplay==0 && draw.batches>0;
+                    const auto name="wow_tauren_forms_"+form; g_ctx["captures"].push_back(name); g_ctx["snap"]=Snap(name); next(3); return false;
+                }
+                if (!Settled(g_ctx["snap"])) return false;
+                Cast::FormForTesting(0,{});
+                if (i==4) return finish();
+                g_ctx["index"]=i+1; next(0); return false;
+            }});
+
+            if ((","+Config::Get().testOnly+",").find(",wow_tauren_racials,")!=std::string::npos)
+            g_steps.push_back({"wow_tauren_racials",90,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto health=[&] { return BookMax(player,RE::ActorValue::kHealth); };
+                auto finish=[&](const char* error=nullptr) {
+                    r={{"pass",error==nullptr},{"checks",g_ctx.value("checks",json::object())},
+                        {"review","General-tab capture: War Stomp, Endurance and Nature Resistance. Stomp capture: Tauren casting/impact and selected wolf stunned; JSON records the short stun and native paralysis before capture latency can hide it."}};
+                    if (error) r["error"]=error;
+                    for (const auto& v : r["checks"]) if (v!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    if (!Integration::Active() || Character::Looks().race!=4 || Character::Get().classId!=11) return finish("requires the fresh Night Elf druid fixture");
+                    BeginTaurenProbe(); Carriers::Racials(); next(0); return false;
+                }
+                if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
+                if (t>60 || t-g_ctx["at"].get<double>()>12) return finish("racial stage did not settle");
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                auto& checks=g_ctx["checks"];
+                if (stage==0) {
+                    if (since<1) return false;
+                    g_ctx["health_before"]=health();
+                    if (!Character::SetLooks({6,1,0,0,0,0,0})) return finish("Tauren appearance unavailable");
+                    auto caster=Character::Caster(); caster["race"]=Character::Get().looks.race; caster["form"]="none";
+                    Service::Request({{"op","stats"},{"caster",caster}},[index=g_index](const json& reply) { if (index==g_index) g_ctx["stats"]=reply; });
+                    next(1); return false;
+                }
+                if (stage==1) {
+                    if (since<1 || !g_ctx.contains("stats")) return false;
+                    const auto& stats=g_ctx["stats"]; if (!stats.value("ok",false)) return finish("service racial stats unavailable");
+                    bool endurance=false,nature=false;
+                    for (const auto& p : stats.value("racials",json::array())) {
+                        if (p.value("spell",0)==20550) endurance=p.value("type","")=="health_percent" && p.value("amount",0)==5 && p.value("max_health",0)>0 && std::abs(p.value("multiplier",0.f)-1.05f)<.001f;
+                        if (p.value("spell",0)==20551) nature=p.value("type","")=="resistance" && p.value("school_mask",0)==8 && p.value("amount",0)==10 && stats["resist"].value("3",0.f)>=10;
+                    }
+                    g_ctx["health_after"]=health();
+                    checks["endurance_service"]=endurance; checks["nature_service"]=nature;
+                    checks["endurance_native"]=Carriers::HasRacial(20550) && std::abs(health()-g_ctx["health_before"].get<float>()*1.05f)<.2f;
+                    Carriers::Racials(); checks["endurance_does_not_stack"]=std::abs(health()-g_ctx["health_after"].get<float>())<.01f;
+                    checks["nature_native"]=Carriers::HasRacial(20551);
+                    checks["general_tab"]=WowUi::Eval("(function() for tab=1,GetNumSpellTabs() do local name,_,offset,count=GetSpellTabInfo(tab) "
+                        "if name=='General' then local found={} for i=offset+1,offset+count do found[__WB.bookSpell(i,'spell')]=true end "
+                        "return found[20549] and found[20550] and found[20551] and 1 or 0 end end return 0 end)()")=="1";
+                    WowUi::Eval("(function() if not SpellBookFrame:IsVisible() then ToggleSpellBook('spell') end "
+                        "SpellBookFrame.selectedSkillLine=1 SPELLBOOK_PAGENUMBERS[1]=1 SpellBookFrame_Update(1) return 1 end)()");
+                    const auto name="wow_tauren_racials_general"; g_ctx["captures"].push_back(name); g_ctx["snap"]=Snap(name); next(2); return false;
+                }
+                if (stage==2) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() HideUIPanel(SpellBookFrame) return 1 end)()");
+                    auto* wolf=SpawnWolf(3*Avatar::kUnitsPerYard,60); if (!wolf) return finish("missing disposable War Stomp wolf");
+                    g_ctx["enemy"]=wolf->GetFormID(); Bridge::SetTarget(wolf); next(3); return false;
+                }
+                auto* wolf=RE::TESForm::LookupByID<RE::Actor>(g_ctx.value("enemy",0u));
+                if (!wolf || !wolf->Is3DLoaded()) return false;
+                if (stage==3) {
+                    if (since<.5) return false;
+                    checks["war_stomp_stuns"]=false; // remains false if the impact never supplies a stun
+                    g_ctx["paralysis_before"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kParalysis);
+                    // Native actor updates must process paralysis; SpawnWolf normally freezes them.
+                    wolf->EnableAI(true); Cast::Use(20549); g_ctx["attempts"]=1; next(4); return false;
+                }
+                if (stage==4) {
+                    const auto diag=Cast::TalentDiagnostics();
+                    g_ctx["last_cast"]=diag; g_ctx["last_error"]=WowUi::Eval("WBTestLastError or ''");
+                    for (const auto& aura : diag["auras"]) if (aura["spell"]==20549 && aura["target"]==wolf->GetFormID() && aura.value("stun",false) && aura.value("control_remaining",0.f)>0) {
+                        const bool carrier=SleepCarrier(wolf),paralyzed=wolf->GetActorRuntimeData().boolBits.any(RE::Actor::BOOL_BITS::kParalyzed);
+                        if (!Evidence::StunObserved(carrier,paralyzed,aura.value("control_remaining",0.0),0,2.1)) continue;
+                        g_ctx["stun"]=aura; g_ctx["paralysis"]=wolf->AsActorValueOwner()->GetActorValue(RE::ActorValue::kParalysis);
+                        g_ctx["native_stun"]={{"carrier",carrier},{"paralyzed",paralyzed}};
+                        checks["war_stomp_stuns"]=true;
+                        const auto name="wow_tauren_racials_stomp"; g_ctx["captures"].push_back(name); g_ctx["snap"]=Snap(name); next(5); return false;
+                    }
+                    // Real spells may resist. Retry at most three times, clearing only fixture cooldowns.
+                    if (since>3 && g_ctx["attempts"].get<int>()<3) {
+                        Cast::ResetForTesting(); BookReady(); Cast::Use(20549); g_ctx["attempts"]=g_ctx["attempts"].get<int>()+1; next(4);
+                    }
+                    return false;
+                }
+                if (!Settled(g_ctx["snap"])) return false;
+                checks["stomp_cooldown"]=Cast::Snapshot()["cooldowns"].value("20549",0.f)>0;
+                return finish();
+            }});
+
+            // Explicit: the Paladin's Human and Dwarf racials through their bar's own casts (PaladinFixture: a level-60 Human
+            // Paladin, a still wolf and a follower ahead). Human: the named markers, The Human Spirit's service share as
+            // its native Fortify Magicka Rate, Perception's Detect Life for the aura's life. Dwarf: Frost Resistance at
+            // 10/3, Stoneform's purge, refusal, Resist Poison/Disease 100 and armor share for 8 s, Find Treasure's
+            // tracking aura. Every exit removes its Skyrim disease, poison and bleeding; the wow_paladin_ hook restores the player.
+            if ((","+Config::Get().testOnly+",").find(",wow_paladin_racials,")!=std::string::npos)
+            g_steps.push_back({"wow_paladin_racials",150,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                constexpr RE::FormID kRattles=0xB8781, kPoison=0x65A6F, kBleed=0x0C5BEC, kBleeding=0x0C367A;   // wb afflict's; an axe perk's bleed
+                auto fixtures=[&] {   // which of the Skyrim disease, poison and bleeding are on the player
+                    json on={{"disease",false},{"poison",false},{"bleed",false}};
+                    for (auto* spell : player->GetActorRuntimeData().addedSpells) if (spell && spell->GetFormID()==kRattles) on["disease"]=true;
+                    if (auto* effects=player->GetActiveEffectList()) for (auto* e : *effects) {
+                        const auto* base=e ? e->GetBaseObject() : nullptr;
+                        if (!base || !e->spell || e->flags.any(RE::ActiveEffect::Flag::kDispelled)) continue;
+                        if (e->spell->GetFormID()==kPoison) on["poison"]=true;
+                        if (base->GetFormID()==kBleeding) on["bleed"]=true;
+                    }
+                    return on;
+                };
+                auto afflict=[&] {
+                    auto* disease=RE::TESForm::LookupByID<RE::SpellItem>(kRattles);
+                    auto* poison=RE::TESForm::LookupByID<RE::MagicItem>(kPoison);
+                    auto* bleed=RE::TESForm::LookupByID<RE::MagicItem>(kBleed);
+                    auto* caster=player->GetMagicCaster(RE::MagicSystem::CastingSource::kInstant);
+                    if (!disease || !poison || !bleed || !caster) return false;
+                    player->AddSpell(disease);
+                    caster->CastSpellImmediate(poison,false,player,1.0f,false,0.0f,nullptr);
+                    caster->CastSpellImmediate(bleed,false,player,1.0f,false,0.0f,nullptr);
+                    return true;
+                };
+                auto native=[&](const char* spell,int av) {   // a carrier's summed value-modifier magnitude; -1: none on the player
+                    float sum=-1.f;
+                    for (const auto& e : Carriers::EffectsForTesting(player))
+                        if (e.value("spell","")==spell && e.value("av",-1)==av) sum=std::max(sum,0.f)+e.value("magnitude",0.f);
+                    return sum;
+                };
+                auto general=[&](std::initializer_list<int> a_has,std::initializer_list<int> a_lacks) {   // their General tab
+                    std::string all="1";
+                    for (const int id : a_has) all+=std::format(" and found[{}]",id);
+                    for (const int id : a_lacks) all+=std::format(" and not found[{}]",id);
+                    return WowUi::Eval("(function() for tab=1,GetNumSpellTabs() do local name,_,offset,count=GetSpellTabInfo(tab) "
+                        "if name=='General' then local found={} for i=offset+1,offset+count do found[__WB.bookSpell(i,'spell')]=true end "
+                        "return ("+all+") and 1 or 0 end end return 0 end)()")=="1";
+                };
+                auto book=[&](const char* a_capture) {
+                    WowUi::Eval("(function() if not SpellBookFrame:IsVisible() then ToggleSpellBook('spell') end "
+                        "SpellBookFrame.selectedSkillLine=1 SPELLBOOK_PAGENUMBERS[1]=1 SpellBookFrame_Update(1) return 1 end)()");
+                    g_ctx["captures"].push_back(a_capture); g_ctx["snap"]=Snap(a_capture);
+                };
+                auto finish=[&](const char* error=nullptr) {
+                    if (auto* disease=RE::TESForm::LookupByID<RE::SpellItem>(kRattles); disease && player->HasSpell(disease)) player->RemoveSpell(disease);
+                    auto handle=player->CreateRefHandle();
+                    for (const auto id : {kPoison,kBleed}) if (auto* spell=RE::TESForm::LookupByID<RE::MagicItem>(id)) player->GetMagicTarget()->DispelEffect(spell,handle);
+                    WowUi::Eval("(function() HideUIPanel(SpellBookFrame) return 1 end)()");
+                    PaladinFinish(r,error);
+                    r["captures"]=g_ctx.value("captures",json::array());
+                    r["review"]="Human: General tab with Perception, Sword and Mace Specialization, The Human Spirit, Diplomacy. Perception: Detect Life "
+                        "on the wolf and the follower ahead. Dwarf: General tab with Stoneform, Find Treasure, Gun Specialization, Frost Resistance. "
+                        "Stoneform: its buff, no Skyrim disease, poison or bleeding left on the player.";
+                    return true;
+                };
+                if (t==0) {
+                    if (!Integration::Active()) return PaladinFinish(r,"requires WoWBridge active on a disposable save");
+                    PaladinFixture(json::object()); next(0); return false;
+                }
+                if (t>130) return finish("racial stage did not settle");
+                if (!Progression::Ready()) return false;
+                auto& checks=g_ctx["checks"];
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                if (stage==0) {   // Human: their own stats answer gives the share HumanSpirit carries (asked at most once a second)
+                    if (since<3) return false;
+                    Carriers::Racials();
+                    PaladinAsk({{"op","stats"},{"caster",PaladinCaster()}},"stats"); next(1); return false;
+                }
+                if (stage==1) {
+                    if (!g_ctx.contains("stats")) return since>10 ? finish("service racial stats unavailable") : false;
+                    const auto& stats=g_ctx["stats"]; if (!stats.value("ok",false)) return finish("service racial stats unavailable");
+                    float share=-1.f;
+                    for (const auto& p : stats.value("racials",json::array())) if (p.value("spell",0)==20598 && p.value("type","")=="stat_percent" && p.value("amount",0)==5)
+                        for (const auto& e : p.value("skyrim",json::array())) if (e.value("mgef",0u)==0x7A0FDu) share=e.value("magnitude",0.f);
+                    const auto values=Character::Caster()["actor_values"];
+                    g_ctx["evidence"]["human_spirit"]={{"share",share},{"native",native("The Human Spirit",156)},{"actor_values",values}};
+                    checks["human_spirit_service"]=share>0;
+                    checks["human_spirit_native"]=share>0 && std::abs(native("The Human Spirit",156)-share)<.01f;
+                    checks["human_spirit_owned"]=share>0 && values["owned"].value("156",0.f)>=share-.01f;   // not counted again as external regen
+                    checks["human_markers"]=Carriers::HasRacial(20597) && Carriers::HasRacial(20599) && Carriers::HasRacial(20864) &&
+                        !Carriers::HasRacial(20595) && !Carriers::HasRacial(20596) && !Carriers::HasRacial(20583);
+                    checks["human_general_tab"]=general({20600,20597,20598,20599,20864},{20594,2481,20595,20596,20580});
+                    book("wow_paladin_racials_human"); next(2); return false;
+                }
+                if (stage==2) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() HideUIPanel(SpellBookFrame) return 1 end)()");
+                    Cast::RefreshCooldownsForTesting(); BookReady(); Cast::Use(20600); next(3); return false;
+                }
+                if (stage==3) {
+                    // Its Detect Life lands after the WoW aura (Carriers waits half a second for the cast to settle).
+                    if (since<.8 || (!Carriers::Perceiving() && since<3)) return false;
+                    const auto aura=PaladinAura(20600); g_ctx["evidence"]["perception"]=aura;
+                    checks["perception_cast"]=aura.value("remaining",0.)>19.5-since && aura.value("remaining",0.)<=20.1;
+                    // Its fire-and-forget Detect Life lights the living without staying in their effect list (the capture
+                    // shows it): the carrier's own state for this aura.
+                    checks["perception_detect_life"]=Carriers::Perceiving();
+                    if (!Carriers::Perceiving()) {   // evidence: what is on the player
+                        json seen=json::array();
+                        if (auto* effects=player->GetActiveEffectList()) for (auto* e : *effects) if (e && e->spell && e->GetBaseObject())
+                            seen.push_back({e->spell->GetName() ? e->spell->GetName() : "", std::format("{:08X}",e->spell->GetFormID()),
+                                static_cast<int>(e->GetBaseObject()->data.archetype), e->flags.underlying()});
+                        g_ctx["evidence"]["effects_on_her"]=seen;
+                    }
+                    g_ctx["captures"].push_back("wow_paladin_racials_perception"); g_ctx["snap"]=Snap("wow_paladin_racials_perception");
+                    next(4); return false;
+                }
+                if (stage==4) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    Cast::CancelAura(20600); next(5); return false;   // their right click: Detect Life ends with it
+                }
+                if (stage==5) {
+                    if (since<.5) return false;
+                    checks["perception_ends_with_aura"]=PaladinAura(20600).empty() && !Carriers::Perceiving();
+                    if (!Character::SetIdentity(2,3,1,true)) return finish("Dwarf Paladin identity unavailable");
+                    next(6); return false;
+                }
+                if (stage==6) {   // Dwarf: Frost Resistance at gear's 10/3 and markers; the Human's carriers gone
+                    if (since<1.5) return false;
+                    Carriers::Racials();
+                    const auto values=Character::Caster()["actor_values"];
+                    g_ctx["evidence"]["dwarf"]={{"frost",native("Frost Resistance",43)},{"actor_values",values}};
+                    checks["dwarf_passives"]=Carriers::HasRacial(20595) && Carriers::HasRacial(20596) && !Carriers::HasRacial(20597) &&
+                        !Carriers::HasRacial(20599) && !Carriers::HasRacial(20864);
+                    checks["human_spirit_removed"]=native("The Human Spirit",156)<0;
+                    checks["frost_resistance_native"]=std::abs(native("Frost Resistance",43)-10.f/3.f)<.01f;
+                    checks["frost_resistance_owned"]=values["owned"].value("43",0.f)>=10.f/3.f-.01f;
+                    checks["dwarf_general_tab"]=general({20594,2481,20595,20596},{20600,20597,20598,20599,20864});
+                    book("wow_paladin_racials_dwarf"); next(7); return false;
+                }
+                if (stage==7) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Eval("(function() HideUIPanel(SpellBookFrame) return 1 end)()");
+                    if (!afflict()) return finish("Skyrim disease, poison or bleeding spell unavailable");
+                    next(8); return false;
+                }
+                if (stage==8) {
+                    if (since<.6) return false;
+                    g_ctx["evidence"]["afflicted"]=fixtures();
+                    checks["fixtures_applied"]=g_ctx["evidence"]["afflicted"]==json{{"disease",true},{"poison",true},{"bleed",true}};
+                    Cast::RefreshCooldownsForTesting(); BookReady(); Cast::Use(20594); g_ctx["stone_at"]=t; next(9); return false;
+                }
+                const json clean={{"disease",false},{"poison",false},{"bleed",false}};
+                if (stage==9) {   // applying it purged them; its natives are on the player
+                    if (since<.8) return false;
+                    const auto aura=PaladinAura(20594); const float worn=Forms::WornArmor();
+                    g_ctx["evidence"]["stoneform"]={{"aura",aura},{"after",fixtures()},{"worn_armor",worn},
+                        {"armor",native("Stoneform",39)},{"poison",native("Stoneform",40)},{"disease",native("Stoneform",45)}};
+                    checks["stoneform_cast"]=aura.value("remaining",0.)>6.5 && aura.value("remaining",0.)<=8.1;
+                    checks["stoneform_purges"]=fixtures()==clean;
+                    checks["stoneform_armor"]=std::abs(std::max(0.f,native("Stoneform",39))-worn*.1f)<.05f;
+                    checks["stoneform_resists"]=std::abs(native("Stoneform",40)-100.f)<.01f && std::abs(native("Stoneform",45)-100.f)<.01f;
+                    afflict(); next(10); return false;
+                }
+                if (stage==10) {   // and refuses what lands while it lasts
+                    if (since<.5) return false;
+                    g_ctx["evidence"]["refused"]=fixtures();
+                    checks["stoneform_refuses"]=fixtures()==clean;
+                    g_ctx["captures"].push_back("wow_paladin_racials_stoneform"); g_ctx["snap"]=Snap("wow_paladin_racials_stoneform");
+                    next(11); return false;
+                }
+                if (stage==11) {
+                    if (!Settled(g_ctx["snap"]) || t-g_ctx["stone_at"].get<double>()<8.6) return false;
+                    checks["stoneform_ends"]=PaladinAura(20594).empty() && native("Stoneform",39)<0 && native("Stoneform",40)<0 && native("Stoneform",45)<0;
+                    afflict(); next(12); return false;
+                }
+                if (stage==12) {   // after it the same afflictions stay
+                    if (since<.6) return false;
+                    g_ctx["evidence"]["after_stoneform"]=fixtures();
+                    checks["stoneform_purge_stops"]=fixtures()==json{{"disease",true},{"poison",true},{"bleed",true}};
+                    Cast::RefreshCooldownsForTesting(); BookReady(); Cast::Use(2481); next(13); return false;
+                }
+                if (stage==13) {   // Find Treasure: their one tracking aura, until cancelled (the minimap's tracking button)
+                    if (since<.6) return false;
+                    const auto aura=PaladinAura(2481); g_ctx["evidence"]["find_treasure"]=aura;
+                    bool tracking=false;
+                    for (const auto& e : aura.value("effects",json::array())) tracking=tracking || (e.value("type","")=="track_resources" && e.value("mask",0u)==32u);
+                    checks["find_treasure_tracking"]=tracking && aura.value("remaining",0.)>1e6;
+                    checks["find_treasure_icon"]=WowUi::Eval("(function() local a,info=__WB.trackingAura() "
+                        "return a and a.spell==2481 and GetTrackingTexture()==info.icon and 1 or 0 end)()")=="1";
+                    WowUi::Eval("(function() CancelTrackingBuff() return 1 end)()"); next(14); return false;
+                }
+                if (since<.6) return false;
+                checks["find_treasure_cancels"]=PaladinAura(2481).empty();
+                return finish();
+            }});
+
+            // Explicit: the enabled pass may provoke the village. Selection, not the copy's health, is authoritative.
+            if ((","+Config::Get().testOnly+",").find(",wow_area_friendly_toggle,")!=std::string::npos)
+            g_steps.push_back({"wow_area_friendly_toggle",80,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto next=[&](int stage) { g_ctx["stage"]=stage; g_ctx["at"]=t; };
+                auto actor=[&](const char* key) { return RE::TESForm::LookupByID<RE::Actor>(g_ctx.value(key,RE::FormID{})); };
+                auto finish=[&](const char* error) {
+                    r={{"pass",error==nullptr},{"states",g_ctx.value("states",json::object())},{"captures",g_ctx.value("captures",json::array())}};
+                    if (error) r["error"]=error;
+                    return true;
+                };
+                if (t==0) {
+                    const auto original=WowUi::Eval("GetCVar('wbAreaFriendly')");
+                    if (original!="0" && original!="1") return finish("area option unavailable");
+                    g_ctx["original"]=original; g_ctx["states"]=json::object(); g_ctx["captures"]=json::array();
+                    g_ctx["crimes"]=json::array();
+                    for (const auto& [faction,gold] : player->GetCrimeValue().crimeGoldMap)
+                        g_ctx["crimes"].push_back({{"id",faction->GetFormID()},{"violent",gold.violentCur},{"nonviolent",gold.nonViolentCur}});
+                    WowUi::Run("SetCVar('wbAreaFriendly','0') ShowUIPanel(GameMenuFrame) GameMenuButtonUIOptions:Click('LeftButton')");
+                    next(0); return false;
+                }
+                const int stage=g_ctx["stage"], pass=g_ctx.value("pass_index",0);
+                const double since=t-g_ctx["at"].get<double>();
+                if (since>15) return finish("area friendly stage did not settle");
+                if (stage==0) {
+                    if (since<.5) return false;
+                    const std::string wanted=pass ? "1" : "0";
+                    if ((!pass && WowUi::Eval("GetCVar('wbAreaFriendly')")!=wanted) ||   // the CVar follows the box on Okay
+                        WowUi::Eval("UIOptionsFrameCheckButton71:IsVisible() and (UIOptionsFrameCheckButton71:GetChecked() and 1 or 0) or -1")!=wanted)
+                        return finish("checkbox state mismatch");
+                    const std::string name=pass ? "wow_area_friendly_on" : "wow_area_friendly_off";
+                    g_ctx["captures"].push_back(name); g_ctx["snap"]=Snap(name); next(1); return false;
+                }
+                if (stage==1) {
+                    if (!Settled(g_ctx["snap"])) return false;
+                    WowUi::Run("UIOptionsFrameOkay:Click('LeftButton')");   // Okay applies the boxes' CVars and closes the frame
+                    next(6); return false;
+                }
+                if (stage==6) {   // the interface hears Run a frame later than Eval reads it
+                    if (since<.5) return false;
+                    if (WowUi::Eval("GetCVar('wbAreaFriendly')")!=(pass ? "1" : "0")) return finish("option not applied on Okay");
+                    RE::TESNPC* base=nullptr;
+                    for (auto& h : RE::ProcessLists::GetSingleton()->highActorHandles) if (auto a=h.get(); a && a.get()!=player && !a->IsDead() &&
+                        a->HasKeywordString("ActorTypeNPC") && Bridge::Reaction(a.get())==5 && !a->IsPlayerTeammate() &&
+                        a->GetActorBase() && !a->GetActorBase()->IsUnique()) { base=a->GetActorBase(); break; }
+                    if (!base) base=RE::TESForm::LookupByID<RE::TESNPC>(0xAA8FC);
+                    auto* person=SpawnAhead(base,640,-80); if (person) { g_ctx["person"]=person->GetFormID(); person->EnableAI(false); }
+                    auto* wolf=SpawnWolf(640,80); if (wolf) { g_ctx["wolf"]=wolf->GetFormID(); wolf->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kHealth,2000.f); }
+                    if (!person || !wolf) return finish("missing area fixture actors");
+                    next(2); return false;
+                }
+                auto* person=actor("person"); auto* wolf=actor("wolf");
+                if (!person || !wolf) return finish("area fixture actor disappeared");
+                if (stage==2) {
+                    if (since<1.5 || !person->Is3DLoaded() || !wolf->Is3DLoaded()) return false;
+                    if (Bridge::Reaction(person)!=5 || !Bridge::Attackable(person) || !wolf->IsHostileToActor(player)) return finish("invalid friendly/hostile fixture");
+                    if (!Progression::Knows(16914)) {
+                        if (!g_ctx.contains("progression")) g_ctx["progression"]=Progression::SnapshotForTesting();
+                        const std::array<int,1> spell={16914}; Progression::Acquire(spell);
+                    }
+                    Cast::ResetForTesting(); BookReady(); Bridge::SetTarget(nullptr); Cast::Use(16914); next(3); return false;
+                }
+                if (stage==3) {
+                    if (!Cast::Placing()) return false;
+                    Cast::Place((person->GetPosition()+wolf->GetPosition())*.5f); next(4); return false;
+                }
+                if (stage==4) {
+                    const auto evidence=Cast::TalentDiagnostics(); const auto channel=evidence.value("channel",json::object());
+                    auto selected=[&](RE::FormID id) { for (const auto& x : channel.value("targets",json::array())) if (x.value("id",0u)==id) return true; return false; };
+                    bool skipped=false, struck=false;
+                    for (const auto& id : channel.value("skipped_friendly",json::array())) if (id==person->GetFormID()) skipped=true;
+                    for (const auto& hit : evidence.value("area_damage",json::array())) if (hit.value("target",0u)==wolf->GetFormID() && hit.value("amount",0)>0) struck=true;
+                    const bool ok=channel.value("spell",0u)==16914 && channel.value("area_friendly",false)==(pass==1) &&
+                        selected(wolf->GetFormID()) && struck && (pass ? selected(person->GetFormID()) : skipped && !selected(person->GetFormID()));
+                    if (!ok) return false;
+                    g_ctx["states"][pass ? "on" : "off"]={{"pass",ok},{"selection",channel},{"damage",evidence.value("area_damage",json::array())},
+                        {"friendly",person->GetFormID()},{"hostile",wolf->GetFormID()},{"friendly_provoked",person->IsInCombat() || person->IsHostileToActor(player)}};
+                    Cast::ResetForTesting(); person->StopCombat(); person->Disable(); wolf->StopCombat(); wolf->Disable(); CalmVillage();
+                    if (pass) return finish(nullptr);
+                    g_ctx["pass_index"]=1;
+                    WowUi::Run("ShowUIPanel(GameMenuFrame) GameMenuButtonUIOptions:Click('LeftButton')"); next(5); return false;
+                }
+                if (stage==5) {   // the frame's own show handler sets the box from the CVar: click it once it is up
+                    if (since<.5 || WowUi::Eval("UIOptionsFrameCheckButton71:IsVisible() and 1 or 0")!="1") return false;
+                    WowUi::Run("UIOptionsFrameCheckButton71:Click('LeftButton')"); next(0); return false;
+                }
+                return finish("unknown area friendly stage");
+            }});
+
+            // WoW's harmful spells provoke a friendly person as any Skyrim attack does (Wrath's damage, Faerie Fire's
+            // debuff, Entangling Roots' hold); a buff does not. A copy of a generic townsperson for each, their bounties
+            // restored afterwards. Explicit, in its own world launch: it sets the town on the player before the step calms it.
+            if ((","+Config::Get().testOnly+",").find(",wow_spell_aggression,")!=std::string::npos)
+            g_steps.push_back({"wow_spell_aggression",90,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                constexpr std::array<std::pair<std::uint32_t,bool>,4> spells={{{9912,true},{9907,true},{9853,true},{9885,false}}};
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto person=[&] { return RE::TESForm::LookupByID<RE::Actor>(g_ctx.value("person",RE::FormID{})); };
+                auto hostiles=[&] {   // the people turned on the player (the struck one may flee, the town takes it up)
+                    int n=0;
+                    for (auto& h : RE::ProcessLists::GetSingleton()->highActorHandles) if (auto a=h.get(); a && a.get()!=player && !a->IsDead() &&
+                        (a->IsHostileToActor(player) || a->IsInCombat())) ++n;
+                    return n;
+                };
+                static std::vector<std::pair<const RE::TESFaction*,RE::CrimeGoldStruct>> crimes;
+                auto finish=[&](const char* error=nullptr) {
+                    if (auto* p=person()) { p->StopCombat(); p->Disable(); }
+                    Bridge::SetTarget(nullptr);
+                    auto& map=player->GetCrimeValue().crimeGoldMap;   // their bounties as they were
+                    for (auto& [faction,gold] : map) gold={};
+                    for (const auto& [faction,gold] : crimes) if (auto it=map.find(faction); it!=map.end()) it->second=gold;
+                    player->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000.f);
+                    r={{"spells",g_ctx["results"]},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& [id,res] : g_ctx["results"].items()) if (res.value("as_expected",false)!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    BookReady(); crimes.clear();
+                    for (const auto& [faction,gold] : player->GetCrimeValue().crimeGoldMap) crimes.emplace_back(faction,gold);
+                    RE::TESNPC* base=nullptr; float nearest=1e9f;
+                    // A stranger: Skyrim forgives a friend's stray hit (its friendly-fire allowance), so a unique neighbour's copy
+                    // with their relationship shrugs a spell off as it would a sword - a generic townsperson or guard does not.
+                    for (auto& h : RE::ProcessLists::GetSingleton()->highActorHandles) if (auto a=h.get(); a && a.get()!=player && !a->IsDead() &&
+                        a->HasKeywordString("ActorTypeNPC") && !a->IsHostileToActor(player) && !a->IsPlayerTeammate() &&
+                        a->GetActorBase() && !a->GetActorBase()->IsUnique()) {
+                        if (const float d=a->GetPosition().GetDistance(player->GetPosition()); d<nearest) { nearest=d; base=a->GetActorBase(); }
+                    }
+                    if (!base) base=RE::TESForm::LookupByID<RE::TESNPC>(0x000AA8FC);   // else an Imperial soldier (EncGuardImperialM05MaleGuard)
+                    if (!base) return finish("no stranger to copy");
+                    g_ctx["base"]=base->GetFormID(); g_ctx["index"]=0; g_ctx["results"]=json::object(); next(0); return false;
+                }
+                const int stage=g_ctx["stage"], index=g_ctx["index"]; const double since=t-g_ctx["at"].get<double>();
+                if (since>15) return finish("aggression stage did not settle");
+                ProbeWait("wow_spell_aggression",t,{{"stage",stage},{"index",index},{"casting",Cast::Casting()}});
+                if (stage==0) {   // a fresh copy of their neighbour, three yards ahead
+                    auto* copy=SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(g_ctx["base"].get<RE::FormID>()),3*Avatar::kUnitsPerYard);
+                    if (!copy) return finish("no copy");
+                    g_ctx["person"]=copy->GetFormID(); next(1); return false;
+                }
+                auto* p=person();
+                if (!p) return finish("the copy disappeared");
+                if (stage==1) {
+                    if (!p->Is3DLoaded() || since<1.5) return false;
+                    if (p->IsHostileToActor(player)) return finish("the copy was hostile before any spell");
+                    g_ctx["hostile_before"]=hostiles(); g_ctx["health_before"]=p->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    BookReady(); ObserveCast(); Bridge::SetTarget(p);
+                    Cast::Use(spells[index].first);
+                    next(2); return false;
+                }
+                if (stage==2) {
+                    if (Cast::Casting() || since<3) return false;   // its cast, then a moment for Skyrim to answer
+                    std::int64_t bounty=0; for (const auto& [faction,gold] : player->GetCrimeValue().crimeGoldMap) bounty+=std::bit_cast<std::int32_t>(gold.violentCur)+std::bit_cast<std::int32_t>(gold.nonViolentCur);   // whole gold, stored as integers
+                    const int turned=hostiles()-g_ctx["hostile_before"].get<int>();
+                    const bool provoked=p->IsHostileToActor(player) || p->IsInCombat() || bounty>0 || turned>0;
+                    g_ctx["results"][std::to_string(spells[index].first)]={{"provoked",provoked},{"hostile",p->IsHostileToActor(player)},
+                        {"combat",p->IsInCombat()},{"turned",turned},{"bounty",bounty},{"error",WowUi::Eval("WBTestLastError")},
+                        {"health_lost",g_ctx["health_before"].get<float>()-p->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)},
+
+                        {"as_expected",provoked==spells[index].second}};
+                    p->StopCombat(); p->Disable(); Bridge::SetTarget(nullptr);
+                    auto& map=player->GetCrimeValue().crimeGoldMap;
+                    for (auto& [faction,gold] : map) gold={};
+                    for (const auto& [faction,gold] : crimes) if (auto it=map.find(faction); it!=map.end()) it->second=gold;
+                    CalmVillage();
+                    if (index+1>=static_cast<int>(spells.size())) return finish();
+                    g_ctx["index"]=index+1; next(0); return false;
+                }
+                return finish("unknown aggression stage");
+            }});
+
+            // A TBC-style flyer: summoned like the ground mounts, Space takes it up and climbs, it hovers, X brings it down
+            // onto the player's feet still mounted; it plays its Fly animation in the air.
+            g_steps.push_back({"wow_flying_mount",70,[](double t,json& r) {
+                auto* player=RE::PlayerCharacter::GetSingleton();
+                auto next=[&](int n) { g_ctx["stage"]=n; g_ctx["at"]=t; };
+                auto finish=[&](const char* error=nullptr) {
+                    std::string message; Mounts::Select("none",message);
+                    if (g_ctx.contains("learned")) Mounts::SetLearned(g_ctx["learned"].get<std::vector<std::string>>());
+                    if (g_startPos) player->SetPosition(*g_startPos,true);
+                    player->AsActorValueOwner()->RestoreActorValue(RE::ActorValue::kHealth,100000.f);
+                    r={{"checks",g_ctx["checks"]},{"evidence",g_ctx.value("evidence",json::object())},{"pass",error==nullptr}};
+                    if (error) r["error"]=error;
+                    for (const auto& [key,ok] : g_ctx["checks"].items()) if (ok!=true) r["pass"]=false;
+                    return true;
+                };
+                if (t==0) {
+                    if (g_startPos) player->SetPosition(*g_startPos,true);   // open sky
+                    // A fresh game owns no mount (they come from reins): the gryphon is theirs for the step, finish restores.
+                    auto learned=Mounts::LearnedKeys(); g_ctx["learned"]=learned;
+                    if (!Mounts::Learned("swift_golden_gryphon")) { learned.emplace_back("swift_golden_gryphon"); Mounts::SetLearned(std::move(learned)); }
+                    g_ctx["checks"]=json::object(); g_ctx["evidence"]=json::object(); next(0); return false;
+                }
+                const int stage=g_ctx["stage"]; const double since=t-g_ctx["at"].get<double>();
+                auto& checks=g_ctx["checks"]; auto& evidence=g_ctx["evidence"];
+                if (since>15) return finish("flying stage did not settle");
+                const auto active=Mounts::Snapshot()["active"];
+                ProbeWait("wow_flying_mount",t,{{"stage",stage},{"mounted",active.is_object()},{"z",player->GetPositionZ()},
+                    {"midair",player->IsInMidair()},{"mount_anim",Avatar::Current().mountAnimation}});
+                if (stage==0) {
+                    if (since<1) return false;
+                    std::string message;
+                    if (!Mounts::Select("swift_golden_gryphon",message)) return finish(("the gryphon was refused: "+message).c_str());
+                    next(1); return false;
+                }
+                if (stage==1) {   // summoned
+                    if (!active.is_object()) return false;
+                    checks["summoned_as_flyer"]=active.value("flying",false) && Avatar::Current().mountDisplay==active.value("display",0u);
+                    g_ctx["ground_z"]=player->GetPositionZ();
+                    g_ctx["seq"]=Action("key:space:1.5"); next(2); return false;
+                }
+                if (stage==2) {   // Space: up
+                    if (!Settled(g_ctx["seq"])) { if (Avatar::Current().mountAnimation==135) evidence["fly_animation_seen"]=true; return false; }
+                    const float climbed=player->GetPositionZ()-g_ctx["ground_z"].get<float>();
+                    evidence["climbed"]=climbed;
+                    checks["climbs"]=climbed>4*Avatar::kUnitsPerYard;
+                    checks["fly_animation"]=evidence.value("fly_animation_seen",false) || Avatar::Current().mountAnimation==135;
+                    g_ctx["hover_z"]=player->GetPositionZ(); next(3); return false;
+                }
+                if (stage==3) {   // no keys: it hovers
+                    if (since<1.5) return false;
+                    const float drift=std::abs(player->GetPositionZ()-g_ctx["hover_z"].get<float>());
+                    evidence["hover_drift"]=drift; checks["hovers"]=drift<0.5f*Avatar::kUnitsPerYard;
+                    g_ctx["health"]=player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth);
+                    g_ctx["seq"]=Action("key:x:6"); next(4); return false;
+                }
+                if (stage==4) {   // X: down until the player lands, still mounted
+                    if (!Settled(g_ctx["seq"]) && player->GetPositionZ()>g_ctx["ground_z"].get<float>()+16) return false;
+                    if (since<1) return false;
+                    evidence["landed_above_ground"]=player->GetPositionZ()-g_ctx["ground_z"].get<float>();
+                    checks["descends_and_lands"]=std::abs(evidence["landed_above_ground"].get<float>())<1.5f*Avatar::kUnitsPerYard;
+                    checks["still_mounted"]=Mounts::Snapshot()["active"].is_object();
+                    checks["no_fall_damage"]=player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth)>=g_ctx["health"].get<float>()-0.5f;
+                    return finish();
+                }
+                return finish("unknown flying stage");
+            }});
+
             g_steps.push_back({"wow_attack_relog",60,[](double t,json& r) {
                 if (g_ctx.contains("finish_result")) { r=g_ctx["finish_result"]; return true; }
                 if (t==0) {
@@ -10629,7 +16905,8 @@ return 1 end)())");
                     for (const auto& [name,ok] : g_ctx["results"].items()) if (ok!=true) r["pass"]=false;
                     r["native_mana"]=mana(); r["evidence"]=g_ctx.value("evidence",json::object()); return true;
                 };
-                if (t==0) { BeginFormProbe(); next(0); return false; }
+                // Their Stormrage set's 15% regen while casting would refill the exact amounts these checks pay.
+                if (t==0) { BeginFormProbe(); Forms::HoldCastingRegenForTesting(true); next(0); return false; }
                 const int stage=g_ctx.value("stage",0);
                 if (t-g_ctx["since"].get<double>()>12) return finish("native resource stage did not settle");
                 // Form entry starts a 1.5-second GCD; test zero-mana cancellation after it.
@@ -10774,7 +17051,7 @@ return 1 end)())");
 					g_ctx.value("prowl_first_time",0.f)!=g_ctx.value("prowl_last_time",0.f);
 				return true;
 			} });
-			// Real uinput mouse drags: her Skyrim book to an empty slot, then that action onto Attack.
+			// Real uinput mouse drags: their Skyrim book to an empty slot, then that action onto Attack.
 			g_steps.push_back({ "wow_action_drag", 25, [](double t, json& r) {
 				auto finish = [&] {
 					WowUi::Eval("(function() local s = __wbDragSaved if not s then return 0 end ClearCursor() "
@@ -10796,7 +17073,7 @@ return 1 end)())");
 				};
 				if (t == 0.0) {
 					g_ctx["cursor_mode"] = Input::CursorMode();
-					Cast::FormForTesting(0, {});   // her form and its auras, as leaving it in play
+					Cast::FormForTesting(0, {});   // their form and its auras, as leaving it in play
 					Input::SetCursorMode(true);
 					g_ctx["setup"] = WowUi::Eval("(function() ClearCursor() "
 						"__wbDragSaved = {__WB.actions[11], __WB.actions[12], lock=LOCK_ACTIONBAR, "
@@ -10841,8 +17118,8 @@ return 1 end)())");
 				return finish();
 			} });
 
-			// Night Elf General abilities: constant passives do not stack; Shadowmeld is her stationary stealth,
-			// invisible to Skyrim and faded in her own model, until movement ends it. Its cooldown survives the break.
+			// Night Elf General abilities: constant passives do not stack; Shadowmeld is their stationary stealth,
+			// invisible to Skyrim and faded in their own model, until movement ends it. Its cooldown survives the break.
 			g_steps.push_back({ "wow_nightelf_racials", 20, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
@@ -10859,7 +17136,7 @@ return 1 end)())");
 					BookReady();
 					ClearCorpses();
 					Bridge::SetTarget(nullptr);
-					Cast::FormForTesting(0, {});   // her form and its auras, as leaving it in play
+					Cast::FormForTesting(0, {});   // their form and its auras, as leaving it in play
 					Forms::BreakShadowmeld();
 					Cast::Stop();
 					g_ctx["at"] = { player->GetPosition().x, player->GetPosition().y, player->GetPosition().z };
@@ -11195,8 +17472,8 @@ return good and 1 or 0 end)())") == "1";
 				g_ctx["stage"] = stage + 1;
 				return false;
 			} });
-			// Her Skyrim spells in her WoW book: a new game's Flames and Healing in the "Skyrim" tab; Healing channelled on her
-			// heals her, Flames on a wolf burns it (Skyrim's own spells, their magicka).
+			// Their Skyrim spells in their WoW book: a new game's Flames and Healing in the "Skyrim" tab; Healing channelled on the player
+			// heals the player, Flames on a wolf burns it (Skyrim's own spells, their magicka).
 			g_steps.push_back({ "wow_skyrim_aimed", 12, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				if (t == 0.0) {
@@ -11228,7 +17505,7 @@ return good and 1 or 0 end)())") == "1";
 					return false;
 				}
 				if (!g_ctx.contains("tab")) {
-					if (t < 2.5) {   // her book told (scanned every 2 seconds)
+					if (t < 2.5) {   // their book told (scanned every 2 seconds)
 						return false;
 					}
 					g_ctx["tab"] = WowUi::Eval("(function() local n = GetNumSpellTabs() local name, _, _, count = GetSpellTabInfo(n) "
@@ -11318,12 +17595,12 @@ return good and 1 or 0 end)())") == "1";
 				            r["healed"].get<float>() > 0.0f && r["spent"].get<float>() > 0.0f &&
 				            r["burned"].get<float>() > 0.0f && r["moving_channel"] == true && r["stop_requested"] == "1" &&
 							r["stop_native"] == true && r["mana_stable"] == true && r["ten_second_cap"] == true;
-				BookReady();   // the channels spent her magicka; the steps after cast with it
+				BookReady();   // the channels spent their magicka; the steps after cast with it
 				Bridge::SetTarget(nullptr);
 				wolf->Disable();
 				return true;
 			} });
-			// Fus learned and unlocked: her book and her bar keep the SHOU id, Skyrim fires its highest unlocked word,
+			// Fus learned and unlocked: their book and their bar keep the SHOU id, Skyrim fires its highest unlocked word,
 			// and the client's real cooldown model sweeps over Skyrim's shared voice recovery.
 			g_steps.push_back({ "wow_skyrim_shout", 20, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
@@ -11405,11 +17682,11 @@ return good and 1 or 0 end)())") == "1";
 				return false;
 			} });
 			// A save and its load, as a WoW logout and login (Cast::Snapshot / Restore, which the SKSE record carries):
-			// Rejuvenation on her and Hurricane's cooldown, then 30 seconds "away". The helpful aura comes back as it was,
-			// the cooldown 30 seconds shorter, her mana as it was, and the buff on her frame again.
-			// The fights around her in the chat (WorldLog): the suite's wolves bit her ("Wolf hits you for N."), and died
+			// Rejuvenation on the player and Hurricane's cooldown, then 30 seconds "away". The helpful aura comes back as it was,
+			// the cooldown 30 seconds shorter, their mana as it was, and the buff on their frame again.
+			// The fights around the player in the chat (WorldLog): the suite's wolves bit the player ("Wolf hits you for N."), and died
 			// ("Wolf dies.", "You have slain Wolf!").
-			// The fights around her in her log: a wolf bites her, she kills it (her Moonfire on its last health), it dies.
+			// The fights around the player in their log: a wolf bites the player, the player kills it (their Moonfire on its last health), it dies.
 			g_steps.push_back({ "wow_world_log", 20, [](double t, json& r) {
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
@@ -11497,6 +17774,11 @@ return good and 1 or 0 end)())") == "1";
                 }
                 if (!g_ctx.contains("used")) {
                     if (t-g_ctx["dash_used"].get<double>()<3) return false;
+					// Prowl refuses in combat, and the step before may just have killed a wolf on the player.
+					if (player->IsInCombat()) {
+						Pacify();
+						if (t-g_ctx["dash_used"].get<double>()<15) return false;
+					}
 					Cast::Use(9913); g_ctx["used"] = t; return false;
 				}
 				if (!g_ctx.contains("reloaded")) {
@@ -11558,6 +17840,101 @@ return good and 1 or 0 end)())") == "1";
 					{"checks", g_ctx["results"]}, {"pass", true}};
 				for (const auto& [key, ok] : g_ctx["results"].items()) if (ok != true) r["pass"] = false;
 				return true;
+			} });
+			// CMaNGOS Spell::TakePower/RemoveSpellMods, HandleShapeshiftBoosts,
+			// and Spell.dbc periodic schedules: exercise the production plugin paths.
+			g_steps.push_back({ "wow_druid_gaps", 45, [](double t, json& r) {
+				if (g_ctx.contains("finish_result")) return FinishDruidTalentTest(t, r);
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				if (t == 0) {
+					BeginFormProbe();
+					json caster = {{"level",60}, {"class",11}, {"items",json::array()}, {"skyrim",{{"alteration",100}}},
+						{"talents",{{"762",5},{"761",1},{"921",4},{"787",3},{"763",5},{"791",5},{"781",3},{"788",1}}}};
+					const json target = {{"kind","unit"},{"level",60},{"distance_yd",2},{"reaction","hostile"},{"in_front",true}};
+					const auto ask = [](const char* key, const json& req) {
+						Service::Request(req, [key](const json& reply) { g_ctx["replies"][key] = reply; });
+					};
+					ask("roots", {{"op","resolve"},{"spell",9853},{"seed",1},{"caster",caster},{"target",target}});
+					auto procCaster = caster; procCaster["auras"] = {17329};
+					ask("grasp", {{"op","incoming_hit"},{"weapon_hit",true},{"seed",1},{"caster",procCaster},{"target",target}});
+					auto bear = caster; bear["form"] = "bear"; bear["power"] = {{"rage",100}};
+					for (const auto [key, spell] : {std::pair{"bear",5487}, {"enrage",5229}, {"frenzy",22896}}) {
+						auto c = bear; if (spell == 5487) c["form"] = "none";
+						ask(key, {{"op","resolve"},{"spell",spell},{"caster",c},{"target",{{"kind","self"}}}});
+					}
+					bear["auras"] = {16870}; bear["next_swing"] = 9881;
+					ask("maul", {{"op","melee"},{"seed",1},{"caster",bear},{"target",target}});
+					ask("abolish", {{"op","resolve"},{"spell",2893},{"caster",caster},{"target",{{"kind","self"},{"dispellable",{"Poison"}}}}});
+					json native = {{"kind","self"}}; Cast::AugmentTarget(native,player);
+					// Skyrim has no native Curse category, so this uses the actual host snapshot.
+					ask("empty", {{"op","resolve"},{"spell",2782},{"caster",caster},{"target",native}});
+					return false;
+				}
+				if (!g_ctx.contains("replies") || g_ctx["replies"].size() < 8) return false;
+				const auto& replies = g_ctx["replies"];
+				for (const auto& [key, reply] : replies.items()) if (key != "empty" && !reply.value("ok",false)) {
+					r = {{"pass",false},{"error",reply}}; return FinishDruidTalentTest(t,r);
+				}
+				auto& checks = g_ctx["results"];
+				checks["empty_dispel"] = { {"pass", replies["empty"].value("error","") == "SPELL_FAILED_NOTHING_TO_DISPEL"} };
+				const auto damage = [](const json& out) {
+					for (const auto& a : out["auras"]) if (a.value("type","") == "damage") return a["ticks"];
+					return json();
+				};
+				checks["grasp_conversion"] = {{"pass", damage(replies["roots"]) == damage(replies["grasp"]["procs"][0])}};
+				Cast::ApplyForTesting(16870, {{"name","Clearcasting"},{"auras",json::array({{{"type","spell_mod"},{"duration_ms",15000}}})}});
+				const auto has = [](std::uint32_t spell) {
+					for (const auto& aura : Cast::Snapshot()["auras"]) if (aura.value("spell",0u) == spell) return true;
+					return false;
+				};
+				const bool clearBefore = has(16870);
+				Forms::OnMelee(replies["maul"]); Cast::MeleeEffects(replies["maul"],nullptr);
+				checks["maul_consumption"] = {{"pass", clearBefore && !has(16870) && replies["maul"].value("cost",-1) == 0}};
+				Cast::FormForTesting(5487,replies["bear"]);
+				Cast::ApplyForTesting(5229,replies["enrage"]); Cast::ApplyForTesting(22896,replies["frenzy"]);
+				const bool ticking = Forms::SaveResources()["rage_auras"].size() == 2;
+				Forms::Leave();
+				checks["bear_form_loss"] = {{"pass", ticking && Forms::SaveResources()["rage_auras"].empty() &&
+					Forms::SaveResources()["no_decay_in"].get<double>() <= 0}};
+				Cast::ResetForTesting();
+				Cast::FormForTesting(5487,replies["bear"]);
+				Cast::ApplyForTesting(5229,replies["enrage"]); Cast::ApplyForTesting(22896,replies["frenzy"]);
+				Cast::ApplyForTesting(2893,replies["abolish"]);
+				auto saved = json::parse(Cast::Snapshot().dump());
+				// Represent a logout between power ticks, with nonzero saved pools.
+				saved["form_resources"]["rage"] = 55; saved["form_resources"]["energy"] = 37;
+				saved["form_resources"]["energy_in"] = .25; saved["form_resources"]["decay_in"] = 1.75;
+				saved["saved_at"] = saved["saved_at"].get<double>() - 30;
+				Cast::ResetForTesting(); Cast::Restore(saved); Forms::Reset();
+				const auto loaded = Cast::Snapshot();
+				bool timers = loaded["form_resources"]["rage_auras"].size() == 2;
+				for (const auto key : {"rage","energy"}) timers = timers && saved["form_resources"][key] == loaded["form_resources"][key];
+				for (const auto key : {"energy_in","decay_in","no_decay_in"}) timers = timers &&
+					std::abs(saved["form_resources"][key].get<double>() - loaded["form_resources"][key].get<double>()) < .01;
+				if (timers) for (std::size_t i = 0; i < 2; ++i) {
+					const auto& expected = saved["form_resources"]["rage_auras"][i];
+					auto actual = loaded["form_resources"]["rage_auras"][i];
+					for (const auto key : {"next","end"}) {
+						timers = timers && std::abs(expected[key].get<double>() - actual[key].get<double>()) < .01;
+						actual[key] = expected[key];
+					}
+					timers = timers && actual == expected;
+				}
+				const auto dispel = [](const json& state) {
+					for (const auto& a : state["auras"]) if (a.value("spell",0u) == 2893) return a["periodic_dispel"];
+					return json::object();
+				};
+				const auto before = dispel(saved), after = dispel(loaded);
+				checks["timer_restore"] = {{"pass",timers && before.value("type","") == "Poison" &&
+					after.value("type","") == "Poison" && before["count"] == after["count"] && before["every"] == after["every"] &&
+					std::abs(before["next"].get<double>() - after["next"].get<double>()) < .01}};
+				// A reply can become stale while in flight: the native completion gate
+				// must reject a now-empty target before payment as well.
+				const int mana = Cast::Mana();
+				Cast::BeginForTesting(2782, {{"cost",50},{"cast_ms",0},{"events",json::array({{{"type","dispel"},{"dispel","Curse"},{"count",1}}})}});
+				checks["empty_dispel_no_payment"] = {{"pass",Cast::Mana() == mana && !Cast::Casting()}};
+				r["pass"] = std::ranges::all_of(checks.items(),[](const auto& item) { return item.value().value("pass",false); });
+				return FinishDruidTalentTest(t,r);
 			} });
 			g_steps.push_back({ "wow_relog_keeps_state", 20, [](double t, json& r) {
 				const auto find = [](const json& snap, std::uint32_t spell) {
@@ -11790,7 +18167,7 @@ return good and 1 or 0 end)())") == "1";
 				};
 				if (t == 0.0) {
 					Cast::Stop();
-					Cast::FormForTesting(0, {});   // her form and its auras, as leaving it in play
+					Cast::FormForTesting(0, {});   // their form and its auras, as leaving it in play
 					g_ctx["level"] = std::max(40, static_cast<int>(player->GetLevel()) + 1);
 					g_ctx["points_before"] = WowUi::Eval("UnitCharacterPoints('player')");
 					g_ctx["stage"] = 0;
@@ -11820,7 +18197,7 @@ return good and 1 or 0 end)())") == "1";
 					if (t - g_ctx["at"].get<double>() < 3.0 || Forms::Current() != "cat") {
 						return false;
 					}
-					UiPass::RequestCapture("wow_talent_frame");   // the frame as she sees it, its art loaded (lazily) by now
+					UiPass::RequestCapture("wow_talent_frame");   // the frame as the player sees it, its art loaded (lazily) by now
 					g_ctx["denied"] = rank(807) == 0 && WowUi::Eval("UnitCharacterPoints('player')") == g_ctx["points"].get<std::string>() &&
 						WowUi::Eval("__wbTalentError").find("tier_points") != std::string::npos;
 					g_ctx["speed0"] = av->GetActorValue(RE::ActorValue::kSpeedMult);
@@ -11867,7 +18244,7 @@ return good and 1 or 0 end)())") == "1";
 					std::abs(r["speed1"].get<float>() - r["speed0"].get<float>() - 15.0f) < 1.0f &&
 					std::abs(r["speed2"].get<float>() - r["speed0"].get<float>() - 30.0f) < 1.0f && std::atoi(r["events"].get<std::string>().c_str()) > 0;
 				WowUi::Eval("(function() HideUIPanel(TalentFrame) return 1 end)()");
-				Cast::FormForTesting(0, {});   // her form and its auras, as leaving it in play
+				Cast::FormForTesting(0, {});   // their form and its auras, as leaving it in play
 				return true;
 			} });
 			g_steps.push_back({ "wow_talents_mark", 25, [](double t, json& r) {
@@ -11975,9 +18352,9 @@ end)())");
 					return false;
 				}
 				if (!g_ctx.contains("cat")) {
-					g_ctx["form_after_load"] = Forms::Current();   // her form comes back with the save, as in WoW
+					g_ctx["form_after_load"] = Forms::Current();   // their form comes back with the save, as in WoW
 					if (Forms::Current() != "cat") {
-						Cast::Use(768);   // in Cat Form already, this would take her out of it
+						Cast::Use(768);   // in Cat Form already, this would take the player out of it
 					}
 					g_ctx["cat"] = t;
 					return false;
@@ -12001,8 +18378,1603 @@ end)())");
 				r["pass"] = r["allocation"] == g_ctx["allocation"] && r["allocation"].value("807", 0) == 2 &&
 					r["allocation"].value("827", 0) == 1 && r["points"] == g_ctx["points"] && r["book"] == true && r["speed"].get<float>() > 129.0f &&
 					r["mark_restored"] == true && r["mark_native_restored"] == true;
-				Cast::FormForTesting(0, {});   // her form and its auras, as leaving it in play
+				Cast::FormForTesting(0, {});   // their form and its auras, as leaving it in play
 				return true;
+			} });
+			// A Shrine of Kynareth is their talent master (docs/talents.md): praying there with a point spent shows 1.12's own
+			// CONFIRM_TALENT_WIPE at the wipe's price; accepting takes those septims and refunds every point. The second wipe
+			// costs 5 (first refused while the player holds 4, with the client's error), the third is offered at 10 and its popup
+			// hides itself once the shrine is out of their reach. Every exit restores their allocation, wipe price, septims and
+			// level and disables the shrine.
+			// Progression P0, diagnostic and explicit only: can the plugin, without editing vanilla records, (a) grow a vanilla
+			// leveled list at runtime so it yields a new item, (b) stock a merchant by its container's base and see it after a
+			// restock, (c) hear a book read? The answers decide how WoW gear, spell books and reins reach the player.
+			if ((","+Config::Get().testOnly+",").find(",wow_progression_p0,")!=std::string::npos)
+			g_steps.push_back({ "wow_progression_p0", 20, [](double t, json& r) {
+				static bool heard = false;
+				struct BookSink : RE::BSTEventSink<RE::BooksRead::Event> {
+					RE::BSEventNotifyControl ProcessEvent(const RE::BooksRead::Event*, RE::BSTEventSource<RE::BooksRead::Event>*) override
+					{ heard = true; return RE::BSEventNotifyControl::kContinue; }
+				};
+				static BookSink sink;
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* dagger = RE::TESForm::LookupByID<RE::TESObjectWEAP>(0x0001397E);   // IronDagger, the stand-in item
+				json checks, evidence;
+				if (t == 0) {
+					// (a) LItemSpellTomes00Alteration plus one entry
+					if (auto* list = RE::TESForm::LookupByID<RE::TESLevItem>(0x0009E2B0); list && dagger) {
+						const auto before = list->entries.size();
+						list->entries.resize(before + 1);
+						list->entries[before] = RE::LEVELED_OBJECT{ dagger, 1, 1, 0, nullptr };
+						list->numEntries = static_cast<std::uint8_t>(before + 1);
+						int hits = 0, rolls = 0;
+						for (int i = 0; i < 200; ++i) {
+							RE::BSScrapArray<RE::CALCED_OBJECT> out;
+							list->CalculateCurrentFormList(player->GetLevel(), 1, out, 0, true);
+							for (auto& o : out) { ++rolls; hits += o.form == dagger; }
+						}
+						list->entries.resize(before);
+						list->numEntries = static_cast<std::uint8_t>(before);
+						evidence["list"] = { { "entries", before }, { "rolls", rolls }, { "hits", hits } };
+						checks["leveled_list_grows"] = hits > 0;
+					}
+					// (b) the Riverwood Trader's merchant chest, stocked through its base container
+					if (auto* chest = RE::TESForm::LookupByID<RE::TESObjectREFR>(0x00078C0B); chest && dagger) {
+						auto* base = chest->GetBaseObject() ? chest->GetBaseObject()->As<RE::TESObjectCONT>() : nullptr;
+						auto count = [&] { auto inv = chest->GetInventory([&](RE::TESBoundObject& o) { return &o == dagger; });
+							return inv.empty() ? 0 : inv.begin()->second.first; };
+						const int had = count();
+						const bool added = base && base->AddObjectToContainer(dagger, 3, nullptr);
+						chest->ResetInventory(false);
+						const int stocked = count();
+						if (added) base->RemoveObjectFromContainer(dagger, 3);
+						chest->ResetInventory(false);
+						evidence["merchant"] = { { "base", base != nullptr }, { "had", had }, { "after_restock", stocked }, { "after_removal", count() },
+							{ "loaded", chest->Is3DLoaded() } };
+						checks["merchant_base_stocks"] = stocked >= had + 3;
+					}
+					// (c) a plain book read by script
+					if (auto* src = RE::BooksRead::GetEventSource()) src->AddEventSink(&sink);
+					if (auto* book = RE::TESForm::LookupByID<RE::TESObjectBOOK>(0x000F84A1)) {   // Book0Shadowmarks
+						heard = false;
+						evidence["book_read_returned"] = book->Read(player);
+					}
+					g_ctx["checks"] = checks; g_ctx["evidence"] = evidence;
+					return false;
+				}
+				if (t < 1) return false;
+				checks = g_ctx["checks"]; evidence = g_ctx["evidence"];
+				checks["book_read_heard"] = heard;
+				if (auto* src = RE::BooksRead::GetEventSource()) src->RemoveEventSink(&sink);
+				bool pass = !checks.empty();
+				for (const auto& [k, v] : checks.items()) pass = pass && v.get<bool>();
+				r = { { "checks", checks }, { "evidence", evidence }, { "pass", pass } };
+				return true;
+			} });
+			// Spell books (docs/class-progression.md), explicit only. With Destruction 15 and their book from their skills alone,
+			// Book of Wrath III from their bags is refused with the client's error and kept (Wrath II first); Book of Moonfire
+			// from their bags teaches Moonfire (Rank 1) at once, below its skill, with the client's chat line, and is used
+			// up; Book of Wrath II read in Skyrim's Book Menu does the same, and then Wrath III's book teaches it. All three
+			// stay theirs through a save and reload (a WBBookLearnTest save is left). Every exit restores their skill, level,
+			// book and items.
+			if ((","+Config::Get().testOnly+",").find(",wow_book_learn,")!=std::string::npos)
+			g_steps.push_back({ "wow_book_learn", 150, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* av = player->AsActorValueOwner();
+				const std::array<RE::TESBoundObject*, 3> books{ Learning::Book(8921), Learning::Book(5177), Learning::Book(5178) };
+				const auto [moonfire, wrath, wrath3] = books;
+				const auto count = [&](RE::TESBoundObject* a_form) { return a_form ? player->GetItemCount(a_form) : 0; };
+				const auto had = [&](std::size_t a_index) { return g_ctx["had"][a_index].get<int>(); };
+				const auto sys = [](const char* a_find) {
+					return WowUi::Eval(std::format("(function() for _,l in ipairs(__wbSys or {{}}) do if string.find(l,{},1,true) then return l end end return '' end)()",
+						LuaQuote(a_find)));
+				};
+				const auto use = [](RE::TESBoundObject* a_form) {   // a right-click in their WoW bags
+					return WowUi::Eval(std::format("(function() for _,i in pairs(__WB.bagItems or {{}}) do if i.entry=={} then __WB.host('bagUse',i.key) return 1 end end return 0 end)()",
+						Learning::EntryOf(a_form))) == "1";
+				};
+				const auto next = [&](int a_stage) { g_ctx["stage"] = a_stage; g_ctx["at"] = t; };
+				if (t == 0.0) {
+					if (!moonfire || !wrath || !wrath3 || Character::Get().classId != 11) {
+						r = { { "pass", false }, { "error", "a druid with WoWBridge.esp's spell books is required" } };
+						return true;
+					}
+					const auto saved = Progression::SnapshotForTesting();
+					const float destruction = av->GetBaseActorValue(RE::ActorValue::kDestruction);
+					const int level = player->GetLevel();
+					const json counts = { count(moonfire), count(wrath), count(wrath3) };
+					g_restoreLearning = [saved, destruction, level, counts, books] {
+						auto* player = RE::PlayerCharacter::GetSingleton();
+						RE::UIMessageQueue::GetSingleton()->AddMessage(RE::BookMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kHide, nullptr);
+						player->AsActorValueOwner()->SetBaseActorValue(RE::ActorValue::kDestruction, destruction);
+						if (player->GetLevel() != level) Console::Execute(std::format("player.setlevel {}", level));
+						Progression::RestoreForTesting(saved);
+						bool items = true;
+						for (std::size_t i = 0; i < books.size(); ++i) {
+							const int extra = player->GetItemCount(books[i]) - counts[i].get<int>();
+							if (extra > 0) player->RemoveItem(books[i], extra, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+							else if (extra < 0) player->AddObjectToContainer(books[i], nullptr, -extra, nullptr);
+							items = items && player->GetItemCount(books[i]) == counts[i].get<int>();
+						}
+						WowUi::Run("if __wbSysFrame then __wbSysFrame:UnregisterAllEvents() end __wbSysFrame=nil __wbSys=nil "
+							"if __wbItemErrors then __wbItemErrors:UnregisterAllEvents() end __wbItemErrors=nil __wbItemError=nil");
+						return json{ { "skill", player->AsActorValueOwner()->GetBaseActorValue(RE::ActorValue::kDestruction) == destruction },
+							{ "level", player->GetLevel() == level }, { "progression", Progression::SnapshotForTesting() == saved }, { "items", items } };
+					};
+					av->SetBaseActorValue(RE::ActorValue::kDestruction, 15.0f);
+					if (level < 10) Console::Execute("player.setlevel 10");   // the books' levels (Wrath III's is 5)
+					auto fixture = saved;   // their book from their skills alone: no Moonfire, no Wrath II
+					fixture["known_spells"] = json::array();
+					fixture["books"] = json::array();
+					Progression::RestoreForTesting(fixture);
+					WowUi::Run("__wbSys={} if not __wbSysFrame then __wbSysFrame=CreateFrame('Frame') __wbSysFrame:RegisterEvent('CHAT_MSG_SYSTEM') "
+						"__wbSysFrame:SetScript('OnEvent',function() tinsert(__wbSys,arg1) end) end __wbItemError='' if not __wbItemErrors then "
+						"__wbItemErrors=CreateFrame('Frame') __wbItemErrors:RegisterEvent('UI_ERROR_MESSAGE') __wbItemErrors:SetScript('OnEvent',function() __wbItemError=arg1 end) end");
+					g_ctx = { { "stage", 0 }, { "at", t }, { "had", counts }, { "checks", json::object() } };
+					return false;
+				}
+				const int stage = g_ctx.value("stage", 0);
+				const double since = t - g_ctx.value("at", 0.0);
+				auto& checks = g_ctx["checks"];
+				if (stage == 0) {
+					if (!Progression::Ready() || Progression::Knows(8921) || Progression::Knows(5177) || since < 1) {
+						if (since < 10) return false;
+						r = { { "pass", false }, { "error", "their book from Destruction 15 still has Moonfire or Wrath II" } };
+						return true;
+					}
+					player->AddObjectToContainer(moonfire, nullptr, 1, nullptr);
+					player->AddObjectToContainer(wrath3, nullptr, 1, nullptr);
+					next(1);
+					return false;
+				}
+				if (stage == 1) {   // Wrath III before Wrath II: refused, kept
+					if (since < 1) return false;
+					if (!use(wrath3)) {
+						if (since < 5) return false;
+						r = { { "pass", false }, { "error", "Book of Wrath III never reached their bags" } };
+						return true;
+					}
+					next(2);
+					return false;
+				}
+				if (stage == 2) {
+					if (since < 1) return false;
+					checks["refused_error"] = WowUi::Eval("__wbItemError") == "You do not have the required proficiency for that item.";
+					checks["refused_kept"] = count(wrath3) == had(2) + 1 && !Progression::Knows(5178);
+					checks["bag_use"] = use(moonfire);
+					next(3);
+					return false;
+				}
+				if (stage == 3) {   // from their bags: learned at once, below its skill (20), announced, used up
+					if (!Progression::Knows(8921) && since < 8) return false;
+					checks["bag_learned_early"] = Progression::Knows(8921) && av->GetBaseActorValue(RE::ActorValue::kDestruction) == 15.0f;
+					checks["bag_used_up"] = count(moonfire) == had(0);
+					checks["bag_chat"] = !sys("You have learned a new spell: Moonfire (Rank 1).").empty();
+					player->AddObjectToContainer(wrath, nullptr, 1, nullptr);
+					// Read in Skyrim, opened on the game's own thread. The Book Menu pauses the game and with it these steps
+					// (a step waiting to close it never ran again: the old freeze), so it is closed as it opens.
+					MenusOpened().clear();
+					g_closeOnOpen = { std::string(RE::BookMenu::MENU_NAME) };
+					SKSE::GetTaskInterface()->AddTask([book = wrath->As<RE::TESObjectBOOK>()] { RE::BookMenu::OpenMenuFromBaseForm(book); });
+					next(4);
+					return false;
+				}
+				if (stage == 4) {   // the Book Menu came and went
+					const bool opened = MenusOpened().contains(std::string(RE::BookMenu::MENU_NAME));
+					const bool open = RE::UI::GetSingleton()->IsMenuOpen(RE::BookMenu::MENU_NAME);
+					if ((!opened || open) && since < 5) return false;
+					checks["book_menu"] = opened && !open;
+					g_closeOnOpen.clear();
+					next(5);
+					return false;
+				}
+				if (stage == 5) {   // read: learned as the menu closed, announced, used up; now Wrath III's book teaches
+					if (!Progression::Knows(5177) && since < 8) return false;
+					checks["read_learned"] = Progression::Knows(5177);
+					checks["read_used_up"] = count(wrath) == had(1);
+					checks["read_chat"] = !sys("You have learned a new spell: Wrath (Rank 2).").empty();
+					use(wrath3);
+					next(6);
+					return false;
+				}
+				if (stage == 6) {
+					if (!Progression::Knows(5178) && since < 8) return false;
+					checks["next_rank_by_its_book"] = Progression::Knows(5178) && count(wrath3) == had(2);
+					g_ctx["save"] = std::format("WBBookLearnTest_{}_{}", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()), Frame::Count());
+					WowUi::SaveVariables();
+					RE::BGSSaveLoadManager::GetSingleton()->Save(g_ctx["save"].get<std::string>().c_str());
+					next(7);
+					return false;
+				}
+				if (stage == 7) {
+					if (since < 1 || RE::BGSSaveLoadGame::GetSingleton()->GetSaveGameSaving()) return false;
+					g_ctx["loads"] = g_loads.loads.load();
+					RE::BGSSaveLoadManager::GetSingleton()->Load(g_ctx["save"].get<std::string>().c_str());
+					next(8);
+					return false;
+				}
+				const bool loaded = g_loads.loads.load() > g_ctx["loads"].get<std::uint64_t>();
+				if ((!loaded || !Integration::Active() || !WowUi::Ready() || !Progression::Ready()) && since < 60) return false;
+				checks["after_reload"] = loaded && Progression::Knows(8921) && Progression::Knows(5177) && Progression::Knows(5178) &&
+					Progression::SnapshotForTesting()["books"] == json{ 5177, 5178, 8921 };
+				r = { { "checks", checks }, { "save", g_ctx["save"] } };
+				r["pass"] = std::ranges::all_of(checks, [](const json& v) { return v == true; });
+				return true;
+			} });
+			// Mount items (docs/mounts.md), explicit only. Every mount forgotten (a new game's state): none in their spellbook.
+			// Reins of the Swift Frostsaber bought from the test merchant (native barter) and used from their bags teach it,
+			// with the client's chat line, and are used up; it is in their General tab and summons. At level 30 the Swift
+			// Golden Gryphon's item is refused with the client's error. After data load the tome lists and Solitude's
+			// stables chest carry the plugin's lists; the stables list gives every swift mount from 30 and the flyers from
+			// 46, a restock stocks reins, a court wizard's tome list gives spell books. Restores mounts, level, gold, items.
+			if ((","+Config::Get().testOnly+",").find(",wow_mount_items,")!=std::string::npos)
+			g_steps.push_back({ "wow_mount_items", 90, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* reins = Learning::MountItem("swift_frostsaber");
+				auto* flyer = Learning::MountItem("swift_golden_gryphon");
+				auto* gold = RE::TESForm::LookupByID<RE::TESBoundObject>(0xF);
+				const auto count = [&](RE::TESBoundObject* a_form) { return a_form ? player->GetItemCount(a_form) : 0; };
+				const auto had = [&](std::size_t a_index) { return g_ctx["had"][a_index].get<int>(); };
+				const auto listed = [](std::uint32_t a_spell) {
+					return WowUi::Eval(std::format("(function() for _,id in ipairs(__WB.spellbook or {{}}) do if id=={} then return 1 end end return 0 end)()", a_spell)) == "1";
+				};
+				const auto use = [](RE::TESBoundObject* a_form) {
+					return WowUi::Eval(std::format("(function() for _,i in pairs(__WB.bagItems or {{}}) do if i.entry=={} then __WB.host('bagUse',i.key) return 1 end end return 0 end)()",
+						Learning::EntryOf(a_form))) == "1";
+				};
+				const auto next = [&](int a_stage) { g_ctx["stage"] = a_stage; g_ctx["at"] = t; };
+				if (t == 0.0) {
+					const auto* cell = player->GetParentCell();
+					if (!reins || !flyer || !gold || !cell || cell->IsInteriorCell() || Mounts::Pending() || Mounts::Snapshot()["active"].is_object()) {
+						r = { { "pass", false }, { "error", "an unmounted character outdoors with WoWBridge.esp's mount items is required" } };
+						return true;
+					}
+					const auto learned = Mounts::LearnedKeys();
+					const int level = player->GetLevel(), septims = player->GetGoldAmount();
+					const json counts = { count(reins), count(flyer) };
+					g_restoreLearning = [learned, level, septims, counts, reins, flyer, gold] {
+						auto* player = RE::PlayerCharacter::GetSingleton();
+						{ std::lock_guard lock(g_nativeBarterLock); g_nativeBarter.reset(); }
+						std::string message;
+						Mounts::Select("none", message);
+						Console::Command("merchant", "remove");
+						Mounts::SetLearned(learned);
+						if (player->GetLevel() != level) Console::Execute(std::format("player.setlevel {}", level));
+						const int delta = septims - player->GetGoldAmount();
+						if (delta > 0) player->AddObjectToContainer(gold, nullptr, delta, nullptr);
+						else if (delta < 0) player->RemoveItem(gold, -delta, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+						bool items = true;
+						for (std::size_t i = 0; i < 2; ++i) {
+							auto* form = i ? flyer : reins;
+							const int extra = player->GetItemCount(form) - counts[i].get<int>();
+							if (extra > 0) player->RemoveItem(form, extra, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+							else if (extra < 0) player->AddObjectToContainer(form, nullptr, -extra, nullptr);
+							items = items && player->GetItemCount(form) == counts[i].get<int>();
+						}
+						WowUi::Run("if __wbSysFrame then __wbSysFrame:UnregisterAllEvents() end __wbSysFrame=nil __wbSys=nil "
+							"if __wbItemErrors then __wbItemErrors:UnregisterAllEvents() end __wbItemErrors=nil __wbItemError=nil");
+						return json{ { "mounts", Mounts::LearnedKeys() == learned }, { "level", player->GetLevel() == level },
+							{ "septims", player->GetGoldAmount() == septims }, { "items", items } };
+					};
+					Mounts::SetLearned({});   // a new game's: none
+					if (level != 30) Console::Execute("player.setlevel 30");   // the swift mounts' level, under the flyers' 46
+					player->AddObjectToContainer(gold, nullptr, 30000, nullptr);
+					WowUi::Run("__wbSys={} if not __wbSysFrame then __wbSysFrame=CreateFrame('Frame') __wbSysFrame:RegisterEvent('CHAT_MSG_SYSTEM') "
+						"__wbSysFrame:SetScript('OnEvent',function() tinsert(__wbSys,arg1) end) end __wbItemError='' if not __wbItemErrors then "
+						"__wbItemErrors=CreateFrame('Frame') __wbItemErrors:RegisterEvent('UI_ERROR_MESSAGE') __wbItemErrors:SetScript('OnEvent',function() __wbItemError=arg1 end) end");
+					{
+						std::lock_guard lock(g_nativeBarterLock);
+						g_nativeBarter = std::make_unique<NativeBarterProbe>();
+						g_nativeBarter->panelHelpers = true;
+						g_nativeBarter->item = reins;
+						g_nativeBarter->buyOnly = true;
+					}
+					const bool spawned = Console::Command("merchant", "spawn");   // stocked with spell books and mount items
+					g_ctx = { { "stage", 0 }, { "at", t }, { "had", counts }, { "checks", { { "merchant_spawn", spawned } } } };
+					return false;
+				}
+				const int stage = g_ctx.value("stage", 0);
+				const double since = t - g_ctx.value("at", 0.0);
+				auto& checks = g_ctx["checks"];
+				if (stage == 0) {   // bought at the native barter
+					json proof;
+					{
+						std::lock_guard lock(g_nativeBarterLock);
+						if (!g_nativeBarter || !g_nativeBarter->done) {
+							if (since < 30) return false;
+							proof = { { "pass", false }, { "error", "barter observer did not complete" } };
+						} else {
+							proof = g_nativeBarter->result;
+						}
+						g_nativeBarter.reset();
+					}
+					g_ctx["barter"] = proof;
+					checks["bought"] = proof.value("pass", false) && count(reins) == had(0) + 1;
+					checks["forgotten"] = !Mounts::Learned("swift_frostsaber") && !listed(23221) && !listed(32235);
+					Console::Command("merchant", "remove");
+					player->AddObjectToContainer(flyer, nullptr, 1, nullptr);
+					next(1);
+					return false;
+				}
+				if (stage == 1) {   // the barter closed and their bags published: the flyer's item below its level
+					if (since < 1.5 || RE::UI::GetSingleton()->IsMenuOpen(RE::BarterMenu::MENU_NAME)) return false;
+					checks["flyer_bag"] = use(flyer);
+					next(2);
+					return false;
+				}
+				if (stage == 2) {
+					if (since < 1) return false;
+					checks["flyer_refused"] = WowUi::Eval("__wbItemError") == "You must reach level 46 to use that item." &&
+						count(flyer) == had(1) + 1 && !Mounts::Learned("swift_golden_gryphon");
+					checks["reins_bag"] = use(reins);
+					next(3);
+					return false;
+				}
+				if (stage == 3) {   // learned, announced, used up, in their General tab; then summoned as /mount does
+					if (!Mounts::Learned("swift_frostsaber") && since < 5) return false;
+					if (!g_ctx.contains("learned_at")) { g_ctx["learned_at"] = t; return false; }
+					if (t - g_ctx["learned_at"].get<double>() < 0.5) return false;   // the interface hears of it a frame later
+					const auto line = WowUi::Eval("(function() for _,l in ipairs(__wbSys or {}) do if string.find(l,'You have learned a new',1,true) then return l end end return '' end)()");
+					checks["learned"] = Mounts::Learned("swift_frostsaber");
+					checks["used_up"] = count(reins) == had(0);
+					checks["chat"] = line.find("Swift Frostsaber") != std::string::npos;
+					checks["spellbook"] = listed(23221) && !listed(23227);
+					g_ctx["chat"] = line;
+					std::string message;
+					checks["summon_started"] = Mounts::Select("swift_frostsaber", message);
+					g_ctx["summon"] = message;
+					next(4);
+					return false;
+				}
+				if (stage == 4) {   // the player stands still for its 3-second summon
+					const auto state = Mounts::Snapshot();
+					if (!state["active"].is_object() && since < 10) return false;
+					checks["summoned"] = state["active"].is_object() && state["active"].value("key", std::string{}) == "swift_frostsaber";
+					std::string message;
+					Mounts::Select("none", message);
+					next(5);
+					return false;
+				}
+				if (since < 1) return false;
+				// Distribution, after data load: the vanilla lists and chest carry the plugin's lists, gated by level.
+				auto* spellBooks = Distribution::List("WoWSpellBooks");
+				auto* stables = Distribution::List("WoWMountItemsStables");
+				const auto joined = [](RE::TESLevItem* a_into, RE::TESForm* a_list) {
+					return a_into && a_list && std::ranges::any_of(a_into->entries, [&](const RE::LEVELED_OBJECT& e) { return e.form == a_list; });
+				};
+				auto* treasure = RE::TESForm::LookupByID<RE::TESLevItem>(0x10FD8C);   // LItemSpellTomes00Spells
+				auto* wizards = RE::TESForm::LookupByID<RE::TESLevItem>(0xA297A);     // LItemSpellTomes00AllSpells
+				checks["tome_lists"] = joined(treasure, spellBooks) && joined(wizards, spellBooks);
+				auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(0xA6C01);   // ServicesSolitudeStables
+				auto* chest = faction ? faction->vendorData.merchantContainer : nullptr;
+				auto* base = chest && chest->GetBaseObject() ? chest->GetBaseObject()->As<RE::TESObjectCONT>() : nullptr;
+				checks["stables_chest"] = base && stables && base->GetObjectCount(stables) > 0;
+				const auto roll = [](RE::TESLevItem* a_list, std::uint16_t a_level) {   // what one roll at this level gives
+					std::vector<RE::TESForm*> out;
+					RE::BSScrapArray<RE::CALCED_OBJECT> calced;
+					if (a_list) a_list->CalculateCurrentFormList(a_level, 1, calced, 0, false);
+					for (auto& c : calced) out.push_back(c.form);
+					return out;
+				};
+				const auto mounts = Learning::MountKeys().size();
+				g_ctx["stables_rolls"] = { roll(stables, 29).size(), roll(stables, 30).size(), roll(stables, 46).size() };
+				// A Use All list gives every entry whatever the level (the engine, on both PCs): the stock is the whole
+				// catalogue, and using a reins is what needs their level.
+				checks["stables_levels"] = roll(stables, 29).size() == mounts && roll(stables, 46).size() == mounts;
+				std::set<RE::TESForm*> bookForms;
+				for (const auto spell : Learning::Books()) bookForms.insert(Learning::Book(spell));
+				const auto tomes = roll(wizards, 30);
+				checks["wizard_tomes"] = std::ranges::any_of(tomes, [&](RE::TESForm* f) { return f == spellBooks || bookForms.contains(f); });
+				int stocked = 0;
+				if (chest) {
+					chest->ResetInventory(false);   // a restock, at their level 30
+					for (const auto& [form, n] : chest->GetInventoryCounts()) if (Learning::EntryOf(form) && n > 0) stocked += n;
+				}
+				g_ctx["stables_stocked"] = stocked;
+				checks["stables_restock"] = stocked >= static_cast<int>(mounts) - 2;
+				// Their class's books roll and the other class's do not (each list's chance-none global), following a class
+				// change: twenty level-60 rolls of each as a Druid, then as a Paladin, then their class again.
+				auto* librams = Distribution::List("WoWPaladinBooks");
+				const auto own = Character::Get().classId;
+				const auto rolls = [](RE::TESLevItem* a_list) {
+					std::size_t n = 0;
+					for (int i = 0; i < 20; ++i) n += Distribution::Roll(a_list, 60).size();
+					return n;
+				};
+				Distribution::SetClass(11);
+				const auto druidAsDruid = rolls(spellBooks), paladinAsDruid = rolls(librams);
+				Distribution::SetClass(2);
+				const auto druidAsPaladin = rolls(spellBooks), paladinAsPaladin = rolls(librams);
+				Distribution::SetClass(own);
+				g_ctx["class_book_rolls"] = { druidAsDruid, paladinAsDruid, druidAsPaladin, paladinAsPaladin };
+				checks["class_books"] = librams && druidAsDruid > 0 && paladinAsDruid == 0 && druidAsPaladin == 0 && paladinAsPaladin > 0;
+				r = { { "checks", checks }, { "barter", g_ctx["barter"] }, { "chat", g_ctx.value("chat", "") }, { "summon", g_ctx.value("summon", "") },
+					{ "stables_rolls", g_ctx["stables_rolls"] }, { "stables_stocked", stocked }, { "wizard_roll", tomes.size() },
+					{ "class_book_rolls", g_ctx["class_book_rolls"] } };
+				r["pass"] = std::ranges::all_of(checks, [](const json& v) { return v == true; });
+				return true;
+			} });
+
+			// WoWBridgeArmory.esp (docs/inventory-model.md, Armory), explicit only. Five of its items of different slots, classes
+			// and tiers (Lionheart Helm: plate, level 37; Edgemaster's Handguards: mail, 26; Wyrmtongue Shoulders: leather,
+			// 38; Sentry Cloak: cloth, 11; Death's Sting: a dagger, 52) are given and equipped: each is worn and in the
+			// service's caster, its native armour or damage is armory.json's, its bonus ability is theirs, and their bags' tooltip
+			// names it with its Skyrim armour or damage. After data load the boss chests' and corpses' lists carry the
+			// Armory's; LItemSpecialLoot100 rolls Armory greens and blues of at most level 30 at 30, the boss list nothing
+			// above 45 (except legendaries) or below blue at 45, and a blacksmith's restock stocks Armory gear. A newly
+			// carried, unequipped weapon gets its converted tooltip without a caster change. Restores their outfit and items.
+			if ((","+Config::Get().testOnly+",").find(",wow_armory,")!=std::string::npos)
+			g_steps.push_back({ "wow_armory", 60, [](double t, json& r) {
+				static constexpr std::uint32_t kItems[]{ 12640, 14551, 13358, 2059, 21126 };
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* equip = RE::ActorEquipManager::GetSingleton();
+				const auto next = [&](int a_stage) { g_ctx["stage"] = a_stage; g_ctx["at"] = t; };
+				const auto worn = [&](RE::TESBoundObject* a_form) {
+					const auto inv = player->GetInventory([&](RE::TESBoundObject& o) { return &o == a_form; });
+					return !inv.empty() && inv.begin()->second.second && inv.begin()->second.second->IsWorn();
+				};
+				if (t == 0.0) {
+					std::vector<RE::TESBoundObject*> forms;
+					for (const auto entry : kItems) if (const auto* item = Armory::Find(entry)) forms.push_back(item->form);
+					if (forms.size() != std::size(kItems)) {
+						r = { { "pass", false }, { "error", "WoWBridgeArmory.esp and armory.json with its test items are required" } };
+						return true;
+					}
+					const auto weapons = Gear::WeaponDamages();
+					const auto carried = std::ranges::find_if(Armory::Items(), [&](const Armory::Item& i) {
+						return i.form->IsWeapon() && player->GetItemCount(i.form) == 0 && !weapons.contains(std::to_string(i.entry)) &&
+							std::ranges::find(kItems, i.entry) == std::end(kItems);
+					});
+					if (carried == Armory::Items().end() || weapons.size() >= 200) {
+						r = { { "pass", false }, { "error", "an uncarried Armory weapon and room in the tooltip map are required" } };
+						return true;
+					}
+					forms.push_back(carried->form);
+					json outfit = json::array(), counts = json::array();
+					for (const auto& [form, data] : player->GetInventory([](RE::TESBoundObject& o) { return o.IsArmor() || o.IsWeapon(); })) {
+						if (data.first > 0 && data.second && data.second->IsWorn()) outfit.push_back(form->GetFormID());
+					}
+					for (auto* form : forms) counts.push_back(player->GetItemCount(form));
+					g_restoreLearning = [outfit, counts, forms] {
+						auto* player = RE::PlayerCharacter::GetSingleton();
+						auto* equip = RE::ActorEquipManager::GetSingleton();
+						bool items = true;
+						for (std::size_t i = 0; i < forms.size(); ++i) {
+							equip->UnequipObject(player, forms[i], nullptr, 1, nullptr, false, false, false);
+							const int extra = player->GetItemCount(forms[i]) - counts[i].get<int>();
+							if (extra > 0) player->RemoveItem(forms[i], extra, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+							items = items && player->GetItemCount(forms[i]) == counts[i].get<int>();
+						}
+						for (const auto& id : outfit) {
+							if (auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(id.get<RE::FormID>())) {
+								equip->EquipObject(player, form, nullptr, 1, nullptr, false, false, false);
+							}
+						}
+						return json{ { "items", items } };
+					};
+					g_ctx = { { "stage", 0 }, { "at", t }, { "given", 0 }, { "checks", json::object() }, { "carried", carried->entry } };
+					return false;
+				}
+				const int stage = g_ctx.value("stage", 0);
+				const double since = t - g_ctx.value("at", 0.0);
+				auto& checks = g_ctx["checks"];
+				if (stage == 0) {   // one equip at a time
+					const auto given = g_ctx["given"].get<std::size_t>();
+					if (since < 0.4) return false;
+					if (given < std::size(kItems)) {
+						auto* form = Armory::Find(kItems[given])->form;
+						player->AddObjectToContainer(form, nullptr, 1, nullptr);
+						equip->EquipObject(player, form, nullptr, 1, nullptr, false, true, false, true);
+						g_ctx["given"] = given + 1;
+						g_ctx["at"] = t;
+						return false;
+					}
+					next(1);
+					return false;
+				}
+				if (stage == 1) {   // worn, theirs in the service's caster and their bags
+					const auto caster = Character::Caster()["items"];
+					const bool all = std::ranges::all_of(kItems, [&](std::uint32_t e) { return std::ranges::find(caster, json(e)) != caster.end(); });
+					const auto tooltips = WowUi::Eval(std::format("(function() local n=0 for _,i in pairs(__WB.bagItems or {{}}) do "
+						"for _,e in ipairs({{{},{},{},{},{}}}) do if i.entry==e and __WB.itemTooltip then local t=__WB.itemTooltip(i) or {{}} "
+						"local named,stat=t[1] and t[1].left==i.name,false for _,l in ipairs(t) do if l.left and (string.find(l.left,'%d+ Armor$') "
+						"or string.find(l.left,'Damage$')) then stat=true end end if named and stat then n=n+1 end end end end return n end)()",
+						kItems[0], kItems[1], kItems[2], kItems[3], kItems[4]));
+					if ((!all || tooltips != std::to_string(std::size(kItems))) && since < 10) return false;
+					checks["caster"] = all;
+					checks["tooltips"] = tooltips == std::to_string(std::size(kItems));
+					json items = json::array();
+					bool native = true, wearing = true, abilities = true;
+					for (const auto entry : kItems) {
+						const auto* item = Armory::Find(entry);
+						const auto skyrim = Armory::Row(entry)["skyrim"];
+						json row = { { "entry", entry }, { "worn", worn(item->form) }, { "level", item->level } };
+						if (auto* armor = item->form->As<RE::TESObjectARMO>()) {
+							row["armor"] = armor->GetArmorRating(), row["expected"] = skyrim["armor"];
+							native = native && armor->GetArmorRating() == skyrim["armor"].get<int>();
+						} else if (const auto* weapon = item->form->As<RE::TESObjectWEAP>()) {
+							row["damage"] = weapon->attackDamage, row["expected"] = skyrim["damage"];
+							native = native && weapon->attackDamage == skyrim["damage"].get<int>();
+						}
+						if (item->ability >= 0) {
+							const auto& copies = Armory::Abilities()[item->ability];
+							row["ability"] = !copies.empty() && player->HasSpell(copies.front());
+							abilities = abilities && row["ability"] == true;
+						}
+						wearing = wearing && row["worn"] == true;
+						items.push_back(row);
+					}
+					g_ctx["items"] = items;
+					checks["worn"] = wearing, checks["native_stats"] = native, checks["abilities"] = abilities;
+					next(2);
+					return false;
+				}
+				if (stage == 2) {
+					const auto entry = g_ctx["carried"].get<std::uint32_t>();
+					g_ctx["carried_caster"] = Character::Caster()["items"];
+					checks["carried_weapon_absent"] = WowUi::Eval(std::format(
+						"(__WB.skyrimWeapons and __WB.skyrimWeapons[{}]) and 0 or 1", entry)) == "1";
+					player->AddObjectToContainer(Armory::Find(entry)->form, nullptr, 1, nullptr);
+					next(3);
+					return false;
+				}
+				if (stage == 3) {
+					const auto entry = g_ctx["carried"].get<std::uint32_t>();
+					const bool tooltip = WowUi::Eval(std::format("(function() local w=__WB.skyrimWeapons and __WB.skyrimWeapons[{}] "
+						"return w and w.min>0 and w.max>=w.min and 1 or 0 end)()", entry)) == "1";
+					if (!tooltip && since < 10) return false;
+					checks["carried_weapon_tooltip"] = tooltip && !worn(Armory::Find(entry)->form) &&
+						Character::Caster()["items"] == g_ctx["carried_caster"];
+					next(4);
+					return false;
+				}
+				// Distribution, after data load: the vanilla lists carry the Armory's, gated by level and quality.
+				const auto joined = [](RE::FormID a_into, std::string_view a_list) {
+					auto* into = RE::TESForm::LookupByID<RE::TESLevItem>(a_into);
+					auto* list = Distribution::List(a_list);
+					return into && list ? std::ranges::count_if(into->entries, [&](const RE::LEVELED_OBJECT& e) { return e.form == list; }) : 0;
+				};
+				checks["special_loot_joined"] = joined(0x1031D0, "WoWArmoryLoot") == 3;     // LItemSpecialLoot100, three entries
+				checks["bandit_corpse_joined"] = joined(0xC3C9B, "WoWArmoryDeath") == 1;    // DeathItemBandit
+				checks["boss_chest_joined"] = joined(0x348FD, "WoWArmoryBoss") == 1;        // LootBanditChestBossMagicItem25
+				checks["dragon_joined"] = joined(0xF77F3, "WoWArmoryDragon") == 2;          // LootDragonArmor25
+				const auto armory = [](RE::TESLevItem* a_list, std::uint16_t a_level, int a_rolls) {   // the Armory items rolled
+					std::vector<const Armory::Item*> found;
+					for (int i = 0; a_list && i < a_rolls; ++i) {
+						for (auto* form : Distribution::Roll(a_list, a_level)) if (const auto* item = Armory::Find(form->As<RE::TESBoundObject>())) found.push_back(item);
+					}
+					return found;
+				};
+				const auto special = armory(RE::TESForm::LookupByID<RE::TESLevItem>(0x1031D0), 30, 400);
+				checks["treasure_rolls_armory"] = !special.empty() && std::ranges::all_of(special, [](const Armory::Item* i) {
+					return i->level <= 30 && (i->quality == 2 || i->quality == 3);
+				});
+				const auto boss = armory(Distribution::List("WoWArmoryBoss"), 45, 100);
+				const auto bossLevel = [](const Armory::Item* i) {
+					return i->quality >= 3 && (i->level <= 45 || i->quality == 5);   // boss legendaries enter at 40
+				};
+				checks["boss_list_levels"] = !boss.empty() && std::ranges::all_of(boss, bossLevel);
+				const auto* atiesh = Armory::Find(22589);
+				checks["boss_legendary_exception"] = atiesh && atiesh->level > 45 && bossLevel(atiesh);
+				int stocked = 0;
+				auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(0x9CAFF);   // ServicesWhiterunWarmaidens
+				if (auto* chest = faction ? faction->vendorData.merchantContainer : nullptr) {
+					chest->ResetInventory(false);   // a restock, at their level
+					for (const auto& [form, n] : chest->GetInventoryCounts()) if (Armory::Find(form) && n > 0) stocked += n;
+				}
+				checks["blacksmith_restock"] = stocked > 0;
+				json levels = json::array();
+				for (const auto* i : special) levels.push_back({ i->entry, i->level, i->quality });
+				r = { { "checks", checks }, { "items", g_ctx["items"] }, { "treasure", levels }, { "boss_rolls", boss.size() },
+					{ "blacksmith_stocked", stocked } };
+				r["pass"] = std::ranges::all_of(checks, [](const json& v) { return v == true; });
+				return true;
+			} });
+
+			// Followers see their gear (docs/armory.md): the build gives each WoW armour its Skyrim look's armour addons in the
+			// slots both claim, so an NPC wears it in that look (their own body stays culled by the WoW surrogate). A friendly
+			// person spawned ahead, its AI off, is given and wears an Armory helm and chest (Lionheart Helm, Imperial Plate
+			// Chest: Ebony's look), then WoWBridge.esp's (Helm and Breastplate of Might: Dragonplate's). Each pair is worn in
+			// the head and body slots, each item has addons, and the person's biped holds one of each with its 3D drawn;
+			// captures npc_armory_look and npc_armory_look_esp. The person is disabled after, on every exit (not deleted).
+			// Explicit only: [Test] only=npc_armory_look.
+			// Explicit only ([Test] only=wow_gear_dual_slots): two rings, two trinkets, a shirt and a tabard worn at once, as
+			// 1.12's paper doll holds them, though Skyrim gives each pair one body slot (36, 60, 56).
+			if ((","+Config::Get().testOnly+",").find(",wow_gear_dual_slots,")!=std::string::npos)
+			g_steps.push_back({ "wow_gear_dual_slots", 20, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* equip = RE::ActorEquipManager::GetSingleton();
+				const auto pick = [](std::uint32_t a_type, std::uint32_t a_skip) -> const Armory::Item* {
+					for (const auto& item : Armory::Items())
+						if (item.look.inventoryType == a_type && item.entry != a_skip && item.form && item.form->As<RE::TESObjectARMO>()) return &item;
+					return nullptr;
+				};
+				if (t == 0.0) {
+					const auto* ring1 = pick(11, 0); const auto* ring2 = ring1 ? pick(11, ring1->entry) : nullptr;
+					const auto* trinket1 = pick(12, 0); const auto* trinket2 = trinket1 ? pick(12, trinket1->entry) : nullptr;
+					const auto* shirt = pick(4, 0); const auto* tabard = pick(19, 0);
+					if (!ring1 || !ring2 || !trinket1 || !trinket2 || !shirt || !tabard) {
+						r = { { "pass", false }, { "error", "the Armory has no two rings, two trinkets, a shirt and a tabard" } };
+						return true;
+					}
+					json items = json::array();
+					for (const auto* item : { ring1, ring2, trinket1, trinket2, shirt, tabard }) {
+						player->AddObjectToContainer(item->form, nullptr, 1, nullptr);
+						items.push_back({ { "entry", item->entry }, { "form", item->form->GetFormID() }, { "type", item->look.inventoryType } });
+					}
+					g_ctx = { { "items", items }, { "next", 0 }, { "at", t } };
+					return false;
+				}
+				auto& items = g_ctx["items"];
+				const auto form = [&](const json& a_item) { return RE::TESForm::LookupByID<RE::TESObjectARMO>(a_item["form"].get<RE::FormID>()); };
+				const auto worn = [&](const json& a_item) {
+					const auto* armo = form(a_item);
+					for (const auto& [object, data] : player->GetInventory([&](RE::TESBoundObject& o) { return &o == armo; }))
+						if (data.second && data.second->IsWorn()) return true;
+					return false;
+				};
+				const auto cleanup = [&] {
+					for (const auto& item : items) if (auto* armo = form(item)) {
+						equip->UnequipObject(player, armo, nullptr, 1, nullptr, false, true, false, true);
+						player->RemoveItem(armo, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+					}
+				};
+				const int next = g_ctx["next"];
+				if (next < static_cast<int>(items.size())) {   // one a second: each equip's own one-per-slot pass runs first
+					if (t - g_ctx["at"].get<double>() < 1.0) return false;
+					equip->EquipObject(player, form(items[next]), nullptr, 1, nullptr, false, false, false, true);
+					g_ctx["next"] = next + 1; g_ctx["at"] = t;
+					return false;
+				}
+				if (t - g_ctx["at"].get<double>() < 1.5) return false;
+				json checks = json::object();
+				for (const auto& item : items) checks[std::format("worn_{}_{}", item["type"].get<int>(), item["entry"].get<int>())] = worn(item);
+				// The paper doll's slots: INVSLOT_BODY 4, TABARD 19, FINGER1/2 11/12, TRINKET1/2 13/14.
+				for (const int slot : { 4, 19, 11, 12, 13, 14 })
+					checks[std::format("paper_doll_{}", slot)] = WowUi::Eval(std::format("GetInventoryItemLink('player',{}) and 1 or 0", slot)) == "1";
+				r = { { "checks", checks }, { "items", items } };
+				r["pass"] = std::ranges::all_of(checks, [](const json& v) { return v == true; });
+				cleanup();
+				return true;
+			} });
+
+			// Native clones on the player's WoW body: explicit only, ten full-resolution frames (each drawn AND sheathed).
+			if ((","+Config::Get().testOnly+",").find(",wow_player_skyrim_weapons,")!=std::string::npos)
+			g_steps.push_back({ "wow_player_skyrim_weapons", 600, [](double t, json& r) {
+				constexpr RE::FormID forms[] = { 0x12EB7, 0x896B9, 0x1359D, 0x13985, 0x12EB6 };
+				constexpr const char* names[] = { "iron_sword", "enchanted_sword", "greatsword", "bow", "shield" };
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* equip = RE::ActorEquipManager::GetSingleton();
+				auto* camera = RE::PlayerCamera::GetSingleton();
+				const auto command = [](std::string_view arg, std::string_view value = {}) {
+					std::string message; return PlayerWeapons::Command(arg, value, message);
+				};
+				const auto next = [&](int stage) { g_ctx["stage"] = stage; g_ctx["at"] = t; StepCheckpoint(); };
+				if (t == 0.0) {
+					const auto* body = Avatar::Data();
+					if (!player || !equip || !camera || !body || body->display || player->IsOnMount() || player->IsSwimming()) {
+						r = { { "pass", false }, { "error", "requires their unmounted WoW character body on dry ground" } }; return true;
+					}
+					for (std::size_t i = 0; i < std::size(forms); ++i) {
+						auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(forms[i]);
+						const auto* weapon = form ? form->As<RE::TESObjectWEAP>() : nullptr;
+						const auto* armor = form ? form->As<RE::TESObjectARMO>() : nullptr;
+						if (!form || (i == 4 ? !armor || !armor->IsShield() : !weapon) || (i == 1 && !weapon->formEnchanting)) {
+							r = { { "pass", false }, { "error", "required vanilla weapon/shield or sword enchantment missing" }, { "form", forms[i] } }; return true;
+						}
+					}
+					std::array<const Armory::Item*, 5> references{};
+					for (std::size_t kind = 0; kind < references.size(); ++kind) for (const auto& item : Armory::Items()) {
+						if (!item.form || !item.look.displayId) continue;
+						const auto* weapon = item.form->As<RE::TESObjectWEAP>();
+						const bool match = kind == 0 ? weapon && weapon->GetWeaponType() == RE::WEAPON_TYPE::kOneHandSword && item.look.inventoryType == 13 :
+							kind == 1 ? weapon && item.look.subclass == 5 && item.look.inventoryType == 17 :
+							kind == 2 ? weapon && weapon->GetWeaponType() == RE::WEAPON_TYPE::kTwoHandSword && item.look.inventoryType == 17 :
+							kind == 3 ? weapon && item.look.subclass == 2 && item.look.inventoryType == 15 :
+							item.look.inventoryType == 14 && item.form->As<RE::TESObjectARMO>() && item.form->As<RE::TESObjectARMO>()->IsShield();
+						if (match) { references[kind] = &item; break; }
+					}
+					for (std::size_t kind = 0; kind < references.size(); ++kind) if (!references[kind]) {
+						r = { { "pass", false }, { "error", "matching Armory reference unavailable" }, { "kind", names[kind] } }; return true;
+					}
+					const auto* control = references[0];
+					const auto left = HandInstance(player, true), right = HandInstance(player, false);
+					auto* wornShield = player->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kShield);
+					const bool drawn = player->AsActorState()->IsWeaponDrawn(), enabled = PlayerWeapons::Enabled();
+					const bool avatarDrawn = Avatar::WeaponsDrawn();
+					const bool first = camera->currentState && camera->currentState->id == RE::CameraState::kFirstPerson;
+					auto* third = static_cast<RE::ThirdPersonState*>(camera->cameraStates[RE::CameraState::kThirdPerson].get());
+					const auto rotation = third->freeRotation;
+					const auto originalAngle = player->GetAngle();
+					const bool free = third->freeRotationEnabled;
+					const float zoom = third->targetZoomOffset;
+					std::vector<RE::TESBoundObject*> added, testItems;
+					for (const auto id : forms) {
+						auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(id);
+						testItems.push_back(form);
+					}
+					for (const auto* reference : references) testItems.push_back(reference->form);
+					for (auto* form : testItems) if (!player->GetItemCount(form)) { player->AddObjectToContainer(form, nullptr, 1, nullptr); added.push_back(form); }
+					// Preserve session calibration; the positional gate measures the authored grip at default offsets.
+					std::vector<json> fits;
+					const auto selected = PlayerWeapons::Status()["type"].get<std::string>();
+					for (const auto* name : { "sword", "hammer", "greatsword", "bow", "shield" }) {
+						command("type", name); fits.push_back(PlayerWeapons::Status());
+						command("lift", "0"); command("out", "0"); command("scale", "1"); command("roll", "0");
+					}
+					g_restorePlayerWeapons = [=] {
+						g_wantFrontView = false;
+						third->freeRotation = { 0.f, 0.f };  // do not fold the test orbit into their heading during restoration
+						PlayerWeapons::Reset();
+						for (auto* form : testItems) {
+							equip->UnequipObject(player, form, nullptr, 1, nullptr, false, true, false, true);
+						}
+						for (auto* form : added) {
+							const auto lists = UnwornInstances(player, form, InstanceIdentity(nullptr));
+							player->RemoveItem(form, 1, RE::ITEM_REMOVE_REASON::kRemove, lists.empty() ? nullptr : lists.front(), nullptr);
+						}
+						for (const bool isLeft : { false, true }) {
+							const auto& hand = isLeft ? left : right;
+							auto* old = RE::TESForm::LookupByID(hand.value("form", 0u));
+							auto* slot = RE::BGSDefaultObjectManager::GetSingleton()->GetObject<RE::BGSEquipSlot>(isLeft ? RE::DEFAULT_OBJECT::kLeftHandEquip : RE::DEFAULT_OBJECT::kRightHandEquip);
+							if (auto* form = old ? old->As<RE::TESBoundObject>() : nullptr) {
+								const auto lists = UnwornInstances(player, form, hand["identity"]);
+								equip->EquipObject(player, form, lists.empty() ? nullptr : lists.front(), 1, isLeft ? slot : nullptr, false, true, false, true);
+							} else if (auto* spell = old ? old->As<RE::SpellItem>() : nullptr) equip->EquipSpell(player, spell, slot);
+						}
+						if (wornShield && left.value("form", 0u) != wornShield->GetFormID()) equip->EquipObject(player, wornShield, nullptr, 1, nullptr, false, true, false, true);
+						for (const auto& fit : fits) {
+							command("type", fit["type"].get<std::string>());
+							int i = 0; for (const auto* field : { "lift", "out", "scale", "roll" }) command(field, std::to_string(fit["fit"][i++].get<float>()));
+						}
+						command("type", selected); command(enabled ? "on" : "off");
+						player->DrawWeaponMagicHands(drawn);
+						Avatar::SetWeaponsDrawn(avatarDrawn);
+						player->SetAngle(originalAngle); player->Update3DPosition(true);
+						third->freeRotation = rotation; third->freeRotationEnabled = free; third->targetZoomOffset = zoom;
+						if (first) camera->ForceFirstPerson();
+					};
+					g_ctx = { { "case", 0 }, { "stage", 0 }, { "at", t }, { "cases", json::array() }, { "wow_entry", control->entry }, { "wow_controls", json::array() } };
+					g_ctx["reference_entries"] = json::array();
+					for (const auto* reference : references) g_ctx["reference_entries"].push_back(reference->entry);
+					g_ctx["references"] = json::array();
+					StepCheckpoint();
+					camera->ForceThirdPerson(); command("on");
+					WowUi::Run("if WBTestPanel then WBTestPanel:Hide() end");
+					return false;
+				}
+				const int index = g_ctx["case"], kind = index / 2;
+
+				if (index == 20) {
+					// Disabling must hide every native clone while the body remains culled.
+					command("off"); Surrogate::Refresh();
+					bool hidden = true;
+					RE::BSVisit::TraverseScenegraphGeometries(player->Get3D(false), [&](RE::BSGeometry* geo) {
+						hidden = hidden && geo->GetAppCulled(); return RE::BSVisit::BSVisitControl::kContinue;
+					});
+					r = { { "cases", g_ctx["cases"] }, { "references", g_ctx["references"] }, { "wow_controls", g_ctx["wow_controls"] }, { "off_hides_clones", g_ctx["off_native_hidden"] },
+						{ "pass", hidden && g_ctx.value("off_native_hidden", false) && g_ctx["cases"].size() == 10 && g_ctx["wow_controls"].size() == 2 &&
+							std::ranges::all_of(g_ctx["cases"], [](const json& row) { return row["pass"] == true; }) } };
+					return true;
+				}
+				if (index >= 10) {
+					const int referenceIndex = index - 10, referenceKind = referenceIndex / 2;
+					const auto* item = Armory::Find(g_ctx["reference_entries"][referenceKind].get<std::uint32_t>());
+					if (!item || !item->form) { r = { { "pass", false }, { "error", "Armory reference disappeared" } }; return true; }
+					const bool drawn = referenceIndex % 2 == 0;
+					const int stage = g_ctx["stage"];
+					const double since = t - g_ctx["at"].get<double>();
+					const auto slot = referenceKind == 4 ? 16u : referenceKind == 3 ? 17u : 15u;
+					g_wantFrontView = drawn;
+					if (stage == 0) {
+						if (drawn) {
+							if (index == 10) {
+								command("off"); Surrogate::Refresh();
+								bool hidden = true;
+								RE::BSVisit::TraverseScenegraphGeometries(player->Get3D(false), [&](RE::BSGeometry* geo) {
+									hidden = hidden && geo->GetAppCulled(); return RE::BSVisit::BSVisitControl::kContinue;
+								});
+								g_ctx["off_native_hidden"] = hidden && PlayerWeapons::Status()["items"].empty();
+								if (!g_ctx["off_native_hidden"].get<bool>()) { r = { { "pass", false }, { "error", "off left native clones visible" } }; return true; }
+								command("on");
+							}
+							for (const auto& [form, data] : player->GetInventory()) if (data.second && data.second->IsWorn() &&
+								(form->IsWeapon() || (form->As<RE::TESObjectARMO>() && form->As<RE::TESObjectARMO>()->IsShield())))
+								equip->UnequipObject(player, form, nullptr, 1, nullptr, false, true, false, true);
+							equip->EquipObject(player, item->form, nullptr, 1, nullptr, false, true, false, true);
+							if (referenceKind == 4) equip->EquipObject(player, Armory::Find(g_ctx["reference_entries"][0].get<std::uint32_t>())->form, nullptr, 1, nullptr, false, true, false, true);
+						}
+						next(1); return false;
+					}
+					if (stage == 1) {
+						if (since < .6) return false;
+						player->DrawWeaponMagicHands(drawn); Avatar::SetWeaponsDrawn(drawn, true); next(2); return false;
+					}
+					const auto* body = Avatar::Data();
+					if (since < 2 || !body || Avatar::Current().weaponsDrawn != drawn || player->AsActorState()->IsWeaponDrawn() != drawn ||
+						!PlayerWeapons::Status()["items"].empty() || !std::ranges::any_of(body->items, [&](const auto& worn) {
+							return worn.slot == slot && worn.displayId == item->look.displayId;
+						}) || !std::ranges::any_of(body->attached, [&](const auto& part) { return part.attached && part.attached->slot == slot; })) return false;
+					const auto pose = WowModels::LastAttachments();
+					if (pose.body != body || pose.drawn != drawn || std::chrono::steady_clock::now() - pose.at > std::chrono::milliseconds(250)) return false;
+					bool hidden = true;
+					RE::BSVisit::TraverseScenegraphGeometries(player->Get3D(false), [&](RE::BSGeometry* geo) {
+						hidden = hidden && geo->GetAppCulled(); return RE::BSVisit::BSVisitControl::kContinue;
+					});
+					if (!hidden) return false;
+					const auto base = std::format("player_wow_{}_{}", names[referenceKind], drawn ? "drawn" : "sheathed");
+					const auto measure = [&]() -> json {
+						for (const auto& row : PlayerWeapons::WowItems()) if (row["slot"] == slot) return row;
+						return nullptr;
+					};
+					if (!FitViews(player, base, t, pose.frame, measure, true, drawn)) return false;
+					json reference{ { "entry", item->entry }, { "display", item->look.displayId }, { "drawn", drawn },
+						{ "frame", pose.frame }, { "native_hidden", hidden }, { "wow_attached", true }, { "views", g_ctx["views"] },
+						{ "capture", g_ctx["views"][0]["capture"] }, { "item_px", g_ctx["views"][0]["item_px"] } };
+					auto& native = g_ctx["cases"][referenceIndex];
+					for (std::size_t view = 0; view < 3; ++view) {
+						auto& nativeView = native["views"][view];
+						auto& wowView = reference["views"][view]["metrics"];
+						const auto& clone = nativeView["metrics"]["clone"];
+						const auto vector = [](const json& v) { return glm::vec3(v[0].get<float>(), v[1].get<float>(), v[2].get<float>()); };
+						const float angle = FitEvidence::Angle(vector(clone["long_axis"]), vector(wowView["long_axis"]));
+						const float height = clone["bound_centre_height"].get<float>() - wowView["bound_centre_height"].get<float>();
+						nativeView["metrics"]["reference_axis_angle_deg"] = FitEvidence::Below(angle, 15);
+						nativeView["metrics"]["reference_centre_height_difference"] = FitEvidence::Below(std::abs(height), 8);
+						nativeView["metrics"]["reference_signed_height_difference"] = height;
+						wowView["reference_axis_angle_deg"] = nativeView["metrics"]["reference_axis_angle_deg"];
+						wowView["reference_centre_height_difference"] = nativeView["metrics"]["reference_centre_height_difference"];
+						nativeView["metrics"]["wow_reference"] = wowView;
+					}
+					reference["metrics"] = reference["views"][0]["metrics"];
+					if (referenceKind == 0) g_ctx["wow_controls"].push_back(reference);
+					native["wow_reference"] = reference;
+					native["metrics"] = native["views"][0]["metrics"];
+					PlayerWeapons::RecordReferenceReview(names[referenceKind], drawn, native["metrics"], reference["views"][0]["metrics"]);
+					g_ctx["references"].push_back(std::move(reference));
+					g_ctx["case"] = index + 1; next(0); return false;
+				}
+				const bool drawn = index % 2 == 0;
+				const int stage = g_ctx["stage"];
+				const double since = t - g_ctx["at"].get<double>();
+				auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(forms[kind]);
+				auto* state = camera->currentState.get();
+				// The hook suppresses vanilla's heading fold only during a drawn fixture case. Never toggle free camera.
+				g_wantFrontView = drawn;
+				if (!state || state->id != RE::CameraState::kThirdPerson) { camera->ForceThirdPerson(); return false; }
+				auto* third = static_cast<RE::ThirdPersonState*>(state);
+				if (stage != 3 && WantFrontView()) { third->freeRotationEnabled = true; third->freeRotation = { RE::NI_PI, 0.f }; }
+				// Start sheathed cases in the vanilla behind view; FitViews then holds quarter/half turns.
+				if (stage != 3 && !drawn) third->freeRotationEnabled = false;
+				third->targetZoomOffset = .22f;
+				if (stage == 0) {
+					if (drawn) {
+						for (const auto& [item, data] : player->GetInventory()) if (data.second && data.second->IsWorn() &&
+							(item->IsWeapon() || (item->As<RE::TESObjectARMO>() && item->As<RE::TESObjectARMO>()->IsShield())))
+							equip->UnequipObject(player, item, nullptr, 1, nullptr, false, true, false, true);
+						equip->EquipObject(player, form, nullptr, 1, nullptr, false, true, false, true);
+						if (kind == 4) equip->EquipObject(player, RE::TESForm::LookupByID<RE::TESBoundObject>(forms[0]), nullptr, 1, nullptr, false, true, false, true);
+					}
+					next(1); return false;
+				}
+				if (stage == 1) {
+					if (since < .6) return false;
+					player->DrawWeaponMagicHands(drawn); Avatar::SetWeaponsDrawn(drawn, true); next(2); return false;
+				}
+				if (since < 2.0 || player->AsActorState()->IsWeaponDrawn() != drawn) return false;
+				bool bodyHidden = Surrogate::BodyHidden();
+				Surrogate::Refresh();  // must preserve only the selected clone's leaves
+				const auto status = PlayerWeapons::Status();
+				const auto found = std::ranges::find_if(status["items"], [&](const json& row) { return row["form"] == forms[kind] && row["drawn"] == drawn; });
+				for (const bool first : { false, true }) RE::BSVisit::TraverseScenegraphGeometries(player->Get3D(first), [&](RE::BSGeometry* geo) {
+					if (!PlayerWeapons::KeepsVisible(geo) && !geo->GetAppCulled()) bodyHidden = false;
+					return RE::BSVisit::BSVisitControl::kContinue;
+				});
+				auto* cam = RE::Main::WorldRootCamera();
+				bool framed = false;
+				if (cam) {
+					auto toCamera = cam->world.translate - player->GetPosition(); toCamera.z = 0; toCamera.Unitize();
+					const float heading = Avatar::Current().facing;
+					const auto toBody = player->GetPosition() + RE::NiPoint3{ 0, 0, 80 } - cam->world.translate;
+					const auto& m = cam->world.rotate;
+					const RE::NiPoint3 forward{ m.entry[0][0], m.entry[1][0], m.entry[2][0] };
+					framed = (!drawn || !PlayerWeapons::FrontViewEnabled() || toCamera.x * std::sin(heading) + toCamera.y * std::cos(heading) > .8f) &&   // sheathed: the vanilla view behind the player shows the back and hips
+						toBody.Length() > 100 && toBody.Length() < 650 && forward.Dot(toBody / toBody.Length()) > .85f;
+				}
+				const bool clone = found != status["items"].end() && (*found)["visible"] == true && (*found)["drawn"] == drawn &&   // the point follows the item's real kind (0x896B9 is a warhammer, not a sword)
+					(*found)["distance"].get<float>() < 3.f;
+				const bool glow = !status["glow"].get<bool>() || kind != 1 || !drawn || (clone && (*found)["effect_geometry"].get<int>() > 0);
+				const auto stance = PlayerWeapons::ReadyStance();
+				const bool posed = !drawn || !stance || Avatar::Current().animation == *stance;
+				if (stage != 3 && (!clone || !bodyHidden || !framed || !glow || !posed)) {
+					ProbeWait("wow_player_skyrim_weapons", t, { { "case", index }, { "status", status }, { "framed", framed }, { "body_hidden", bodyHidden }, { "glow", glow }, { "stance", posed } });
+					if (t - g_ctx.value("at", 0.0) > 25.0 && !g_ctx.contains("wait_capture")) { g_ctx["wait_capture"] = true; UiPass::RequestCapture("player_skyrim_wait"); }   // what a long wait looks like
+					return false;
+				}
+				const auto captureName = std::format("player_skyrim_{}_{}", names[kind], drawn ? "drawn" : "sheathed");
+				if (stage == 2) {
+					g_ctx["sample"] = *found; g_ctx["framed"] = framed; g_ctx["body_hidden"] = bodyHidden;
+					next(3); return false;
+				}
+				const auto measure = [&]() -> json {
+					if (found == status["items"].end()) return nullptr;
+					auto metrics = (*found)["metrics"]; metrics["clone"] = *found; return metrics;
+				};
+				if (!FitViews(player, captureName, t, found != status["items"].end() ? (*found)["frame"].get<std::uint64_t>() : 0, measure, true, drawn)) return false;
+				const auto& primary = g_ctx["views"][0];
+				const bool full = primary["full_resolution"];
+				g_ctx["cases"].push_back({ { "capture", primary["capture"] }, { "clone", g_ctx["sample"] }, { "width", primary["width"] }, { "height", primary["height"] },
+					{ "views", g_ctx["views"] }, { "metrics", primary["metrics"] }, { "item_px", primary["item_px"] },
+					{ "body_hidden", g_ctx["body_hidden"] }, { "framed_facing_camera", g_ctx["framed"] }, { "frontview_enabled", status["frontview"] },
+					{ "glow_enabled", status["glow"] }, { "stance_enabled", status["stance"] }, { "animation", Avatar::Current().animation },
+					{ "ready_animation", status["ready_animation"] }, { "stance_matches", posed },
+					{ "enchantment_effect", glow }, { "pass", full && clone && g_ctx["body_hidden"] == true && g_ctx["framed"] == true && posed } });   // glow and metrics are evidence
+				g_wantFrontView = false;
+				if (drawn && PlayerWeapons::FrontViewEnabled()) third->freeRotation = { 0.f, 0.f };
+				g_ctx["case"] = index + 1; next(0); return false;
+			} });
+
+			// Explicit only: five distinct helm shapes on four Skyrim heads, full-resolution head-framed views.
+			if ((","+Config::Get().testOnly+",").find(",wow_npc_helms,")!=std::string::npos)
+			g_steps.push_back({ "wow_npc_helms", 600, [](double t, json& r) {
+				static constexpr const char* kKinds[] = { "full", "open", "hood", "circlet", "horned" };
+				static constexpr std::uint32_t kEntries[] = { 7922, 7931, 7048, 5624, 9394 };
+				static constexpr std::uint32_t kDisplays[] = { 16093, 16110, 15283, 15905, 21301 };
+				// Skyrim.esm: EncGuardImperialM05MaleGuard (Nord), NordFemalePreset10,
+				// ImperialMalePreset10, WoodElfFemalePreset10. Presets avoid hostile elf factions.
+				static constexpr RE::FormID kBases[] = { 0xAA8FC, 0x1347C, 0x1347A, 0x1C197 };   // guard, Gerdur (Nord), Lucan Valerius (Imperial), Faralda (Altmer): presets had no FaceGen (black faces)
+				static constexpr const char* kSubjects[] = { "guard", "nord_f", "imperial_m", "elf_f" };
+				static constexpr const char* kKeys[] = { "actor", "b", "a", "outside" };
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* equip = RE::ActorEquipManager::GetSingleton();
+				const auto next = [&](int stage) { g_ctx["stage"] = stage; g_ctx["at"] = t; };
+				if (t == 0.0) {
+					g_ctx = { { "helms_enabled", NpcHelms::Enabled() }, { "case", 0 }, { "stage", 0 }, { "at", t }, { "cases", json::array() } };
+					for (std::size_t kind = 0; kind < std::size(kEntries); ++kind) {
+						const auto* item = Armory::Find(kEntries[kind]);
+						if (!item || !item->form || !item->form->IsArmor() || item->look.inventoryType != 1 || item->look.displayId != kDisplays[kind]) {
+							r = { { "pass", false }, { "error", "required Armory helm unavailable" }, { "kind", kKinds[kind] }, { "entry", kEntries[kind] } }; return true;
+						}
+					}
+					for (std::size_t subject = 0; subject < std::size(kBases); ++subject) {
+						auto* base = RE::TESForm::LookupByID<RE::TESNPC>(kBases[subject]);
+						if (!base || (base->GetSex() == RE::SEX::kFemale) != (subject % 2 == 1)) {
+							r = { { "pass", false }, { "error", "helm subject base missing or wrong sex" }, { "base", kBases[subject] } }; return true;
+						}
+						auto* person = SpawnAhead(base, 250.f, 80.f * static_cast<float>(subject) - 120.f);
+						if (person) g_ctx[kKeys[subject]] = person->GetFormID();
+						if (!person || person->IsHostileToActor(player)) {
+							r = { { "pass", false }, { "error", "could not place friendly helm subject" }, { "base", kBases[subject] } }; return true;
+						}
+						person->EnableAI(false);
+					}
+					NpcHelms::SetEnabled(true); return false;
+				}
+				const int index = g_ctx["case"], kind = index % 5, subject = index / 5;
+				if (index == 20) {
+					const auto current = NpcHelms::Current(); const auto draws = NpcHelms::Draws();
+					for (const auto* key : kKeys) {
+						const auto id = g_ctx[key].get<RE::FormID>();
+						if (std::ranges::any_of(current, [id](const auto& i) { return i.ref == id; }) ||
+							std::ranges::any_of(draws, [id](const auto& d) { return d.instance.ref == id; })) return false;
+					}
+					r = { { "cases", g_ctx["cases"] }, { "disabled_culled", true } };
+					r["pass"] = g_ctx["cases"].size() == 20 && std::ranges::all_of(g_ctx["cases"], [](const json& row) { return row["pass"] == true; });
+					return true;
+				}
+				auto* person = RE::TESForm::LookupByID<RE::Actor>(g_ctx[kKeys[subject]].get<RE::FormID>());
+				const auto* item = Armory::Find(kEntries[kind]);
+				auto* cam = RE::Main::WorldRootCamera();
+				if (!person || !item || !equip || !cam) {
+					r = { { "pass", false }, { "error", std::format("helm fixture missing: {}{}{}{} (subject {} entry {})", person ? "" : "actor ", item ? "" : "armory-item ",
+						equip ? "" : "equip ", cam ? "" : "camera ", kSubjects[subject], kEntries[kind]) }, { "evidence", g_ctx } };
+					return true;
+				}
+				const int stage = g_ctx["stage"];
+				const double since = t - g_ctx["at"].get<double>();
+				const auto& m = cam->world.rotate;
+				const RE::NiPoint3 fwd{ m.entry[0][0], m.entry[1][0], m.entry[2][0] };
+				const RE::NiPoint3 up{ m.entry[0][2], m.entry[1][2], m.entry[2][2] };
+				RE::NiPoint3 fwdH{ fwd.x, fwd.y, 0.f }; fwdH.Unitize();
+				const RE::NiPoint3 rightH{ fwdH.y, -fwdH.x, 0.f };
+				const auto headSpot = cam->world.translate + fwdH * 170.f + rightH * 75.f;   // the head's target, at camera height
+				const std::string captureName = std::format("npc_helm_{}_{}", kKinds[kind], kSubjects[subject]);
+				if (stage == 0) {
+					if (!person->Get3D(false) || since < .5) return false;
+					for (std::size_t other = 0; other < std::size(kKeys); ++other) if (other != static_cast<std::size_t>(subject)) {
+						if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_ctx[kKeys[other]].get<RE::FormID>()); actor && !actor->IsDisabled())
+							PlaceInSight(actor, { { -250.f, 80.f * static_cast<float>(other) } });
+					}
+					// Eye level, beside the player's line of sight: a level camera behind the player sees the player's own
+					// body straight ahead (the user asked for eye-level views, October 17).
+					person->SetPosition({ headSpot.x, headSpot.y, player->GetPosition().z }, true);
+					{ const auto to = cam->world.translate - headSpot; person->SetAngle({ 0.f, 0.f, std::atan2(to.x, to.y) }); }
+					// Only fixture inventory changes. Remove prior native/Armory head pieces, including circlets.
+					std::vector<std::pair<RE::TESBoundObject*, int>> headItems;
+					for (const auto& [form, data] : person->GetInventory()) if (const auto* armor = form->As<RE::TESObjectARMO>(); armor && data.first > 0 &&
+						(armor->HasPartOf(RE::BGSBipedObjectForm::BipedObjectSlot::kHair) || armor->HasPartOf(RE::BGSBipedObjectForm::BipedObjectSlot::kCirclet))) headItems.emplace_back(form, data.first);
+					for (const auto& [form, count] : headItems) {
+						equip->UnequipObject(person, form, nullptr, 1, nullptr, false, false, false, true);
+						person->RemoveItem(form, count, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+					}
+					person->AddObjectToContainer(item->form, nullptr, 1, nullptr);
+					equip->EquipObject(person, item->form, nullptr, 1, nullptr, false, false, false, true);
+					next(1); return false;
+				}
+				auto* head = person->Get3D(false) ? person->Get3D(false)->GetObjectByName("NPC Head [Head]") : nullptr;
+				if (!head) return false;
+				player->data.angle.x = 0.f;   // eye level: a downward camera hid the helms' height (the user, October 17)
+				g_ctx["camera_pitch_deg"] = std::asin(std::clamp(fwd.z, -1.f, 1.f)) * 57.29578f;
+				// Align the head, not the feet, with the actual camera axis (including its pitch). Camera-relative
+				// placement works in cursor mode too. Frozen fixture actors may float to put their head in view.
+				const auto target = headSpot;
+				const auto error = target - head->world.translate;
+				const bool framed = error.SqrLength() < 40.f * 40.f || g_ctx.value("framed_ok", false);   // a frozen head may not refresh: three corrections, then as is
+				if (stage == 1) {
+					if (since < .5) return false;
+					// A frozen actor's head transform may not refresh after a move: at most three corrections, or the
+					// loop marched him out of the loaded cells until the engine deleted the temp ref (October 16).
+					if (!framed && g_ctx.value("corrections", 0) < 3) {
+						g_ctx["corrections"] = g_ctx.value("corrections", 0) + 1;
+						person->SetPosition(person->GetPosition() + error, true); g_ctx["at"] = t; return false;
+					}
+					g_ctx["corrections"] = 0; g_ctx["framed_ok"] = true;
+					next(2); return false;
+				}
+				const auto instances = NpcHelms::Current(); const auto draws = NpcHelms::Draws();
+				const auto id = person->GetFormID();
+				const auto found = std::ranges::find_if(instances, [&](const auto& i) { return i.ref == id && i.entry == item->entry && i.display == kDisplays[kind]; });
+				const auto drawn = std::ranges::find_if(draws, [&](const auto& d) { return d.instance.ref == id && d.instance.entry == item->entry && d.instance.display == kDisplays[kind]; });
+				const bool gathered = found != instances.end();
+				const bool rendered = drawn != draws.end() && drawn->instance.hidden && drawn->batches && drawn->frame && drawn->instance.gather &&
+					std::chrono::steady_clock::now() - drawn->at < std::chrono::milliseconds(500);
+				if (stage != 3 && (!gathered || !rendered || !framed)) {
+					ProbeWait("wow_npc_helms", t, { { "case", captureName }, { "gathered", gathered }, { "rendered", rendered }, { "framed", framed }, { "describe", NpcHelms::Describe(id) } });
+					return false;
+				}
+				if (stage == 2) {
+					if (since < .5) return false;
+					const auto& i = drawn->instance;
+					const bool hair = i.asset && i.hairHidden == (i.asset->hideHair && i.hairGeometry > 0) && i.beardHidden == (i.asset->hideBeard && i.beardGeometry > 0);
+					g_ctx["sample"] = { { "capture", captureName + "_front" }, { "actor", id }, { "base", kBases[subject] }, { "subject", kSubjects[subject] },
+						{ "entry", item->entry }, { "display", item->look.displayId }, { "model", i.asset->item->parts[0].model.name },
+						{ "gather", i.gather }, { "frame", drawn->frame }, { "batches", drawn->batches }, { "hair_hidden", i.hairHidden }, { "beard_hidden", i.beardHidden },
+						{ "hide_hair", i.asset->hideHair }, { "hide_beard", i.asset->hideBeard }, { "hair_geometry", i.hairGeometry }, { "beard_geometry", i.beardGeometry },
+						{ "describe", NpcHelms::Describe(id) }, { "camera_pitch_deg", g_ctx.value("camera_pitch_deg", 0.0) },
+						{ "checks", { { "gathered", gathered }, { "drawn_hidden_same_frame", rendered }, { "head_framed", framed }, { "hair_policy", hair } } } };
+					next(3); return false;
+				}
+				const auto measure = [&]() -> json { return drawn != draws.end() ? NpcHelms::Evidence(drawn->instance) : json(); };
+				if (!FitViews(person, captureName, t, drawn != draws.end() ? drawn->frame : 0, measure, false, true,
+					[](bool enabled) { NpcHelms::SetEnabled(enabled); })) return false;
+				auto row = g_ctx["sample"];
+				row["views"] = g_ctx["views"];
+				const auto& front = row["views"][0];
+				row["metrics"] = front["metrics"]; row["item_px"] = front["item_px"]; row["head_px"] = front.value("head_px", json());
+				row["width"] = front["width"]; row["height"] = front["height"];
+				row["checks"]["full_resolution"] = front["full_resolution"];
+				row["pass"] = front["full_resolution"] == true && row["checks"]["hair_policy"] == true;
+				g_ctx["cases"].push_back(std::move(row));
+				if (kind == 4) person->Disable();
+				g_ctx["framed_ok"] = false; g_ctx["case"] = index + 1; next(0); return false;
+			} });
+
+			// Explicit only: ten full-resolution views, plus a successful sheathed draw for every item.
+			if ((","+Config::Get().testOnly+",").find(",wow_npc_weapons,")!=std::string::npos)
+			g_steps.push_back({ "wow_npc_weapons", 600, [](double t, json& r) {
+				static constexpr const char* kTypes[] = { "onehand", "twohand", "staff", "bow", "shield" };
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* equip = RE::ActorEquipManager::GetSingleton();
+				const auto next = [&](int stage) { g_ctx["stage"] = stage; g_ctx["at"] = t; StepCheckpoint(); };
+				if (t == 0.0) {
+					// Staff is weapon subclass 10, NOT inventory type 10 (gloves). Bow subclass 2 excludes guns.
+					std::array<const Armory::Item*, 5> selected{};
+					std::set<std::uint32_t> displays;
+					for (std::size_t kind = 0; kind < selected.size(); ++kind) for (const auto& item : Armory::Items()) {
+						if (!item.form || !item.look.displayId || displays.contains(item.look.displayId)) continue;
+						const auto type = item.look.inventoryType, sub = item.look.subclass;
+						const auto* weapon = item.form->As<RE::TESObjectWEAP>();
+						const bool match = kind == 0 ? type == 13 && weapon && weapon->GetWeaponType() == RE::WEAPON_TYPE::kOneHandSword :
+							kind == 1 ? type == 17 && weapon && weapon->GetWeaponType() == RE::WEAPON_TYPE::kTwoHandSword :
+							kind == 2 ? type == 17 && sub == 10 && weapon && weapon->GetWeaponType() == RE::WEAPON_TYPE::kTwoHandAxe :   // Armory staves swing as two-handers
+							kind == 3 ? type == 15 && sub == 2 && weapon && weapon->GetWeaponType() == RE::WEAPON_TYPE::kBow :
+							type == 14 && item.form->As<RE::TESObjectARMO>();
+						if (match) { selected[kind] = &item; displays.insert(item.look.displayId); break; }
+					}
+					if (std::ranges::any_of(selected, [](const auto* item) { return !item; })) {
+						// Say which kind found nothing and what the Armory holds of that inventory type (form, Skyrim kind).
+						json missing = json::array();
+						for (std::size_t kind = 0; kind < selected.size(); ++kind) {
+							if (selected[kind]) continue;
+							const std::uint32_t want = kind == 4 ? 14 : kind == 3 ? 15 : kind == 0 ? 13 : 17;
+							std::map<std::string, int> kinds; int forms = 0, total = 0;
+							for (const auto& item : Armory::Items()) {
+								if (item.look.inventoryType != want) continue;
+								++total; if (!item.form) continue; ++forms;
+								const auto* weapon = item.form->As<RE::TESObjectWEAP>();
+								kinds[std::format("{}/sub{}", weapon ? static_cast<int>(weapon->GetWeaponType()) : -1, item.look.subclass)]++;
+							}
+							missing.push_back({ { "kind", kTypes[kind] }, { "inventory_type", want }, { "total", total }, { "with_form", forms }, { "skyrim_kind/subclass", kinds } });
+						}
+						r = { { "pass", false }, { "error", "Armory requires distinct onehand/twohand/staff/bow/shield displays" }, { "missing", missing } }; return true;
+					}
+					g_ctx = { { "weapons_enabled", NpcWeapons::Enabled() }, { "case", 0 }, { "stage", 0 }, { "at", t },
+						{ "items", json::array() }, { "cases", json::array() } };
+					StepCheckpoint();
+					for (const auto* item : selected) g_ctx["items"].push_back(item->entry);
+					for (int sex = 0; sex < 2; ++sex) {
+						auto* base = RE::TESForm::LookupByID<RE::TESNPC>(sex ? 0x1347C : 0xAA8FC);   // Gerdur: the preset had no FaceGen
+						if (!base || (base->GetSex() == RE::SEX::kFemale) != (sex == 1)) {
+							r = { { "pass", false }, { "error", "male guard / female Nord base unavailable or wrong sex" } }; return true;
+						}
+						auto* person = SpawnAhead(base, 250.f, sex ? -90.f : 90.f);
+						if (person) g_ctx[sex ? "b" : "actor"] = person->GetFormID();
+						if (!person || person->IsHostileToActor(player)) {
+							r = { { "pass", false }, { "error", "could not place friendly weapon fixture" } }; return true;
+						}
+						person->EnableAI(false);
+						PlaceInSight(person, { { 250.f, sex ? -90.f : 90.f }, { 300.f, sex ? -80.f : 80.f } });
+						const auto to = player->GetPosition() - person->GetPosition();
+						person->SetAngle({ 0.f, 0.f, std::atan2(to.x, to.y) });
+					}
+					NpcWeapons::SetEnabled(true);
+					return false;
+				}
+				const int index = g_ctx["case"], kind = index % 5;
+				if (index == 10) {
+					// Both disabled actors must also disappear from the gather and last world frame.
+					const auto current = NpcWeapons::Current(); const auto draws = NpcWeapons::Draws();
+					for (const auto* key : { "actor", "b" }) {
+						const auto id = g_ctx[key].get<RE::FormID>();
+						if (std::ranges::any_of(current, [id](const auto& i) { return i.ref == id; }) ||
+							std::ranges::any_of(draws, [id](const auto& d) { return d.instance.ref == id; })) return false;
+					}
+					r = { { "checks", { { "ten_cases", g_ctx["cases"].size() == 10 }, { "disabled_culled", true } } }, { "cases", g_ctx["cases"] } };
+					r["pass"] = g_ctx["cases"].size() == 10 && std::ranges::all_of(g_ctx["cases"], [](const json& row) { return row["pass"] == true; });
+					return true;
+				}
+				auto* person = RE::TESForm::LookupByID<RE::Actor>(g_ctx[index < 5 ? "actor" : "b"].get<RE::FormID>());
+				const auto* item = Armory::Find(g_ctx["items"][kind].get<std::uint32_t>());
+				if (!person || !item || !equip) { r = { { "pass", false }, { "error", "weapon fixture disappeared" } }; return true; }
+				const int stage = g_ctx["stage"];
+				const double since = t - g_ctx["at"].get<double>();
+				const std::string captureName = std::format("npc_weapon_{}_{}", kTypes[kind], index < 5 ? "male" : "female");
+				if (stage == 0) {
+					if (!person->Get3D(false) || since < 1.0) return false;
+					// The subject stands ahead of the player for its captures; the other fixture waits behind the player, out of frame.
+					if (auto* other = RE::TESForm::LookupByID<RE::Actor>(g_ctx[index < 5 ? "b" : "actor"].get<RE::FormID>()); other && !other->IsDisabled())
+						PlaceInSight(other, { { -220.f, 160.f } });
+					// Ahead of the CAMERA (their heading and the view differ in cursor mode), at their ground height, facing it.
+					if (auto* cam = RE::Main::WorldRootCamera()) {
+						const auto& m = cam->world.rotate;
+						RE::NiPoint3 fwd{ m.entry[0][0], m.entry[1][0], 0.f }; fwd.Unitize();
+						const auto at = RE::NiPoint3{ cam->world.translate.x, cam->world.translate.y, player->GetPosition().z } + fwd * 380.f;
+						person->SetPosition(at, true);
+						person->SetAngle({ 0.f, 0.f, std::atan2(-fwd.x, -fwd.y) });
+					} else {
+						PlaceInSight(person, { { 230.f, 0.f }, { 250.f, 40.f }, { 250.f, -40.f }, { 300.f, 0.f } });
+						const auto to = player->GetPosition() - person->GetPosition(); person->SetAngle({ 0.f, 0.f, std::atan2(to.x, to.y) });
+					}
+					// Only fixture inventory changes. Keep production gather/render entirely observational.
+					// The actor's process attaches a weapon clone to its socket (a frozen actor keeps it at the skeleton
+					// root): its AI runs from the equip through the draw, then it freezes for the capture.
+					person->EnableAI(true);
+					// Its own weapons leave the inventory (not just the hands): an AI-driven draw may re-equip the best one.
+					std::vector<std::pair<RE::TESBoundObject*, int>> own;
+					for (const auto& [form, data] : person->GetInventory()) if (data.first > 0 && form != item->form &&
+						(form->IsWeapon() || (form->As<RE::TESObjectARMO>() && form->As<RE::TESObjectARMO>()->IsShield())))
+						own.emplace_back(form, data.first);
+					for (const auto& [form, count] : own) person->RemoveItem(form, count, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+					person->AddObjectToContainer(item->form, nullptr, 1, nullptr);
+					equip->EquipObject(person, item->form, nullptr, 1, nullptr, false, false, false, true);
+					if (kind == 4) {  // a sword gives the shield a normal drawn stance
+						const auto* sword = Armory::Find(g_ctx["items"][0].get<std::uint32_t>());
+						person->AddObjectToContainer(sword->form, nullptr, 1, nullptr);
+						equip->EquipObject(person, sword->form, nullptr, 1, nullptr, false, false, false, true);
+					}
+					next(1); return false;
+				}
+				if (stage == 1) {
+					if (since < .5) return false;
+					// An AI-disabled actor ignores the draw (it runs through its process): try the graph event first,
+					// then its AI for the draw alone; record which took.
+					if (!g_ctx.contains("draw_try")) {
+						g_ctx["draw_try"] = 2; g_ctx["draw_at"] = t;
+						person->DrawWeaponMagicHands(true);  // actor virtual, no selected-console/player command
+						return false;
+					}
+					// Its AI sheathes an idle weapon within seconds: freeze the actor again once the draw took.
+					// The clone moves to the hand at the draw animation's event, after the state flips: let it finish.
+					if (person->AsActorState()->IsWeaponDrawn()) {
+						if (!g_ctx.contains("drawn_at")) { g_ctx["drawn_at"] = t; return false; }
+						if (t - g_ctx["drawn_at"].get<double>() < 1.5) return false;
+						g_ctx["draw_method"] = g_ctx["draw_try"]; g_ctx.erase("draw_try"); g_ctx.erase("drawn_at"); person->EnableAI(false); next(2); return false;
+					}
+					if (t - g_ctx["draw_at"].get<double>() < 3.0) return false;
+					if (t - g_ctx["draw_at"].get<double>() < 8.0) { if (static_cast<int>(t * 2) % 4 == 0) person->DrawWeaponMagicHands(true); return false; }
+					r = { { "pass", false }, { "error", "fixture never drew its weapon (AI on)" }, { "evidence", g_ctx } }; return true;
+				}
+				const auto instances = NpcWeapons::Current(); const auto draws = NpcWeapons::Draws();
+				const auto id = person->GetFormID();
+				const auto found = std::ranges::find_if(instances, [&](const auto& i) { return i.ref == id && i.entry == item->entry; });
+				const auto drawn = std::ranges::find_if(draws, [&](const auto& d) { return d.instance.ref == id && d.instance.entry == item->entry; });
+				const bool sheathed = stage >= 4;
+				const bool gathered = found != instances.end() && found->display == item->look.displayId && found->drawn != sheathed;
+				const bool rendered = drawn != draws.end() && drawn->instance.display == item->look.displayId && drawn->instance.drawn != sheathed &&
+					drawn->instance.hidden && drawn->batches && drawn->frame && drawn->instance.gather &&
+					std::chrono::steady_clock::now() - drawn->at < std::chrono::milliseconds(500);
+				if (stage != 3 && stage != 5 && (!gathered || !rendered || person->AsActorState()->IsWeaponDrawn() == sheathed)) {
+					ProbeWait("wow_npc_weapons", t, { { "case", captureName }, { "sheathed", sheathed }, { "gathered", gathered }, { "rendered", rendered }, { "describe", NpcWeapons::Describe(id) } });
+					return false;
+				}
+				if (stage == 2) {
+					if (since < 1.0) return false;
+					g_ctx["sample"] = { { "capture", captureName + "_front" }, { "actor", id }, { "entry", item->entry }, { "display", item->look.displayId },
+						{ "inventory_type", item->look.inventoryType }, { "subclass", item->look.subclass }, { "drawn_node", drawn->instance.node }, { "draw_method", g_ctx.value("draw_method", 0) },
+						{ "gather", drawn->instance.gather }, { "frame", drawn->frame }, { "batches", drawn->batches },
+						{ "describe", NpcWeapons::Describe(id) },
+						{ "checks", { { "gathered", gathered }, { "drawn_hidden_same_frame", rendered } } } };
+					next(3); return false;
+				}
+				const auto measure = [&]() -> json { return drawn != draws.end() ? NpcWeapons::Evidence(drawn->instance) : json(); };
+				if (stage == 3) {
+					if (!FitViews(person, captureName, t, drawn != draws.end() ? drawn->frame : 0, measure, false, true,
+						[](bool enabled) { NpcWeapons::SetEnabled(enabled); })) return false;
+					auto row = g_ctx["sample"];
+					row["views"] = g_ctx["views"];
+					const auto& front = row["views"][0];
+					row["metrics"] = front["metrics"]; row["item_px"] = front["item_px"];
+					row["width"] = front["width"]; row["height"] = front["height"];
+					row["checks"]["full_resolution"] = front["full_resolution"]; row["pass"] = front["full_resolution"];
+					g_ctx["cases"].push_back(std::move(row));
+					person->EnableAI(true); person->DrawWeaponMagicHands(false); next(4); return false;
+				}
+				if (stage == 4) {
+					if (since < 2.0) return false;
+					auto& row = g_ctx["cases"].back();
+					row["checks"]["sheathed_rendered"] = rendered; row["sheathed_node"] = drawn->instance.node;
+					row["sheathed_frame"] = drawn->frame;
+					row["sheathed_metrics"] = NpcWeapons::Evidence(drawn->instance);
+					person->EnableAI(false); next(5); return false;
+				}
+				if (!FitViews(person, captureName + "_sheathed", t, drawn != draws.end() ? drawn->frame : 0, measure)) return false;
+				g_ctx["cases"].back()["sheathed_views"] = g_ctx["views"];
+				g_ctx["case"] = index + 1; next(0);
+				if (kind == 4) person->Disable();  // never delete spawned actors
+				return false;
+			} });
+
+			ShadowTests();
+
+			// Explicit only: a native NPC wears an Armory shoulder item in slot 57. Both M2s must be drawn from
+			// one gather snapshot in one world frame; capture it, then disable the actor and verify it disappears.
+			if ((","+Config::Get().testOnly+",").find(",wow_npc_shoulders,")!=std::string::npos)
+			g_steps.push_back({ "wow_npc_shoulders", 90, [](double t, json& r) {
+				const auto* item = Armory::Find(13358);  // Wyrmtongue Shoulders, also used by wow_armory
+				auto* armor = item && item->form ? item->form->As<RE::TESObjectARMO>() : nullptr;
+				if (t == 0.0) {
+					if (!armor || item->look.inventoryType != 3) {
+						r = { { "pass", false }, { "error", "Armory Wyrmtongue Shoulders (13358) required" } }; return true;
+					}
+					auto* person = SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0xAA8FC), 250.f, 60.f);
+					if (!person || person->IsHostileToActor(RE::PlayerCharacter::GetSingleton())) {
+						if (person) person->Disable();
+						r = { { "pass", false }, { "error", "could not place a friendly person" } }; return true;
+					}
+					person->EnableAI(false);
+					PlaceInSight(person, { { 250.f, 60.f }, { 250.f, -60.f }, { 300.f, 0.f }, { 200.f, 100.f } });
+					const auto to = RE::PlayerCharacter::GetSingleton()->GetPosition() - person->GetPosition();
+					person->SetAngle({ 0.f, 0.f, std::atan2(to.x, to.y) });
+					g_ctx = { { "actor", person->GetFormID() }, { "stage", 0 }, { "shoulders_enabled", NpcShoulders::Enabled() } };
+					NpcShoulders::SetEnabled(true);
+					return false;
+				}
+				auto* person = RE::TESForm::LookupByID<RE::Actor>(g_ctx["actor"].get<RE::FormID>());
+				if (!person || !armor) { r = { { "pass", false }, { "error", "person or shoulder item is gone" } }; return true; }
+				const int stage = g_ctx["stage"];
+				if (stage == 0) {
+					if (!person->Get3D(false) || t < 1.0) return false;
+					person->AddObjectToContainer(armor, nullptr, 1, nullptr);
+					RE::ActorEquipManager::GetSingleton()->EquipObject(person, armor, nullptr, 1, nullptr, false, false, false, true);
+					g_ctx["stage"] = 1;
+					return false;
+				}
+				const auto instances = NpcShoulders::Current();
+				const auto draws = NpcShoulders::Draws();
+				const auto id = person->GetFormID();
+				const auto found = std::ranges::find(instances, id, &NpcShoulders::Instance::ref);
+				const auto drawn = std::ranges::find_if(draws, [id](const auto& d) { return d.instance.ref == id; });
+				if (stage == 3) {
+					if (found != instances.end() || drawn != draws.end()) return false;
+					r = g_ctx["result"];
+					r["checks"]["disabled_culled"] = person->IsDisabled();
+					r["pass"] = std::ranges::all_of(r["checks"], [](const json& v) { return v == true; });
+					return true;
+				}
+				const bool gathered = found != instances.end() && found->entry == item->entry && found->display == item->look.displayId;
+				const bool attached = drawn != draws.end() && drawn->instance.entry == item->entry && drawn->instance.display == item->look.displayId &&
+					drawn->instance.gather && drawn->frame && drawn->batches[0] && drawn->batches[1] &&
+					std::chrono::steady_clock::now() - drawn->at < std::chrono::milliseconds(500);
+				if (stage != 2 && (!gathered || !attached || person->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kModShoulder) != armor)) {
+					ProbeWait("wow_npc_shoulders", t, { { "gate", "two_attached_models" }, { "gathered", gathered }, { "drawn", attached } });
+					return false;
+				}
+				if (stage == 1) { g_ctx["stage"] = 2; return false; }
+				if (!FitViews(person, "npc_shoulders", t, drawn != draws.end() ? drawn->frame : 0,
+					[&]() -> json { return drawn != draws.end() ? NpcShoulders::Evidence(drawn->instance) : json(); })) return false;
+				const auto& capture = g_ctx["views"][0];
+				const auto matrix = [](const glm::mat4& m) {
+					json result = json::array();
+					for (int row = 0; row < 4; ++row) for (int col = 0; col < 4; ++col) result.push_back(m[col][row]);
+					return result;
+				};
+				json sides = json::array();
+				for (std::size_t side = 0; side < 2; ++side) sides.push_back({ { "side", side == 0 ? "left" : "right" },
+					{ "upper_arm", drawn->instance.upperArm[side] },
+					{ "node_world", matrix(drawn->instance.nodes[side]) }, { "model_world", matrix(drawn->instance.world[side]) }, { "batches", drawn->batches[side] } });
+				g_ctx["result"] = { { "checks", { { "slot_57_worn", true }, { "gathered", gathered }, { "two_models_one_frame", attached },
+					{ "captured", capture["width"].get<int>() > 0 && capture["height"].get<int>() > 0 } } }, { "actor", id }, { "entry", item->entry }, { "display", item->look.displayId },
+					{ "gather", drawn->instance.gather }, { "frame", drawn->frame }, { "sides", sides }, { "capture", "npc_shoulders_front" }, { "views", g_ctx["views"] },
+					{ "metrics", capture["metrics"] }, { "item_px", capture["item_px"] }, { "cases", g_ctx["views"] } };
+				person->Disable();  // never delete spawned actors; verify the next gather/render drops it
+				g_ctx["stage"] = 3;
+				return false;
+			} });
+
+			if ((","+Config::Get().testOnly+",").find(",npc_armory_look,")!=std::string::npos)
+			g_steps.push_back({ "npc_armory_look", 45, [](double t, json& r) {
+				struct Pair { const char* capture; std::uint32_t helm, chest; bool armory; };
+				// The third: Embersilk Coronet, a helm whose 1.12 look is a circlet (f8c53f9; backlog L1).
+				static constexpr Pair kPairs[]{ { "npc_armory_look", 12640, 12422, true }, { "npc_armory_look_esp", 16866, 16865, false },
+					{ "npc_armory_circlet", 14228, 12422, true } };
+				const auto armor = [](std::uint32_t a_entry, bool a_armory) -> RE::TESObjectARMO* {
+					const auto* item = a_armory ? Armory::Find(a_entry) : nullptr;
+					auto* form = a_armory ? (item ? item->form : nullptr) : Gear::FormOf(a_entry);
+					return form ? form->As<RE::TESObjectARMO>() : nullptr;
+				};
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* equip = RE::ActorEquipManager::GetSingleton();
+				const auto next = [&](int a_stage) { g_ctx["stage"] = a_stage; g_ctx["at"] = t; };
+				if (t == 0.0) {
+					for (const auto& pair : kPairs) {
+						if (!armor(pair.helm, pair.armory) || !armor(pair.chest, pair.armory)) {
+							r = { { "pass", false }, { "error", "WoWBridge.esp, WoWBridgeArmory.esp and their test helms and chests are required" } };
+							return true;
+						}
+					}
+					auto* person = SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0xAA8FC), 250.f, 60.f);   // EncGuardImperialM05MaleGuard
+					if (!person || person->IsHostileToActor(player)) {
+						if (person) person->Disable();
+						r = { { "pass", false }, { "error", "could not place a friendly person" } };
+						return true;
+					}
+					person->EnableAI(false);   // stays where the camera sees it
+					PlaceInSight(person, { { 250.f, 60.f }, { 250.f, -60.f }, { 300.f, 0.f }, { 200.f, 100.f } });   // a rock hid it once
+					const auto to = player->GetPosition() - person->GetPosition();
+					person->SetAngle({ 0.f, 0.f, std::atan2(to.x, to.y) });   // facing the player and the camera
+					g_ctx = { { "actor", person->GetFormID() }, { "stage", 0 }, { "at", t }, { "pair", 0 }, { "pairs", json::array() } };
+					return false;
+				}
+				auto* person = RE::TESForm::LookupByID<RE::Actor>(g_ctx["actor"].get<RE::FormID>());
+				if (!person) {
+					r = { { "pass", false }, { "error", "the person is gone" }, { "pairs", g_ctx["pairs"] } };
+					return true;
+				}
+				const int stage = g_ctx["stage"].get<int>();
+				const double since = t - g_ctx["at"].get<double>();
+				const auto  index = g_ctx["pair"].get<std::size_t>();
+				if (index >= std::size(kPairs)) {   // both pairs seen; the step's cleanup disables the person (never deletes it)
+					r = { { "pairs", g_ctx["pairs"] } };
+					r["pass"] = std::ranges::all_of(g_ctx["pairs"], [](const json& p) { return p["pass"] == true; });
+					return true;
+				}
+				const auto& pair = kPairs[index];
+				auto* helm = armor(pair.helm, pair.armory);
+				auto* chest = armor(pair.chest, pair.armory);
+				if (stage == 0) {   // its 3D loaded and settled, then the pair given and worn
+					auto* root = person->Get3D(false);
+					if ((!root || !root->GetObjectByName("NPC Spine2 [Spn2]")) && t < 10.0) return false;
+					if (since < 1.0) return false;
+					if (index > 0)   // the previous pair off first; forceEquip would lock a pair against its successor
+						for (auto* form : { armor(kPairs[index - 1].helm, kPairs[index - 1].armory), armor(kPairs[index - 1].chest, kPairs[index - 1].armory) })
+							if (form) equip->UnequipObject(person, form, nullptr, 1, nullptr, false, true, false, true);
+					for (auto* form : { helm, chest }) {
+						person->AddObjectToContainer(form, nullptr, 1, nullptr);
+						equip->EquipObject(person, form, nullptr, 1, nullptr, false, false, false, true);
+					}
+					next(1);
+					return false;
+				}
+				// The biped slot that holds this item: one of its own addons there, its 3D attached and drawn.
+				const auto drawn = [&](RE::TESObjectARMO* a_armo, std::initializer_list<RE::BIPED_OBJECTS::BIPED_OBJECT> a_slots) {
+					const auto& biped = person->GetBiped(false);
+					return biped && std::ranges::any_of(a_slots, [&](RE::BIPED_OBJECTS::BIPED_OBJECT a_slot) {
+						const auto& o = biped->objects[a_slot];
+						return o.item == a_armo && o.addon && std::ranges::find(a_armo->armorAddons, o.addon) != a_armo->armorAddons.end() &&
+							o.partClone && !o.partClone->GetAppCulled();
+					});
+				};
+				const auto worn = [&](RE::BGSBipedObjectForm::BipedObjectSlot a_slot) {
+					auto* armo = person->GetWornArmor(a_slot);
+					return json{ { "form", armo ? std::format("{:08X}", armo->GetFormID()) : "none" },
+						{ "addons", armo ? armo->armorAddons.size() : 0 } };
+				};
+				if (stage == 1) {
+					json checks = { { "head_worn", person->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kHead) == helm ||
+						person->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kCirclet) == helm },   // a circlet look: slot 42
+						{ "body_worn", person->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kBody) == chest },
+						{ "helm_addons", !helm->armorAddons.empty() }, { "chest_addons", !chest->armorAddons.empty() },
+						{ "head_drawn", drawn(helm, { RE::BIPED_OBJECTS::kHead, RE::BIPED_OBJECTS::kHair, RE::BIPED_OBJECTS::kCirclet }) },
+						{ "body_drawn", drawn(chest, { RE::BIPED_OBJECTS::kBody }) } };
+					if (std::string_view(pair.capture) == "npc_armory_circlet") {   // its face and hair under the circlet (headless once)
+						auto* face = person->GetFaceNodeSkinned();
+						checks["face_shown"] = face && !face->GetAppCulled();
+					}
+					const bool all = std::ranges::all_of(checks, [](const json& v) { return v == true; });
+					if (!all && since < 8.0) return false;   // the equip and its 3D land over a few frames
+					g_ctx["pairs"].push_back({ { "capture", pair.capture }, { "helm", pair.helm }, { "chest", pair.chest }, { "checks", checks },
+						{ "head", worn(RE::BGSBipedObjectForm::BipedObjectSlot::kHead) }, { "body", worn(RE::BGSBipedObjectForm::BipedObjectSlot::kBody) },
+						{ "pass", all } });
+					UiPass::RequestCapture(pair.capture);
+					next(2);
+					return false;
+				}
+				// stage 2: held until its capture is taken, then the next pair
+				const bool captured = UiPass::TakeCapture(pair.capture).done;
+				if (!captured && since < 5.0) return false;
+				auto& row = g_ctx["pairs"][index];
+				row["captured"] = captured;
+				row["pass"] = row["pass"].get<bool>() && captured;
+				g_ctx["pair"] = index + 1;
+				next(0);
+				return false;
+			} });
+
+			g_steps.push_back({ "wow_talent_shrine", 90, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* gold = RE::TESForm::LookupByID<RE::TESBoundObject>(0xF);
+				const auto hold = [&](int a_septims) {   // exactly this many septims
+					const int delta = a_septims - player->GetGoldAmount();
+					if (delta > 0) player->AddObjectToContainer(gold, nullptr, delta, nullptr);
+					else if (delta < 0) player->RemoveItem(gold, -delta, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+				};
+				const auto point = [] {   // one Improved Wrath rank as a fixture, the wipe price kept
+					auto fixture = Progression::SnapshotForTesting();
+					fixture["talents"] = {{"762", 1}};
+					Progression::RestoreForTesting(fixture);
+				};
+				if (t == 0.0) {
+					auto* base = RE::TESForm::LookupByID<RE::TESBoundObject>(0x000D987F);   // ShrineOfKynareth, Skyrim.esm
+					auto* shrine = base && gold ? PlaceAhead(base, 150.0f) : nullptr;
+					if (!shrine) { r = {{"pass", false}, {"error", "could not place a Shrine of Kynareth"}}; return true; }
+					Cast::Stop();
+					Cast::FormForTesting(0, {});   // the player prays as the player
+					const int level = player->GetLevel(), septims = player->GetGoldAmount();
+					const auto saved = Progression::SnapshotForTesting();
+					const auto id = shrine->GetFormID();
+					g_ctx = {{"stage", 0}, {"round", 0}, {"level", std::max(level, 10)}, {"shrine", id}, {"rounds", json::array()}};
+					g_restoreShrine = [level, septims, saved, id] {
+						auto* player = RE::PlayerCharacter::GetSingleton();
+						WowUi::Eval("(function() StaticPopup_Hide('CONFIRM_TALENT_WIPE') if __wbShrineFrame then __wbShrineFrame:UnregisterAllEvents() end "
+							"__wbShrineFrame=nil __wbShrineError=nil return 1 end)()");
+						Progression::RestoreForTesting(saved);   // their allocation, book and wipe price
+						auto* gold = RE::TESForm::LookupByID<RE::TESBoundObject>(0xF);
+						const int delta = septims - player->GetGoldAmount();
+						if (gold && delta > 0) player->AddObjectToContainer(gold, nullptr, delta, nullptr);
+						if (gold && delta < 0) player->RemoveItem(gold, -delta, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+						if (player->GetLevel() != level) Console::Execute(std::format("player.setlevel {}", level));
+						auto* shrine = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+						if (shrine) shrine->Disable();   // the plugin's offer closes with it
+						const bool book = Progression::SnapshotForTesting() == saved, money = player->GetGoldAmount() == septims,
+								   levelled = player->GetLevel() == level, gone = !shrine || shrine->IsDisabled();
+						return json{{"progression", book}, {"septims", money}, {"level", levelled}, {"shrine_disabled", gone},
+							{"ready", book && money && levelled && gone}};
+					};
+					if (level < 10) Console::Execute("player.setlevel 10");   // a talent point to spend
+					hold(100);
+					WowUi::Eval("(function() __wbShrineError=nil if not __wbShrineFrame then __wbShrineFrame=CreateFrame('Frame') "
+						"__wbShrineFrame:RegisterEvent('UI_ERROR_MESSAGE') __wbShrineFrame:SetScript('OnEvent',function() __wbShrineError=arg1 end) end return 1 end)()");
+					auto fixture = saved;   // never wiped before
+					fixture["talents"] = {{"762", 1}};
+					fixture["reset_cost"] = 0;
+					fixture["reset_day"] = 0.0;
+					Progression::RestoreForTesting(fixture);
+					return false;
+				}
+				auto* shrine = RE::TESForm::LookupByID<RE::TESObjectREFR>(g_ctx["shrine"].get<RE::FormID>());
+				if (!shrine) { r = {{"pass", false}, {"error", "the shrine is gone"}}; return true; }
+				const int level = g_ctx["level"].get<int>(), round = g_ctx["round"].get<int>(), stage = g_ctx["stage"].get<int>();
+				const int price = round == 0 ? 1 : round == 1 ? 5 : 10;
+				const auto points = [] { return WowUi::Eval("UnitCharacterPoints('player')"); };
+				const auto spent = [] { return WowUi::Eval("(function() return __WB.talents and __WB.talents.points_spent or -1 end)()"); };
+				const auto pray = [&] {   // the crosshair's own activation, as E or a right click
+					auto* pick = RE::CrosshairPickData::GetSingleton();
+					const auto old = pick->target, actor = pick->targetActor;
+					pick->target = shrine->CreateRefHandle(); pick->targetActor = {}; player->ActivatePickRef();
+					pick->target = old; pick->targetActor = actor;
+					g_ctx["septims_before"] = player->GetGoldAmount();
+					g_ctx["stage"] = 1;
+				};
+				const json one = {{"762", 1}};
+				if (stage == 0) {   // their point spent, as the service and the interface have it
+					r["gate"] = "shrine 3D and one spent point";
+					if (!shrine->Is3DLoaded() || !Progression::Ready() || Character::Caster()["talents"] != one || spent() != "1" ||
+						points() != std::to_string(level - 10)) return false;
+					g_ctx["points_before"] = points();
+					pray();
+					return false;
+				}
+				if (stage == 1) {   // the client's popup at this wipe's price while the player stands at the shrine
+					r["gate"] = "CONFIRM_TALENT_WIPE popup";
+					const auto popup = WowUi::Eval("(function() local d=StaticPopup_FindVisible('CONFIRM_TALENT_WIPE') if not d then return '' end "
+						"local n=d:GetName() return (getglobal(n..'MoneyFrame').staticMoney or -1)..'|'..(getglobal(n..'MoneyFrameGoldButton'):GetText() or '')"
+						"..'|'..(getglobal(n..'Text'):GetText()==CONFIRM_TALENT_WIPE and 1 or 0)..'|'..(CheckTalentMasterDist() or 0) end)()");
+					if (popup.empty()) return false;
+					g_ctx["popup"] = popup;   // copper | gold shown | the client's text | master distance
+					if (round == 2) {   // the player walks away: moved out of their reach, the shrine no longer answers
+						auto away = shrine->GetPosition() - player->GetPosition();
+						away.z = 0;
+						away.Unitize();
+						shrine->SetPosition(shrine->GetPosition() + away * 1500.0f);
+						g_ctx["stage"] = 4;
+						return false;
+					}
+					const bool broke = round == 1 && !g_ctx.contains("refused");
+					if (broke) hold(price - 1);
+					g_ctx["accepted"] = WowUi::Eval("(function() __wbShrineError=nil local d=StaticPopup_FindVisible('CONFIRM_TALENT_WIPE') "
+						"getglobal(d:GetName()..'Button1'):Click('LeftButton') return d:IsVisible() and 0 or 1 end)()");
+					if (broke) g_ctx["refused"] = {{"popup", popup}, {"accept_hid", g_ctx["accepted"]}, {"at", t}};
+					g_ctx["stage"] = broke ? 3 : 2;
+					return false;
+				}
+				if (stage == 3) {   // the player cannot pay: the client's error, nothing taken or unlearned
+					r["gate"] = "ERR_NOT_ENOUGH_MONEY";
+					const auto error = WowUi::Eval("(function() return __wbShrineError==ERR_NOT_ENOUGH_MONEY and 1 or 0 end)()");
+					if (error != "1" && t - g_ctx["refused"]["at"].get<double>() < 5) return false;
+					g_ctx["refused"]["error"] = error == "1";
+					g_ctx["refused"]["septims_kept"] = player->GetGoldAmount() == price - 1;
+					g_ctx["refused"]["talents_kept"] = Character::Caster()["talents"] == one;
+					hold(100);
+					pray();   // and again with the septims
+					return false;
+				}
+				if (stage == 4) {   // out of reach: the master distance fails and the popup hides itself, nothing paid
+					r["gate"] = "popup hidden out of reach";
+					if (WowUi::Eval("(function() return not StaticPopup_FindVisible('CONFIRM_TALENT_WIPE') and not CheckTalentMasterDist() and 1 or 0 end)()") != "1") {
+						return false;
+					}
+					r["walked_away"] = {{"popup", g_ctx["popup"]}, {"hidden", true}, {"talents_kept", Character::Caster()["talents"] == one},
+						{"septims_kept", player->GetGoldAmount() == g_ctx["septims_before"].get<int>()}};
+					r["rounds"] = g_ctx["rounds"];
+					r["refused"] = g_ctx["refused"];
+					r["level"] = level;
+					const auto paid = [&](const json& a_round, int a_cost) {
+						return a_round["popup"] == std::format("{}|{}|1|1", a_cost * 10000, a_cost) && a_round["accept_hid"] == "1" &&
+							a_round["septims_taken"] == a_cost && a_round["points_before"] == std::to_string(level - 10) &&
+							a_round["points_after"] == std::to_string(level - 9) && a_round["spent_after"] == "0" &&
+							a_round["saved_cost"] == a_cost && a_round["master_dist_after"] == "1";
+					};
+					const auto& refused = r["refused"];
+					r["pass"] = paid(r["rounds"][0], 1) && paid(r["rounds"][1], 5) && refused.value("popup", "") == "50000|5|1|1" &&
+						refused.value("error", false) && refused.value("septims_kept", false) && refused.value("talents_kept", false) &&
+						r["walked_away"]["popup"] == "100000|10|1|1" && r["walked_away"]["talents_kept"] == true &&
+						r["walked_away"]["septims_kept"] == true;
+					return true;
+				}
+				// stage 2: paid, every point back and the talent frame told
+				r["gate"] = "talents refunded and septims taken";
+				if (!Character::Caster()["talents"].empty() || !Progression::Ready() || spent() != "0" || points() != std::to_string(level - 9)) {
+					return false;
+				}
+				g_ctx["rounds"].push_back({{"popup", g_ctx["popup"]}, {"accept_hid", g_ctx["accepted"]},
+					{"septims_taken", g_ctx["septims_before"].get<int>() - player->GetGoldAmount()},
+					{"points_before", g_ctx["points_before"]}, {"points_after", points()}, {"spent_after", spent()},
+					{"saved_cost", Progression::SnapshotForTesting().value("reset_cost", -1)},
+					{"master_dist_after", WowUi::Eval("(function() return CheckTalentMasterDist() or 0 end)()")}});
+				point();
+				g_ctx["round"] = round + 1;
+				g_ctx["stage"] = 0;
+				return false;
 			} });
 			// The vanilla perk is observed through HasPerk, just as one taken in the skill menu is.
 			g_steps.push_back({ "wow_skyrim_perk_cost", 25, [](double t, json& r) {
@@ -12055,11 +20027,13 @@ end)())");
 			} });
 			DruidTalentTests();
 			TestingPanelTests();
+            PanelHelperTests();
 			IdolModelTests();
 			NativeCompassTests();
             EnemyCompassTest();
 			MountTests();
             if ((","+Config::Get().testOnly+",").find(",wow_flight_controller,")!=std::string::npos) FlightControllerTests();
+            if ((","+Config::Get().testOnly+",").find(",wow_flight_kinematic,")!=std::string::npos) FlightKinematicTest();
 			CompassLabelProbe();
 			FeralTalentTests();
 			WbTests();
@@ -12146,26 +20120,326 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                 return true;
             } });
 
+            g_steps.push_back({ "wow_npc_scan_cost", 55, [](double t,json& r) {
+                if (!g_ctx.contains("started")) {
+                    if (t<6) return false; // allow the preceding fixture's actor cleanup to settle
+                    g_ctx["started"]=t;
+                    g_ctx["accepted"]=Console::Command("npcscan");
+                    if (g_ctx["accepted"].get<bool>()) TeleportStarted();
+                    g_ctx["travel"]=Console::Snapshot().value("travel",json::object());
+                    if (!g_ctx["accepted"].get<bool>()) {
+                        r["console"]=Console::Snapshot(); r["pass"]=false; return true;
+                    }
+                    return false;
+                }
+                if (g_ctx.contains("home")) {
+                    if (t-g_ctx["home"].get<double>()<8 || !RE::PlayerCharacter::GetSingleton()->Is3DLoaded()) return false;
+                    r=g_ctx["result"]; return true;
+                }
+                if (!g_ctx.contains("result")) {
+                    if (t-g_ctx["started"].get<double>()<18 || t<g_ctx.value("next_status",0.0)) return false;
+                    g_ctx["next_status"]=t+0.5;
+                    Console::Command("npcscan","status");
+                    const auto scan=Console::Snapshot().value("scan_cost",json::object());
+                    if (!scan.value("done",false)) return false;
+                    g_ctx["result"]=scan;
+                    if (!CaptureWhenLanded("wow_npc_scan_cost", t)) return false;
+                    return false;
+                }
+                const auto capture=UiPass::TakeCapture("wow_npc_scan_cost");
+                if (!capture.done) return false;
+                g_ctx["result"]["capture"]={capture.width,capture.height};
+                Travel("riverwood"); g_ctx["home"]=t;
+                return false;
+            } });
+
+			// Armory "Use:" effects: Diamond Flask (+75 Strength, item cooldown) and The Burrower's Shell (a damage absorb) used from
+			// their trinket slots; each starts its cooldown and its aura, a second use while cooling down is refused with the client's
+			// ERR_ITEM_COOLDOWN, and the Shell absorbs native damage.
+			g_steps.push_back({ "wow_trinket_use", 40, [](double t, json& r) {
+				auto finish = [&](const char* error) {
+					r = { { "pass", error == nullptr }, { "states", g_ctx.value("states", json::object()) }, { "captures", json::array({ "wow_trinket_use" }) } };
+					if (error) r["error"] = error;
+					return true;
+				};
+				auto state = [](int slot) {
+					return WowUi::Eval(std::format("(function() local s,d,e=GetInventoryItemCooldown('player',{}) local n=0 "
+						"for i=1,32 do if UnitBuff('player',i) then n=n+1 end end return (s or 0)..'|'..(d or 0)..'|'..(e or 0)..'|'..n..'|'..(GetInventoryItemLink('player',{}) or 'none') end)()", slot, slot));
+				};
+				if (t == 0) { Console::Command("usetrinkets", "", ""); g_ctx["stage"] = 0; g_ctx["at"] = t; g_ctx["states"] = json::object(); return false; }
+				const double since = t - g_ctx["at"].get<double>();
+				const int stage = g_ctx["stage"];
+				auto advance = [&](int n) { g_ctx["stage"] = n; g_ctx["at"] = t; };
+				if (stage == 0) {
+					if (since < 3) return false;
+					g_ctx["states"]["before_13"] = state(13); g_ctx["states"]["before_14"] = state(14);
+					if (state(13).find("none") != std::string::npos || state(14).find("none") != std::string::npos) return finish("trinkets not equipped");
+					WowUi::Run("UseInventoryItem(13)"); advance(1); return false;
+				}
+				if (stage == 1) {
+					if (since < 2) return false;
+					WowUi::Run("UseInventoryItem(14)"); advance(2); return false;
+				}
+				if (stage == 2) {
+					if (since < 2) return false;
+					g_ctx["states"]["after_13"] = state(13); g_ctx["states"]["after_14"] = state(14);
+					g_ctx["states"]["error"] = WowUi::Eval("WBTestLastError or ''");
+					UiPass::RequestCapture("wow_trinket_use"); advance(3); return false;
+				}
+				if (stage == 3) {
+					if (!UiPass::TakeCapture("wow_trinket_use").done) return false;
+					ObserveCast();   // the UI_ERROR_MESSAGE probe, also in an --only run
+					WowUi::Run("UseInventoryItem(13)"); advance(4); return false;
+				}
+				auto* av = RE::PlayerCharacter::GetSingleton()->AsActorValueOwner();
+				if (stage == 4) {
+					if (since < 1.5) return false;
+					g_ctx["states"]["again_error"] = WowUi::Eval("WBTestLastError or ''");
+					g_ctx["states"]["cooldown_text"] = WowUi::Eval("ERR_ITEM_COOLDOWN or ''");
+					// Native damage through Actor::DoDamage meets the Shell's absorb before their health drops.
+					g_ctx["health_before"] = av->GetActorValue(RE::ActorValue::kHealth);
+					RE::PlayerCharacter::GetSingleton()->DoDamage(25.0f, nullptr, true);
+					advance(5); return false;
+				}
+				if (since < 0.5) return false;
+				g_ctx["states"]["health_lost"] = g_ctx["health_before"].get<float>() - av->GetActorValue(RE::ActorValue::kHealth);
+				auto field = [](const std::string& s, int n) { std::size_t a = 0; for (int i = 0; i < n; ++i) a = s.find('|', a) + 1; return std::atof(s.c_str() + a); };
+				const auto& st = g_ctx["states"];
+				const std::string a13 = st["after_13"], a14 = st["after_14"], b13 = st["before_13"];
+				if (field(a13, 1) <= 0 || field(a14, 1) <= 0) return finish("a used trinket did not start its cooldown");
+				if (field(a13, 3) <= field(b13, 3)) return finish("no new aura after the uses");
+				if (st["again_error"].get<std::string>().empty() || st["again_error"] != st["cooldown_text"])
+					return finish("a second use while cooling down was not refused with ERR_ITEM_COOLDOWN");
+				if (st["health_lost"].get<float>() > 1) return finish("the Shell's absorb did not intercept native damage");
+				return finish(nullptr);
+			} });
+			// Diagnostic for the minimap's city ground: inside each walled city, which LAND the loaded cells actually carry
+			// (the city worldspace's own records, or none so the parent's terrain shows) and their exterior grid.
+			g_steps.push_back({ "wow_city_ground_probe", 120, [](double t, json& r) {
+				static constexpr const char* kCities[] = { "whiterun", "solitude", "windhelm", "riften" };
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				const auto i = g_ctx.value("i", std::size_t{ 0 });
+				if (i >= std::size(kCities)) { r = { { "pass", true }, { "cities", g_ctx.value("cities", json::array()) } }; return true; }
+				if (!g_ctx.contains("at")) { Travel(kCities[i]); g_ctx["at"] = t; return false; }
+				if (t - g_ctx["at"].get<double>() < 8 || !player->Is3DLoaded()) return false;
+				json cells = json::array();
+				auto* tes = RE::TES::GetSingleton();
+				if (tes && tes->gridCells) {
+					const auto n = tes->gridCells->length;
+					for (std::uint32_t x = 0; x < n; ++x)
+						for (std::uint32_t y = 0; y < n; ++y) {
+							auto* cell = tes->gridCells->GetCell(x, y);
+							if (!cell || cell->IsInteriorCell()) continue;
+							const auto* xy = cell->GetCoordinates();
+							auto* land = cell->GetRuntimeData().cellLand;
+							auto* file = land ? land->GetFile(0) : nullptr;
+							auto* owner = cell->GetRuntimeData().worldSpace;
+							cells.push_back({ { "cell", std::format("{:08X}", cell->GetFormID()) }, { "xy", xy ? json{ xy->cellX, xy->cellY } : json() },
+								{ "world", owner ? owner->GetFormEditorID() : "" }, { "land", land ? std::format("{:08X}", land->GetFormID()) : "" },
+								{ "land_file", file ? file->GetFilename() : "" }, { "land_loaded", land && land->loadedData != nullptr } });
+						}
+				}
+				auto* world = player->GetWorldspace();
+				g_ctx["cities"].push_back({ { "city", kCities[i] }, { "world", world ? world->GetFormEditorID() : "" }, { "cells", cells } });
+				g_ctx["i"] = i + 1; g_ctx.erase("at"); return false;
+			} });
+			// A nearby townsperson answers their /wave with a glance and a native idle; a second wave within the cooldown is
+			// skipped, and nobody fights or reports a crime.
+			g_steps.push_back({ "wow_npc_reactions", 40, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto finish = [&](const char* error) {
+					if (g_ctx.contains("spawned"))   // a guard this step placed (nobody stood near): disabled, never deleted
+						if (auto* spawned = RE::TESForm::LookupByID<RE::Actor>(g_ctx["spawned"].get<RE::FormID>())) spawned->Disable();
+					r = { { "pass", error == nullptr }, { "first", g_ctx.value("first", json()) }, { "second", g_ctx.value("second", json()) },
+						{ "spawned", g_ctx.contains("spawned") }, { "picked", g_ctx.value("picked", json()) }, { "captures", json::array({ "wow_npc_reactions" }) } };
+					if (error) r["error"] = error;
+					return true;
+				};
+				auto bounty = [&] { int total = 0; for (const auto& [faction, gold] : player->GetCrimeValue().crimeGoldMap) total += gold.violentCur + gold.nonViolentCur; return total; };
+				if (!g_ctx.contains("npc")) {
+					if (t < 1) return false;   // the previous step's actors finish disabling (a guard it placed is no townsperson)
+					RE::Actor* best = nullptr; float bestDistance = 550.f;   // inside Reactions' 600 units, targeted or not
+					if (auto* lists = RE::ProcessLists::GetSingleton())
+						for (const auto& handle : lists->highActorHandles) {
+							const auto actor = handle.get();
+							if (!actor || actor->IsDisabled() || !actor->Is3DLoaded() || actor->IsDead() || actor->IsInCombat() ||
+								actor->IsHostileToActor(player) || actor->IsPlayerTeammate() ||
+								!actor->HasKeywordString("ActorTypeNPC") || actor->AsActorState()->GetSitSleepState() != RE::SIT_SLEEP_STATE::kNormal) continue;
+							const float d = actor->GetPosition().GetDistance(player->GetPosition());
+							if (d < bestDistance) { bestDistance = d; best = actor.get(); }
+						}
+					if (!best) {   // nobody about (night, an empty street): a guard placed ahead answers instead
+						best = SpawnAhead(RE::TESForm::LookupByID<RE::TESNPC>(0xAA8FC), 300.f);   // EncGuardImperialM05MaleGuard
+						if (!best) return finish("no standing townsperson within 550 units and no guard to place");
+						g_ctx["spawned"] = best->GetFormID();
+					}
+					g_ctx["npc"] = best->GetFormID(); g_ctx["bounty"] = bounty();
+					g_ctx["picked"] = { { "id", std::format("{:08X}", best->GetFormID()) }, { "name", best->GetDisplayFullName() },
+						{ "distance", best->GetPosition().GetDistance(player->GetPosition()) }, { "process", best->GetActorRuntimeData().currentProcess != nullptr },
+						{ "high", best->GetActorRuntimeData().currentProcess && best->GetActorRuntimeData().currentProcess->high != nullptr } };
+					g_ctx["stage"] = -1; g_ctx["at"] = t; return false;
+				}
+				if (g_ctx["stage"] == -1) {   // their target set and the wave made once the person is loaded and standing
+					auto* person = RE::TESForm::LookupByID<RE::Actor>(g_ctx["npc"].get<RE::FormID>());
+					if ((!person || !person->Is3DLoaded()) && t - g_ctx["at"].get<double>() < 8) return false;
+					if (t - g_ctx["at"].get<double>() < (g_ctx.contains("spawned") ? 3.0 : 0.1)) return false;
+					Bridge::SetTarget(person); WowUi::Run("DoEmote('WAVE')");
+					g_ctx["stage"] = 0; g_ctx["at"] = t; return false;
+				}
+				const double since = t - g_ctx["at"].get<double>();
+				auto* npc = RE::TESForm::LookupByID<RE::Actor>(g_ctx["npc"].get<RE::FormID>());
+				if (g_ctx["stage"] == 0) {
+					if (since < 1.5) return false;
+					g_ctx["first"] = Reactions::Status();
+					UiPass::RequestCapture("wow_npc_reactions"); g_ctx["stage"] = 1; g_ctx["at"] = t; return false;
+				}
+				if (g_ctx["stage"] == 1) {
+					if (!UiPass::TakeCapture("wow_npc_reactions").done) return false;
+					g_ctx["stage"] = 2; g_ctx["at"] = t; return false;
+				}
+				if (g_ctx["stage"] == 2) {
+					if (since < 3.5) return false;   // past the 3 s global spacing, inside their 30 s
+					WowUi::Run("DoEmote('WAVE')"); g_ctx["stage"] = 3; g_ctx["at"] = t; return false;
+				}
+				if (since < 1) return false;
+				g_ctx["second"] = Reactions::Status();
+				const auto id = std::format("{:08X}", g_ctx["npc"].get<RE::FormID>());
+				const auto& first = g_ctx["first"]; const auto& second = g_ctx["second"];
+				const bool answered = first.value("reactions", 0) == 1 && first["reacted"][0].value("actor", RE::FormID{}) == g_ctx["npc"].get<RE::FormID>();
+				if (!answered) return finish("the targeted townsperson did not react");
+				if (second.value("reactions", 0) != 0 || second["skipped"].value(id, std::string()) != "cooling down") return finish("second wave was not held by the cooldown");
+				if (!npc || npc->IsInCombat() || npc->IsHostileToActor(player) || bounty() != g_ctx["bounty"].get<int>()) return finish("the reaction caused hostility or a crime");
+				return finish(nullptr);
+			} });
+			// Standing Stones reach the service: the Lord Stone's ability (+25 magic resistance, +50 armor) raises their
+			// converted Arcane resistance in the service's native_defenses report, then comes off again.
+			g_steps.push_back({ "wow_native_defenses", 40, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* lord = RE::TESForm::LookupByID<RE::SpellItem>(0xE5F58);   // doomLordAbility
+				auto finish = [&](const char* error) {
+					if (lord) player->RemoveSpell(lord);
+					r = { { "pass", error == nullptr }, { "resist_magic", g_ctx.value("resist_magic", json()) }, { "arcane_percent", g_ctx.value("arcane_percent", json()) } };
+					if (error) r["error"] = error;
+					return true;
+				};
+				auto request = [&](const char* key) {
+					auto caster = Character::Caster(); Forms::Augment(caster);
+					json target = { { "level", player->GetLevel() } }; Cast::AugmentTarget(target, player);
+					Service::Request({ { "op", "native_defenses" }, { "caster", caster }, { "target", target } },
+						[key = std::string(key), index = g_index](const json& out) { if (index == g_index) g_ctx[key] = out; });
+				};
+				auto arcane = [](const json& reply) { return reply.value("ok", false) ? reply.at("player").at("resist_percent").value("6", 0.0) : -1.0; };
+				auto resistMagic = [](const json& reply) { return reply.value("ok", false) ? reply.at("player").at("actor_values").at("live").value("44", 0.0) : -1.0; };
+				if (t == 0) {
+					if (!lord) return finish("doomLordAbility missing");
+					Bridge::SetTarget(player); request("base"); g_ctx["stage"] = 0; g_ctx["at"] = t; return false;
+				}
+				const int stage = g_ctx["stage"];
+				if (t - g_ctx["at"].get<double>() > 15) return finish("no service reply");
+				if (stage == 0) {
+					if (!g_ctx.contains("base")) return false;
+					if (!g_ctx["base"].value("ok", false)) return finish("native_defenses refused");
+					player->AddSpell(lord); g_ctx["stage"] = 1; g_ctx["at"] = t; return false;
+				}
+				if (stage == 1) {
+					if (t - g_ctx["at"].get<double>() < 1) return false;   // the ability's effects apply
+					request("lord"); g_ctx["stage"] = 2; g_ctx["at"] = t; return false;
+				}
+				if (!g_ctx.contains("lord")) return false;
+				const auto& base = g_ctx["base"]; const auto& withLord = g_ctx["lord"];
+				g_ctx["resist_magic"] = { resistMagic(base), resistMagic(withLord) };
+				g_ctx["arcane_percent"] = { arcane(base), arcane(withLord) };
+				if (resistMagic(withLord) < resistMagic(base) + 24) return finish("ResistMagic did not rise by the Lord Stone's 25");
+				if (arcane(withLord) <= arcane(base)) return finish("converted Arcane resistance did not rise");
+				return finish(nullptr);
+			} });
+			// Native compass rows drawn as 1.12 art at their real positions (wbMinimapNativeArt 0) at Whiterun's marker,
+			// then the Skyrim-glyph rim again (1, today's default); the capture is the evidence for the user's choice.
+			g_steps.push_back({ "wow_minimap_native_art", 60, [](double t, json& r) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto finish = [&](const char* error) {
+					WowUi::Run("SetCVar('wbMinimapNativeArt','1')");
+					r = { { "pass", error == nullptr }, { "captures", g_ctx.value("captures", json::array()) }, { "placed", g_ctx.value("placed", 0) },
+						{ "pois", g_ctx.value("pois", std::string()) } };
+					if (error) r["error"] = error;
+					return true;
+				};
+				if (t == 0) {
+					if (WowUi::Eval("GetCVar('wbMinimapNativeArt') or 'none'") == "none") return finish("wbMinimapNativeArt unavailable");
+					Travel("whiterun");
+					g_ctx["at"] = t; g_ctx["captures"] = json::array(); return false;
+				}
+				const double since = t - g_ctx["at"].get<double>();
+				if (!g_ctx.contains("set")) {
+					if (since < 8 || !player->Is3DLoaded()) return false;
+					WowUi::Run("SetCVar('wbMinimapNativeArt','0')"); g_ctx["set"] = true; return false;
+				}
+				if (!g_ctx.contains("shot")) {
+					if (since < 9.5) return false;
+					g_ctx["placed"] = std::atoi(WowUi::Eval("(function() local n=0 for _,p in ipairs(__WB.minimap and __WB.minimap.pois or {}) do "
+						"if p.placed then n=n+1 end end return n end)()").c_str());
+					g_ctx["pois"] = MinimapPoiEvidence();
+					if (!CaptureWhenLanded("wow_minimap_native_art", t)) return false;
+					g_ctx["shot"] = true; g_ctx["captures"].push_back("wow_minimap_native_art"); return false;
+				}
+				if (!UiPass::TakeCapture("wow_minimap_native_art").done) return false;
+				if (g_ctx.value("placed", 0) < 1) return finish("no native row matched a real position at Whiterun");
+				return finish(nullptr);
+			} });
+			// The 1.12 minimap ping: Minimap:PingLocation(x, y) fires MINIMAP_PING through the stock FrameXML, whose
+			// MiniMapPing model shows at the offset and fades out by itself within a few seconds.
+			g_steps.push_back({ "wow_minimap_ping", 40, [](double t, json& r) {
+				auto finish = [&](const char* error) {
+					r = { { "pass", error == nullptr }, { "captures", g_ctx.value("captures", json::array()) }, { "ping", g_ctx.value("ping", json::object()) } };
+					if (error) r["error"] = error;
+					return true;
+				};
+				if (t == 0) {
+					if (WowUi::Eval("Minimap and Minimap.PingLocation and MiniMapPing and 'yes' or 'no'") != "yes") return finish("minimap ping API unavailable");
+					WowUi::Run("__WBPing=nil local f=CreateFrame('Frame') f:RegisterEvent('MINIMAP_PING') "
+						"f:SetScript('OnEvent',function() __WBPing={unit=arg1,x=arg2,y=arg3} end) Minimap:PingLocation(20,20)");
+					g_ctx["at"] = t; g_ctx["captures"] = json::array(); return false;
+				}
+				const double since = t - g_ctx["at"].get<double>();
+				if (!g_ctx.contains("shot")) {
+					if (since < .5) return false;
+					const auto shown = WowUi::Eval("MiniMapPing:IsShown() and 'yes' or 'no'");
+					const auto event = WowUi::Eval("__WBPing and (__WBPing.unit..' '..__WBPing.x..' '..__WBPing.y) or 'none'");
+					g_ctx["ping"] = { { "shown", shown == "yes" }, { "event", event } };
+					if (shown != "yes" || event == "none") return finish("ping did not show");
+					UiPass::RequestCapture("wow_minimap_ping"); g_ctx["shot"] = true; g_ctx["captures"].push_back("wow_minimap_ping"); return false;
+				}
+				if (!g_ctx.contains("captured")) {   // a capture is handed over once
+					if (!UiPass::TakeCapture("wow_minimap_ping").done) return false;
+					g_ctx["captured"] = true;
+				}
+				if (since < 8) return false;
+				if (WowUi::Eval("MiniMapPing:IsShown() and 'yes' or 'no'") == "yes") return finish("ping did not expire");
+				return finish(nullptr);
+			} });
 			// The minimap across Skyrim (the user: "test the minimap in several areas to ensure accuracy"): each place's
 			// worldspace as the minimap resolves it (walled cities use Tamriel's terrain) and a capture to compare with
-			// the land around her. Last in the suite: it travels, and comes back to Riverwood.
+			// the land around the player. Last in the suite: it travels, and comes back to Riverwood.
 			g_steps.push_back({ "wow_minimap_tour", 260, [](double t, json& r) {
-				// Cells from Skyrim.esm/Dragonborn.esm (most town names are not cells coc knows): cow world x y.
-				struct Place { const char* name; const char* cow; const char* world; };
-				static constexpr Place kPlaces[] = { { "Whiterun", "WhiterunWorld 6 -2", "Tamriel" },
-					{ "Solitude", "SolitudeWorld -13 25", "Tamriel" }, { "Windhelm", "WindhelmWorld 33 9", "Tamriel" },
-					{ "Riften", "RiftenWorld 42 -24", "Tamriel" }, { "Markarth", "MarkarthWorld -43 1", "MarkarthWorld" },
-					{ "Dawnstar", "Tamriel 6 24", "Tamriel" }, { "RavenRock", "DLC2SolstheimWorld 7 8", "DLC2SolstheimWorld" },
-					{ "Blackreach", "Blackreach 0 0", "Blackreach" },
-					{ "MarkarthWest", "MarkarthWorld -49 1", "MarkarthWorld" },
-					{ "DeepwoodEdge", "DeepwoodRedoubtWorld -41 5", "DeepwoodRedoubtWorld" },
-					{ "SkuldafnEdge", "SkuldafnWorld -1 0", "SkuldafnWorld" } };
+				// Share the console/panel resolver. The last three intentional atlas-edge probes
+                // retain fixed grids to exercise missing-tile fallback, rather than city travel.
+				// tile: 1 = a Tamriel tile through the LOD-parent rule, -1 = none (a worldspace drawing its own LOD gets no foreign fill)
+				struct Place { const char* name; const char* cow; const char* world; const char* key; int tile = 0; };
+				static constexpr Place kPlaces[] = { { "Whiterun", "", "Tamriel", "whiterun" },
+					{ "Solitude", "", "Tamriel", "solitude" }, { "Windhelm", "", "Tamriel", "windhelm" },
+					{ "Riften", "", "Tamriel", "riften" }, { "Markarth", "", "MarkarthWorld", "markarth" },
+					{ "Dawnstar", "", "Tamriel", "dawnstar" }, { "RavenRock", "", "DLC2SolstheimWorld", "ravenrock" },
+					{ "Blackreach", "", "Blackreach", "blackreach" },
+					{ "WhiterunEdge", "WhiterunWorld 1 -2", "Tamriel", "", 1 },
+					{ "SolitudeEdge", "SolitudeWorld -20 25", "Tamriel", "", 1 },
+					{ "RiftenEdge", "RiftenWorld 36 -24", "Tamriel", "", 1 },
+					{ "MarkarthWest", "MarkarthWorld -49 1", "MarkarthWorld", "", -1 } };
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				const auto i = g_ctx.value("i", std::size_t{ 0 });
 				if (i >= std::size(kPlaces)) {
 					if (!g_ctx.contains("home")) {
 						Console::Execute("tgm");   // off again
-						Console::Execute("coc Riverwood");
+						Travel("riverwood");
 						g_ctx["home"] = t;
 						return false;
 					}
@@ -12176,7 +20450,7 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 					r["pass"] = std::ranges::all_of(r["places"], [](const json& x) { return x.value("pass", false); });
 					return true;
 				}
-				const auto& [place, cow, world] = kPlaces[i];
+				const auto& [place, cow, world, key, expectTile] = kPlaces[i];
 				if (!g_ctx.contains("at")) {
 					if (i == 0) {
 						if (t < 6.0) {
@@ -12184,7 +20458,15 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 						}
 						Console::Execute("tgm");   // a cell's centre may be in the air
 					}
-					Console::Execute(std::format("cow {}", cow));
+					if (*key) {
+                        g_ctx["travel_ok"]=Travel(key);
+                        g_ctx["travel"]=Console::Snapshot().value("travel",json::object());
+                    } else {
+                        Console::Print(std::format("Minimap atlas-edge diagnostic {}: fixed grid cow {}",place,cow));
+                        TravelCell(std::format("cow {}", cow));
+                        g_ctx["travel_ok"]=true;
+                        g_ctx["travel"]={{"source","atlas_edge_grid"}};
+                    }
 					g_ctx["at"] = t;
 					return false;
 				}
@@ -12193,7 +20475,7 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 					return false;
 				}
 				if (!g_ctx.contains("shot")) {
-					UiPass::RequestCapture(std::format("wow_minimap_{}", place));
+					if (!CaptureWhenLanded(std::format("wow_minimap_{}", place), t)) return false;
 					g_ctx["shot"] = true;
 					return false;
 				}
@@ -12206,13 +20488,22 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 				const auto seen = WowUi::Eval("__WB.minimap and __WB.minimap.worldspace or 'none'");
 				const auto tile = WowUi::Eval("__WB.minimapTile or 'none'");
 				const auto exists = WowUi::Eval("__WB.minimapTileExists and 'yes' or 'no'");
-				const bool fallback = i >= 8;
-				g_ctx["places"].push_back({ { "place", place }, { "worldspace", seen }, { "pos", { p.x, p.y } },
+                const auto& travel=g_ctx["travel"];
+                bool arrived=g_ctx.value("travel_ok",false);
+                if (travel.value("source","")=="live_reference") {
+                    const auto& at=travel["position"];
+                    const RE::NiPoint3 expected{at[0].get<float>(),at[1].get<float>(),at[2].get<float>()};
+                    auto* liveWorld=player->GetWorldspace();
+                    arrived &= liveWorld && liveWorld->GetFormID()==travel["world"].get<RE::FormID>() && p.GetDistance(expected)<4096;
+                }
+                const auto expectedWorld=travel.value("terrain_world",std::string(world));
+				g_ctx["places"].push_back({ { "place", place }, { "travel", travel }, { "arrived", arrived }, { "expected_worldspace", expectedWorld }, { "worldspace", seen }, { "pos", { p.x, p.y } },
 					{ "zone", WowUi::Eval("GetMinimapZoneText()") }, { "pois", MinimapPoiEvidence() },
 					{ "poi_count", WowUi::Eval("table.getn(__WB.minimap and __WB.minimap.pois or {})") },
 					{ "parents", WowUi::Eval("table.concat(__WB.minimap and __WB.minimap.parents or {}, ',')") },
 					{ "tile", tile }, { "tile_exists", exists == "yes" }, { "capture", { capture.width, capture.height } },
-					{ "pass", seen == world && exists == "yes" && (!fallback || tile.find("WB_tamriel_") != std::string::npos) } });
+					{ "pass", arrived && seen == expectedWorld && (expectTile < 0 ? exists == "no" :
+						exists == "yes" && (expectTile == 0 || tile.find("WB_tamriel_") != std::string::npos)) } });
 				g_ctx["i"] = i + 1;
 				g_ctx.erase("at");
 				g_ctx.erase("shot");
@@ -12235,8 +20526,8 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
             }
             const bool loaded = !g_ctx.value("baseline_ready",false) || g_loads.loads.load() != g_ctx["cleanup_loads"].get<std::uint64_t>();
             const bool restored = loaded && WowUi::Ready() && Progression::Ready() && WowUi::ProfileKey() == g_ctx["original_profile"].get<std::string>();
-            if (!restored && t-g_ctx["cleanup_at"].get<double>() < 15) return false;
-            r = g_ctx["profile_result"]; r["baseline_restored"] = restored;
+            if (!restored && t-g_ctx["cleanup_at"].get<double>() < 30) return false;
+            r = g_ctx["profile_result"]; r["baseline_restored"] = restored; r["restore_seconds"] = t-g_ctx["cleanup_at"].get<double>();
             r["pass"] = r.value("pass",false) && restored;
             if (!restored) {
                 r["evidence"] = g_ctx;
@@ -12245,22 +20536,73 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
             return true;
         }
 
+        bool FinishOnboarding(double t,json& r)
+        {
+            if (!g_ctx.contains("fixture")) return true;
+            if (!g_ctx.contains("cleanup_at")) {
+                g_ctx["finish_result"]=r; g_ctx["cleanup_at"]=t;
+                g_ctx["cleanup_loads"]=g_loads.loads.load();
+                WowUi::Eval("(function() if __WBCustomizeClose then __WBCustomizeClose() end if CharacterFrame then CharacterFrame:Hide() end return 1 end)()");
+                // The explicit disposable input owns the opening's position, disabled controls,
+                // pending setup, kit, native player base and unanswered appearance offer.
+                RE::BGSSaveLoadManager::GetSingleton()->Load(g_ctx["fixture"]["save"].get<std::string>().c_str());
+                return false;
+            }
+            auto* player=RE::PlayerCharacter::GetSingleton();
+            auto* ui=RE::UI::GetSingleton();
+            auto* controls=RE::ControlMap::GetSingleton();
+            const bool loaded=g_loads.loads.load()>g_ctx["cleanup_loads"].get<std::uint64_t>() && player && player->Is3DLoaded() && ui &&
+                !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+            // An inactive opening does not apply LOOK or the surrogate voice on its own.
+            // Restore the runtime snapshot too, including the shared NPC base's voice.
+            if (loaded && !g_ctx.contains("runtime_restored")) {
+                Character::OnGameLoaded();
+                g_ctx["runtime_restored"]=CustomizationLooks()==g_ctx["original_looks"] &&
+                    Character::CustomizationOffered()==g_ctx["original_offer"].get<bool>();
+                if (auto* base=player->GetActorBase()) {
+                    base->SetFlagBit(RE::ACTOR_BASE_DATA::Flag::kFemale,g_ctx["original_surrogate"]["female"].get<bool>(),true);
+                    base->voiceType=RE::TESForm::LookupByID<RE::BGSVoiceType>(g_ctx["original_surrogate"]["voice"].get<RE::FormID>());
+                }
+                WowUi::Run(g_ctx["character_open"].get<bool>() ? "if CharacterFrame then CharacterFrame:Show() end" : "if CharacterFrame then CharacterFrame:Hide() end");
+            }
+            bool kitRestored=loaded;
+            if (loaded) for (const auto& [key,old] : g_ctx["kit"].items()) {
+                auto* item=RE::TESForm::LookupByID<RE::TESBoundObject>(static_cast<RE::FormID>(std::stoul(key)));
+                kitRestored=kitRestored && item && player->GetItemCount(item)==old.get<int>();
+            }
+            const bool restored=loaded && kitRestored && g_ctx.value("runtime_restored",false) && controls &&
+                !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) && Integration::Active()==g_ctx["original_active"].get<bool>() &&
+                controls->IsMovementControlsEnabled()==g_ctx["original_movement"].get<bool>() &&
+                controls->IsFightingControlsEnabled()==g_ctx["original_fighting"].get<bool>() &&
+                CustomizationLooks()==g_ctx["original_looks"] && CustomizationSurrogate()==g_ctx["original_surrogate"] &&
+                Character::CustomizationOffered()==g_ctx["original_offer"].get<bool>();
+            if (!restored && t-g_ctx["cleanup_at"].get<double>()<15) return false;
+            r=g_ctx["finish_result"]; r["baseline_restored"]=restored;
+            r["pass"]=r.value("pass",false) && restored;
+            if (!restored) r["evidence"]=g_ctx;
+            Bridge::SetTarget(RE::TESForm::LookupByID<RE::Actor>(g_ctx["target"].get<RE::FormID>()));
+            Input::SetCursorMode(g_ctx["cursor"].get<bool>());
+            return true;
+        }
+
         bool FinishWorldBaseline(double t,json& r)
         {
             if (!g_ctx.contains("baseline")) return true;
+            if (g_ctx.contains("baseline_tries") && !g_ctx.value("baseline_ok",false)) { r["baseline_restored"]=false; r["pass"]=false; return true; }   // never saved: nothing to reload
             if (!g_ctx.contains("cleanup_at")) {
                 if (r.value("error",std::string{})=="timeout") r["evidence"]=g_ctx;
                 g_ctx["finish_result"]=r; g_ctx["cleanup_at"]=t;
                 g_ctx["cleanup_loads"]=g_loads.loads.load();
                 Taxi::Reset();
+                if (g_ctx.contains("saved_autoloot")) WowUi::Eval("SetCVar('autoLootDefault',"+LuaQuote(g_ctx["saved_autoloot"].get<std::string>())+")");
                 RE::UIMessageQueue::GetSingleton()->AddMessage(RE::DialogueMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kForceHide,nullptr);
                 RE::BGSSaveLoadManager::GetSingleton()->Load(g_ctx["baseline"].get<std::string>().c_str());
                 return false;
             }
             const bool restored=g_loads.loads.load()!=g_ctx["cleanup_loads"].get<std::uint64_t>() &&
                 WowUi::Ready() && WowUi::ProfileKey()==g_ctx["profile"].get<std::string>();
-            if (!restored && t-g_ctx["cleanup_at"].get<double>()<15) return false;
-            r=g_ctx["finish_result"]; r["baseline_restored"]=restored;
+            if (!restored && t-g_ctx["cleanup_at"].get<double>()<30) return false;   // a load with the Armory's items takes longer
+            r=g_ctx["finish_result"]; r["baseline_restored"]=restored; r["restore_seconds"]=t-g_ctx["cleanup_at"].get<double>();
             r["pass"]=r.value("pass",false) && restored;
             Input::SetCursorMode(g_ctx["cursor"].get<bool>());
             return true;
@@ -12269,7 +20611,7 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 		bool g_stepActive = false;
 
 		// One loop drives every step: a step's first poll sees t == 0 exactly (used for setup).
-		// [Test] only=: the setup (the world, her interface and body ready) and then just the steps named.
+		// [Test] only=: the setup (the world, their interface and body ready) and then just the steps named.
 		bool Skipped(std::size_t a_index)
 		{
 			const auto& only = Config::Get().testOnly;
@@ -12283,7 +20625,7 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 			return a_index > static_cast<std::size_t>(setup - g_steps.begin()) && ("," + only + ",").find(name) == std::string::npos;
 		}
 
-		// A step's fights stay its own: a villager the suite's spells or borrowed company turned on her (once Hod, mid-run)
+		// A step's fights stay its own: a villager the suite's spells or borrowed company turned on the player (once Hod, mid-run)
 		// is calmed before the next step starts. Only the game's own people (not the steps' spawned wolves), and through
 		// the console's commands (virtual Actor calls are not trusted on this runtime).
 		void CalmVillage()
@@ -12310,24 +20652,83 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 					continue;
 				}
 				auto& step = g_steps[g_index];
+				StepCheckpoint("start");
 				if (!g_stepActive) {
 					g_stepActive = true;
+					g_stepPolled = false;
 					g_stepStart = Frame::Now();
 					CalmVillage();
+					// The input state every step inherits: a suite failed five steps late in a 30-minute launch with the
+					// WoW cursor left on (October 16) while each passed alone; the next such run names the leaker.
+					logger::info("selftest: START {} cursor_mode {} cursor_active {} paused {} menus {}", step.name,
+						Input::CursorMode(), Input::Active(), RE::UI::GetSingleton()->GameIsPaused(), RE::UI::GetSingleton()->menuStack.size());
 				}
 				const double t = Frame::Now() - g_stepStart;
 				json r;
-				const bool talentAudit = step.name == "wow_talents_balance" || step.name == "wow_talents_restoration" ||
-					step.name == "wow_cold_persistence_seed" || step.name == "wow_ground_mounts" || step.name == "wow_testing_panel" || step.name == "wow_form_shortcuts" || step.name == "wow_form_resources" || step.name == "wow_action_feedback" || step.name == "wow_hibernate_feedback" || step.name == "wow_cast_records" || step.name == "wow_prowl_restore" || step.name == "wow_bear_rage_level" || step.name == "wow_travel_prowl_motion";
+				// The Paladin suites restore through FinishTaurenProbe (PaladinFixture begins with BeginTaurenProbe), not here.
+				const bool talentAudit = step.name == "wow_prowl_miss" || step.name == "wow_missile_target" || step.name == "wow_melee_retarget" || step.name == "wow_threat_control" || step.name == "wow_melee_release" || step.name == "wow_feral_release" || step.name == "wow_charge_release" || step.name == "wow_talents_balance" || step.name == "wow_talents_restoration" ||
+					step.name == "wow_cold_persistence_seed" || step.name == "wow_ground_mounts" || step.name == "wow_testing_panel" || step.name == "wow_form_shortcuts" || step.name == "wow_form_resources" || step.name == "wow_action_feedback" || step.name == "wow_hibernate_feedback" || step.name == "wow_soothe_animal" || step.name == "wow_prowl_detection" || step.name == "wow_cast_records" || step.name == "wow_prowl_restore" || step.name == "wow_bear_rage_level" || step.name == "wow_travel_prowl_motion" || step.name == "wow_rebirth_targeting";
+				// A probe step whose restore has begun (FinishTaurenProbe set tauren_restoring) stays done every frame so
+				// its finisher is polled to completion; its own poll would see the restored fixture and never finish
+				// again, and the budget would overwrite a passing result with "timeout" (every Paladin step, October 16).
+				const bool restoring = g_ctx.is_object() && g_ctx.value("tauren_restoring", false) && g_ctx.contains("tauren_before");
 				bool done = talentAudit && g_ctx.contains("finish_result") ? (r = g_ctx["finish_result"], true) :
-					t > step.timeout ? (r = { { "pass", false }, { "error", "timeout" } }, true) : step.poll(t, r);
+					restoring || (step.name.starts_with("wow_shadow_") && g_ctx.contains("shadow_returning")) ? true :
+					t - g_landingWait > step.timeout ? (r = { { "pass", false }, { "error", "timeout" } }, true) : PollWhenLanded(step, t, r);   // landing time is not the step's (the 1 s runtime step timed out behind the 1.5 s floor, October 17)
+				StepCheckpoint();  // carry a newly assigned g_ctx["stage"] into cleanup and the next poll
+                if (done && step.name.starts_with("wow_shadow_")) done = FinishShadows(t, r);
+                if (done && step.name=="wow_npc_scan_cost" && g_ctx.value("accepted",false)) {
+                    Console::Command("npcscan","cancel"); // also stop tracking override when timeout bypasses the poll
+                    if (t>step.timeout) r["evidence"]=g_ctx;
+                }
+                if (done && step.name=="wow_area_friendly_toggle" && g_ctx.contains("original")) {
+                    if (g_ctx.contains("progression")) Progression::RestoreForTesting(g_ctx["progression"]);
+                    Cast::ResetForTesting(); Bridge::SetTarget(nullptr);
+                    for (const char* key : {"person","wolf"}) if (auto* a=RE::TESForm::LookupByID<RE::Actor>(g_ctx.value(key,RE::FormID{}))) { a->StopCombat(); a->Disable(); }
+                    CalmVillage();
+                    auto& crimes=RE::PlayerCharacter::GetSingleton()->GetCrimeValue().crimeGoldMap;
+                    for (auto& [faction,gold] : crimes) { gold.violentCur=0; gold.nonViolentCur=0; }
+                    for (const auto& saved : g_ctx["crimes"]) for (auto& [faction,gold] : crimes) if (faction->GetFormID()==saved["id"]) {
+                        gold.violentCur=saved["violent"].get<decltype(gold.violentCur)>(); gold.nonViolentCur=saved["nonviolent"].get<decltype(gold.nonViolentCur)>();
+                    }
+                    // Eval runs now; Run lands a frame later, after this reads back.
+                    r["option_restored"]=WowUi::Eval(std::format("(function() SetCVar('wbAreaFriendly',{}) HideUIPanel(UIOptionsFrame) return GetCVar('wbAreaFriendly') end)()",
+                        LuaQuote(g_ctx["original"].get<std::string>())))==g_ctx["original"].get<std::string>();
+                    r["pass"]=r.value("pass",false) && r["option_restored"]==true;
+                    if (t>step.timeout) r["evidence"]=g_ctx;
+                }
+				if (done && step.name.starts_with("wow_paladin_") && step.name != "wow_paladin_identity") {
+					if (step.name == "wow_paladin_damage_pipeline") WowUi::Eval("(function() "
+						"if __wbPaladinDamageOriginal then __WBCombatEvent=__wbPaladinDamageOriginal end "
+						"if __wbPaladinDamageFrame then __wbPaladinDamageFrame:UnregisterAllEvents() end "
+						"__wbPaladinDamageOriginal=nil __wbPaladinDamageReports=nil __wbPaladinDamageFrame=nil __wbPaladinDamageChat=nil return 1 end)()");
+					if (g_restorePaladinTreasure) { g_restorePaladinTreasure(); g_restorePaladinTreasure = {}; }
+					if (step.name == "wow_paladin_mechanics") Carriers::ClearMechanicsForTesting(RE::PlayerCharacter::GetSingleton());
+					for (auto* actor : {static_cast<RE::Actor*>(RE::PlayerCharacter::GetSingleton()), PaladinActor("follower")}) if (actor) {
+						if (step.name == "wow_paladin_freedom") Carriers::Unroot(actor);   // the direct native root fixture, including early failure
+						if (auto* effects = actor->GetActiveEffectList()) for (auto* effect : *effects) if (effect && effect->spell && effect->spell->GetName() &&
+							std::string_view(effect->spell->GetName()) == "Paladin purge fixture") effect->Dispel(true);
+					}
+					if (g_restorePaladinEquipment) { g_restorePaladinEquipment(); g_restorePaladinEquipment = {}; }
+					done = FinishTaurenProbe(t, r);
+				}
+                if (done && (step.name=="wow_form_resources" || step.name=="wow_form_shortcuts")) Forms::HoldCastingRegenForTesting(false);
+                if (done && step.name=="wow_paladin_identity") {
+                    g_allowStartDialog=false; g_startDialogClass=11; g_startDialogRace=4;
+                    RE::UIMessageQueue::GetSingleton()->AddMessage(RE::MessageBoxMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kForceHide,nullptr);
+                }
+                if (done && step.name=="wow_race_models" && g_restoreRaceModels) { g_restoreRaceModels(); g_restoreRaceModels={}; }
+                if (done && (step.name=="wow_tauren_creation" || step.name=="wow_tauren_forms" || step.name=="wow_tauren_racials" || step.name=="wow_paladin_identity" || step.name=="wow_race_models" || step.name=="wow_scale_probe")) done=FinishTaurenProbe(t,r);   // wow_paladin_mount: the Paladin hook above
+                if (done && step.name==kOnboardingProbe) done=FinishOnboarding(t,r);
+                if (done && step.name=="wow_cast_wrath") WowUi::Run("if __wbWrathProbeFrame then __wbWrathProbeFrame:UnregisterAllEvents() end __wbWrathProbe=nil");
                 if (done && step.name=="wow_chat_scroll" && g_ctx.contains("cursor_mode")) {
                     WowUi::Run(std::format("ChatFrame1:SetTimeVisible({}) ChatFrame1:SetFadeDuration(3) ChatFrame1:ScrollToBottom() __wbChatScroll=nil",g_ctx["time_visible"].get<std::string>()));
                     Input::SetCursorMode(g_ctx["cursor_mode"].get<bool>());
                 }
-				// These probes own their spawned wolves. Leaving Moonfire's living
+				// These probes own their spawned wolves (npc_armory_look its person). Leaving Moonfire's living
 				// target ahead of the player can block a later ground spell's real LOS.
-				if (done && (step.name=="wow_cast_wrath" || step.name=="wow_cast_moonfire_dot" || step.name=="wow_book_starfire" || step.name=="wow_cast_hurricane")) {
+				if (done && (step.name=="wow_cast_wrath" || step.name=="wow_cast_moonfire_dot" || step.name=="wow_book_starfire" || step.name=="wow_cast_hurricane" ||
+					step.name=="npc_armory_look" || step.name=="wow_npc_shoulders" || step.name=="wow_npc_weapons" || step.name=="wow_npc_helms")) {
 					for (const auto* key : {"actor","a","b","outside"}) {
 						const auto id=g_ctx.value(key,RE::FormID{});
 						if (id<0xFF000000) continue; // never touch a shared placed actor
@@ -12337,19 +20738,64 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 						}
 					}
 				}
+				if (done && step.name=="wow_player_skyrim_weapons" && g_restorePlayerWeapons) {
+					if (t>step.timeout) r["evidence"]=g_ctx;
+					g_restorePlayerWeapons(); g_restorePlayerWeapons = {};
+				}
+				if (done && step.name=="wow_npc_helms" && g_ctx.contains("helms_enabled")) {
+					NpcHelms::SetEnabled(g_ctx["helms_enabled"].get<bool>());
+					if (t>step.timeout) r["evidence"]=g_ctx;
+				}
+				if (done && step.name=="wow_npc_weapons" && g_ctx.contains("weapons_enabled")) {
+					NpcWeapons::SetEnabled(g_ctx["weapons_enabled"].get<bool>());
+					if (t>step.timeout) r["evidence"]=g_ctx;
+				}
+				if (done && step.name=="wow_npc_shoulders" && g_ctx.contains("shoulders_enabled")) {
+					NpcShoulders::SetEnabled(g_ctx["shoulders_enabled"].get<bool>());
+					if (t>step.timeout) r["evidence"]=g_ctx;
+				}
 				if (done && step.name=="wow_compass_native" && g_ctx.contains("zoom")) {
 					WowUi::Run(std::format("Minimap:SetZoom({}); SetCVar('rotateMinimap',{})",g_ctx["zoom"].get<std::string>(),LuaQuote(g_ctx["rotate"].get<std::string>())));
 					if (t>step.timeout) r["evidence"]=g_ctx;
 				}
                 if (done && step.name=="wow_compass_enemy" && g_restoreCompassEnemy) { g_restoreCompassEnemy(); g_restoreCompassEnemy={}; if (t>step.timeout) r["evidence"]=g_ctx; }
 				if (done && step.name=="wow_idol_models" && g_restoreIdolModels) { g_restoreIdolModels(); g_restoreIdolModels={}; }
-				if (done && step.name=="wow_flight_controller" && g_restoreFlightController) {
+				// Every exit, including this loop's timeout that bypasses the poll: the runner's virtual Alt
+				// is released (and acknowledged) before the next step's input, and the bucket is let go.
+				if (done && step.name=="wow_alt_grab") {
+					if (g_ctx.contains("alt_down") && !g_ctx.contains("alt_up")) g_ctx["alt_up"] = Action("alt_up");
+					if (g_ctx.contains("alt_up") && Acked() < g_ctx["alt_up"].get<int>() && t < step.timeout + 5) done = false;
+					else {
+						if (auto* bucket = RE::TESForm::LookupByID<RE::TESObjectREFR>(g_ctx.value("ref", RE::FormID{})); bucket && !bucket->IsDisabled()) bucket->Disable();   // drops Bridge's hold
+						if (t > step.timeout) { Input::SetCursorMode(g_ctx.value("cursor0", false)); r["evidence"] = g_ctx; }
+					}
+				}
+				if (done && (step.name=="wow_flight_controller" || step.name=="wow_flight_kinematic") && g_restoreFlightController) {
                     r["restored"]=g_restoreFlightController(); g_restoreFlightController={};
                     r["pass"]=r.value("pass",false) && r["restored"]==true;
                     if (t>step.timeout) r["evidence"]=g_ctx;
                 }
                 if (done && step.name=="wow_ground_mounts" && g_restoreMounts) { g_restoreMounts(); g_restoreMounts={}; if (t>step.timeout) r["evidence"]=g_ctx; }
-				if (done && step.name=="wow_testing_panel" && g_restoreTestingPanel) { g_restoreTestingPanel(); g_restoreTestingPanel={}; }
+				if (done && step.name=="wow_panel_helpers" && g_restorePanelHelpers) {
+                    if (t>step.timeout) r["checks"]=g_ctx.value("checks",json::object());
+                    r["restored"]=g_restorePanelHelpers(); g_restorePanelHelpers={};
+                    r["pass"]=r.value("pass",false) && std::ranges::all_of(r["restored"],[](const json& v) { return v==true; });
+                }
+                if (done && step.name=="wow_testing_panel" && g_restoreTestingPanel) { g_restoreTestingPanel(); g_restoreTestingPanel={}; }
+				if (done && !g_pacified.empty()) {
+					for (auto& h : g_pacified) if (auto a = h.get()) a->EnableAI(true);
+					g_pacified.clear();
+				}
+				if (done && (step.name=="wow_book_learn" || step.name=="wow_mount_items" || step.name=="wow_armory") && g_restoreLearning) {
+					r["restored"]=g_restoreLearning(); g_restoreLearning={};
+					r["pass"]=r.value("pass",false) && std::ranges::all_of(r["restored"],[](const json& v) { return v==true; });
+					if (t>step.timeout) r["evidence"]=g_ctx;
+				}
+				if (done && step.name=="wow_talent_shrine" && g_restoreShrine) {
+					r["restored"]=g_restoreShrine(); g_restoreShrine={};
+					r["pass"]=r.value("pass",false) && r["restored"]["ready"]==true;
+					if (t>step.timeout) r["evidence"]=g_ctx;
+				}
 				if (done && step.name=="wow_ui_profiles_relog") done = FinishUiProfiles(t,r);
 				if (done && step.name == "wow_gear_feedback") {
 					if (g_restoreGearFeedback) { g_restoreGearFeedback(); g_restoreGearFeedback={}; }
@@ -12384,13 +20830,26 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                     if (t-g_ctx["quiesced_at"].get<double>()<3) done=false;
                 }
                 if (done && (step.name=="wow_container_edges" || step.name=="wow_container_variants" || step.name=="wow_container_quest") && g_ctx.contains("auto")) WowUi::Eval(std::format("(function() ClearCursor() CloseLoot() SetCVar('autoLootDefault',{}) return 1 end)()",LuaQuote(g_ctx["auto"].get<std::string>())));
-                if (done && (step.name=="wow_taxi_dialogue" || step.name=="wow_equipment_full" || step.name=="wow_equipment_variants" || step.name=="wow_equipment_hands" || step.name=="wow_attack_relog" || step.name=="wow_container_edges" || step.name=="wow_container_variants" || step.name=="wb_sex_relog" || step.name=="wow_gear_feedback" || step.name=="wow_spell_numbers" || step.name=="wow_start_dialog" || step.name=="wow_container_quest")) done = FinishWorldBaseline(t,r);
+                if (done && (step.name=="wow_dragon_death_loot" || step.name=="wow_dragon_combat")) WowUi::Run("if __wbDragonLootFrame then __wbDragonLootFrame:UnregisterAllEvents() end __wbDragonLootFrame=nil __wbDragonLoot=nil");
+                if (done && (step.name=="wow_dragon_death_loot" || step.name=="wow_dragon_combat" || step.name=="wow_dragon_projectile" || step.name=="wow_swipe_targets" || step.name=="wow_courier_delivery" || step.name=="wow_taxi_dialogue" || step.name=="wow_equipment_full" || step.name=="wow_equipment_variants" || step.name=="wow_equipment_hands" || step.name=="wow_attack_relog" || step.name=="wow_container_edges" || step.name=="wow_container_variants" || step.name=="wb_sex_relog" || step.name=="wow_gear_feedback" || step.name=="wow_spell_numbers" || step.name=="wow_start_dialog" || step.name=="wow_container_quest")) done = FinishWorldBaseline(t,r);
                 if (done && step.name=="wb_sex_relog") {
                     const bool sex=Character::Get().looks.sex==g_ctx["original_sex"].get<int>() && RE::PlayerCharacter::GetSingleton()->GetActorBase()->IsFemale()==g_ctx["original_female"].get<bool>();
                     r["baseline_sex_restored"]=sex; r["pass"]=r.value("pass",false) && sex;
                 }
                 if (done && step.name=="wow_hibernate_feedback") WowUi::Eval("(function() if __WBHibernateFrame then __WBHibernateFrame:UnregisterAllEvents() __WBHibernateFrame:SetScript('OnUpdate',nil) end __WBHibernateFrame=nil __WBHibernateTest=nil return 1 end)()");
                 if (done && step.name=="wow_action_feedback") WowUi::Eval("(function() if __WBFeedbackFrame then __WBFeedbackFrame:UnregisterAllEvents() end __WBFeedbackFrame=nil __WBFeedbackTest=nil return 1 end)()");
+				if (done && step.name == "wow_cc_native_damage" && g_ctx.contains("wolves")) {   // its wolves, also after a timeout
+					for (const auto& [key, id] : g_ctx["wolves"].items()) {
+						if (auto* a = RE::TESForm::LookupByID<RE::Actor>(id.get<RE::FormID>()); a && !a->IsDisabled()) {
+							if (Bridge::Target() == a) Bridge::SetTarget(nullptr);
+							a->StopCombat(); a->Disable();
+						}
+					}
+				}
+				if (done && step.name == "wow_threat_control") {   // its test effects and root on the player, also after a timeout
+					Carriers::ClearNativeForTesting(RE::PlayerCharacter::GetSingleton());
+					Carriers::Unroot(RE::PlayerCharacter::GetSingleton());
+				}
 				if (done && talentAudit && g_ctx.contains("saved")) done = FinishDruidTalentTest(t, r);
 				if (t > step.timeout && step.name == "wow_level_choice" && g_levelChoiceSaved) {
 					r["evidence"] = g_ctx;
@@ -12421,16 +20880,25 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 						WowUi::Eval("(function() __wbFeralSavedActions=nil return 1 end)()");
 					}
 				}
+				if (r.value("baseline_restored", true) == false || r.value("restoration_pending", false) ||
+					(r.contains("restored") && r["restored"].is_object() && r["restored"].value("ready", true) == false)) {
+					if (g_unrestored.empty()) g_unrestored = step.name;
+					logger::info("selftest: {} did not restore its baseline; later results carry after_unrestored", step.name);
+				} else if (!g_unrestored.empty()) {
+					// Later steps still run (their coverage is kept) but may stand on that step's leftovers: say so.
+					r["after_unrestored"] = g_unrestored;
+				}
 				Record(step.name, std::move(r));
 				g_ctx = json::object();
 				g_stepActive = false;
+				g_keepOpen.clear(); g_closeOnOpen.clear();   // the next step starts with every stray menu closed on open
 				++g_index;
 			}
 			logger::info("selftest: suite {} ({} failed)", g_failed ? "failed" : "passed", g_failed);
 			{
 				auto* player = RE::PlayerCharacter::GetSingleton();
 				auto* av = player->AsActorValueOwner();
-				logger::info("selftest: her Skyrim level {}, Destruction {}, Restoration {}, Alteration {}, One-handed {}, Two-handed {}",
+				logger::info("selftest: their Skyrim level {}, Destruction {}, Restoration {}, Alteration {}, One-handed {}, Two-handed {}",
 					player->GetLevel(), av->GetBaseActorValue(RE::ActorValue::kDestruction), av->GetBaseActorValue(RE::ActorValue::kRestoration),
 					av->GetBaseActorValue(RE::ActorValue::kAlteration), av->GetBaseActorValue(RE::ActorValue::kOneHanded),
 					av->GetBaseActorValue(RE::ActorValue::kTwoHanded));
@@ -12468,7 +20936,7 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                             SKSE::GetTaskInterface()->AddTask([name] { RE::BGSSaveLoadManager::GetSingleton()->Load(name.c_str()); });
                         }
                     } else {
-					SKSE::GetTaskInterface()->AddTask([] { Console::Execute("coc " + Config::Get().testCell); });
+					SKSE::GetTaskInterface()->AddTask([] { TravelCell("coc " + Config::Get().testCell); });
                     }
 				} else if (a_event->menuName == RE::MessageBoxMenu::MENU_NAME) {
                     if (g_allowStartDialog) {
@@ -12476,11 +20944,29 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                         SKSE::GetTaskInterface()->AddUITask([choice] {
                             if (!g_allowStartDialog || g_startDialogChoice!=choice) return;
                             const auto* data=RE::MessageBoxMenu::GetCurrentMessageBoxData();
-                            if (!data || !std::string_view(data->bodyText.c_str()).starts_with("WoWBridge: Night Elf Druid") ||
-                                data->buttonText.size()!=3 || std::string_view(data->buttonText[0].c_str())!="Female" ||
-                                std::string_view(data->buttonText[1].c_str())!="Male" || std::string_view(data->buttonText[2].c_str())!="Cancel") return;
-                            RE::MessageBoxMenu::SelectOption(choice==0?2:choice==1?1:0);
-                            g_startDialogAnswered=choice;
+                            if (!data || data->buttonText.size()!=3) return;
+                            const std::string_view message=data->bodyText.c_str();
+                            if (message=="WoWBridge: choose a class") {
+                                RE::MessageBoxMenu::SelectOption(choice==0 ? 2 : g_startDialogClass==11 ? 0 : 1);
+                                if (choice==0) g_startDialogAnswered=choice;
+                            } else if (message=="WoWBridge: choose a race") {
+                                RE::MessageBoxMenu::SelectOption(choice==0 ? static_cast<std::uint32_t>(data->buttonText.size()-1) :
+                                    g_startDialogRace==4 || g_startDialogRace==1 ? 0 : 1);
+                                if (choice==0) g_startDialogAnswered=choice;
+                            } else if (message.starts_with("WoWBridge\n\n") &&
+                                std::string_view(data->buttonText[0].c_str())=="Female" && std::string_view(data->buttonText[1].c_str())=="Male") {
+                                RE::MessageBoxMenu::SelectOption(choice==1 ? 1 : 0);
+                                g_startDialogAnswered=choice;
+                            }
+                        });
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
+                    if (g_restorePanelHelpers && Console::Snapshot().value("command","")=="levelup" && Console::Snapshot().value("pending",false)) {
+                        SKSE::GetTaskInterface()->AddUITask([] {
+                            const auto* data=RE::MessageBoxMenu::GetCurrentMessageBoxData();
+                            const REL::Relocation<std::uintptr_t> expected{RE::VTABLE___ConfirmLevelUpAttributeCallback[0]};
+                            if (data && data->callback && *reinterpret_cast<const std::uintptr_t*>(data->callback.get())==expected.address()) return;
+                            RE::UIMessageQueue::GetSingleton()->AddMessage(RE::MessageBoxMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kForceHide,nullptr);
                         });
                         return RE::BSEventNotifyControl::kContinue;
                     }
@@ -12516,7 +21002,7 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
             const auto menu=RE::UI::GetSingleton()->GetMenu<RE::BarterMenu>();
             if (!menu || !menu->uiMovie) return;
             auto* player=RE::PlayerCharacter::GetSingleton();
-            auto* sword=RE::TESForm::LookupByID<RE::TESBoundObject>(0x12EB7);
+            auto* sword=p.item ? p.item : RE::TESForm::LookupByID<RE::TESBoundObject>(0x12EB7);
             auto& data=menu->GetRuntimeData();
             if (!data.itemList || data.itemList->updatePending || now-p.changed<std::chrono::milliseconds(400)) return;
             auto advance=[&](int stage) { p.stage=stage; p.changed=now; };
@@ -12562,9 +21048,25 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                 p.result["movie_visible"]=menu->uiMovie->GetVisible();
                 p.result["rows"]=data.itemList->items.size();
                 p.result["no_client_merchant"]=WowUi::Eval("not __WB.merchant and not MerchantFrame:IsVisible() and 1 or 0")=="1";
+                if (p.panelHelpers) {
+                    const auto target=RE::BarterMenu::GetTargetRefHandle();
+                    auto actor=RE::Actor::LookupByHandle(target);
+                    auto* faction=actor ? actor->GetVendorFaction() : nullptr;
+                    auto* chest=faction ? faction->vendorData.merchantContainer : nullptr;
+                    p.result["target"]=actor ? actor->GetFormID() : 0;
+                    p.result["chest"]=chest ? chest->GetFormID() : 0;
+                    p.result["stock"]=json::array();
+                    for (auto* item : data.itemList->items) if (item && item->data.objDesc && item->data.objDesc->object && item->data.objDesc->countDelta>0)
+                        p.result["stock"].push_back({{"form",item->data.objDesc->object->GetFormID()},{"count",item->data.objDesc->countDelta}});
+                    const auto inventory=chest ? chest->GetInventoryCounts() : RE::TESObjectREFR::InventoryCountMap{};
+                    const auto it=inventory.find(sword);
+                    p.result["stocked"]=chest && it!=inventory.end() && it->second>=(p.item ? 1 : 5) && !p.result["stock"].empty();
+                    advance(1); return;
+                }
                 p.sequence=Snap("wow_native_merchant"); advance(1); return;
             }
             if (p.stage==1) {
+                if (p.panelHelpers) { if (trade(true)) advance(3); return; }
                 if (!acked()) return;
                 Input::ResetStats(); p.sequence=Action("key:down"); advance(2); return;
             }
@@ -12578,6 +21080,12 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                 if (player->GetItemCount(sword)!=p.count+1 || data.playerGold!=player->GetGoldAmount()) return;
                 p.result["buy"]=player->GetGoldAmount()==p.playerGold-p.buyPrice && data.merchantGold==p.vendorGold+p.buyPrice;
                 p.result["buy_price"]=p.buyPrice;
+                if (p.buyOnly) {
+                    p.result["pass"]=p.result["native_flags"]==true && p.result["stocked"]==true && p.result["buy"]==true;
+                    p.done=true;
+                    RE::UIMessageQueue::GetSingleton()->AddMessage(RE::BarterMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kHide,nullptr);
+                    return;
+                }
                 if (trade(false)) advance(4);
                 return;
             }
@@ -12585,6 +21093,13 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
                 if (player->GetItemCount(sword)!=p.count-1 || data.playerGold!=player->GetGoldAmount()) return;
                 p.result["sell"]=player->GetGoldAmount()==p.playerGold+p.sellPrice && data.merchantGold==p.vendorGold-p.sellPrice;
                 p.result["sell_price"]=p.sellPrice;
+                if (p.panelHelpers) {
+                    p.result["pass"]=p.result["native_flags"]==true && p.result["movie_visible"]==true &&
+                        p.result["no_client_merchant"]==true && p.result["stocked"]==true && p.result["buy"]==true && p.result["sell"]==true;
+                    p.done=true;
+                    RE::UIMessageQueue::GetSingleton()->AddMessage(RE::BarterMenu::MENU_NAME,RE::UI_MESSAGE_TYPE::kHide,nullptr);
+                    return;
+                }
                 p.sequence=Snap("wow_native_merchant_after_trade"); advance(5); return;
             }
             if (p.stage==5) {
@@ -12701,6 +21216,14 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 		}
 	}
 
+	bool WantFrontView() { return g_wantFrontView.load() && PlayerWeapons::FrontViewEnabled(); }
+
+	void ClaimMenu(std::string_view a_menu, bool a_claim)
+	{
+		auto& n = g_menuClaims[std::string(a_menu)];
+		n = std::max(0, n + (a_claim ? 1 : -1));
+	}
+
 	void OnDataLoaded()
 	{
 		if (!Config::Get().autorun) {
@@ -12727,6 +21250,6 @@ return 1 end)())", spell, LuaQuote(mount), LuaQuote(binding), extra ? "1" : "nil
 		}
 		static MenuSink sink;
 		RE::UI::GetSingleton()->AddEventSink<RE::MenuOpenCloseEvent>(&sink);
-		Frame::Until(RunSuite);
+		Frame::Until("selftest", RunSuite);
 	}
 }

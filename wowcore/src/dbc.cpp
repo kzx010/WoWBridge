@@ -7,6 +7,24 @@
 #include <cstring>
 
 namespace wowcore {
+std::optional<HelmetVisibility> helmetVisibility(const Dbc& displays, const Dbc& visibility,
+    uint32_t displayId, uint32_t race, uint32_t sex) {
+    if (race < 1 || race > 8 || sex > 1 || displays.cols() < 14 || visibility.cols() != 6) return std::nullopt;
+    const auto display = displays.rowOf(displayId);
+    if (!display) return std::nullopt;
+    HelmetVisibility out;
+    out.id = displays.u32(*display, 12 + sex);
+    if (!out.id) return out;
+    const auto row = visibility.rowOf(out.id);
+    if (!row) return std::nullopt;
+    // WoWDBDefs via data/dbc.py: ID, HideGeoset[5] = hair, facial hair 1/2/3, ears.
+    const uint32_t bit = 1u << race;
+    out.hair = (visibility.u32(*row, 1) & bit) != 0;
+    out.facialHair = ((visibility.u32(*row, 2) | visibility.u32(*row, 3) | visibility.u32(*row, 4)) & bit) != 0;
+    out.ears = (visibility.u32(*row, 5) & bit) != 0;
+    return out;
+}
+
 namespace {
 uint32_t le32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
@@ -19,7 +37,9 @@ constexpr uint32_t Reagent = 42, ReagentCount = 50, School = 1, DispelType = 4, 
                    EffectChainTargets = 100, EffectMiscValue = 106, ManaCostPct = 156, EffectChainAmplitude = 167, CastingTimeIndex = 18,
                    RecoveryTime = 19, CategoryRecoveryTime = 20, DurationIndex = 30, PowerType = 31, ManaCost = 32,
                    RangeIndex = 36, Speed = 37, SpellVisual = 115, SpellIconID = 117, Name = 120, NameSubtext = 129, Description = 138,
-                   AuraDescription = 147, StartRecoveryTime = 158, ImplicitTargetA = 82;
+                   AuraDescription = 147, StartRecoveryTime = 158, ImplicitTargetA = 82,
+                   StackAmount = 39, EffectMultipleValue = 97, EffectPointsPerComboPoint = 112, MaxTargetLevel = 159,
+                   MaxAffectedTargets = 163;   // CMaNGOS DBCStructure.h SpellEntry
 }
 namespace skillLineAbility { constexpr uint32_t SkillLine = 1, Spell = 2; }
 namespace skillLine { constexpr uint32_t CategoryID = 1, DisplayName = 3, SpellIconID = 21; }
@@ -95,6 +115,15 @@ ClientDb::ClientDb(const Mpq& mpq) {
     creatureDisplays_ = t("CreatureDisplayInfo.dbc");
     creatureModels_ = t("CreatureModelData.dbc");
     creatureSounds_ = t("CreatureSoundData.dbc");
+    emotesText_ = t("EmotesText.dbc");
+    emotes_ = t("Emotes.dbc");
+    emotesTextData_ = t("EmotesTextData.dbc");
+    emotesTextSound_ = t("EmotesTextSound.dbc");
+    if (emotesText_) for (uint32_t r = 0; r < emotesText_->rows(); ++r) {
+        std::string token = emotesText_->str(r, 1);
+        for (auto& c : token) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        emoteTokens_.emplace(token, r);
+    }
     if (sounds_) {
         // ID, SoundType, Name, File[10], Freq[10], DirectoryBase, Volume, Flags, MinDistance, DistanceCutoff, EAXDef
         for (uint32_t r = 0; r < sounds_->rows(); ++r) {
@@ -134,6 +163,35 @@ const SoundInfo* ClientDb::sound(std::string_view name) const {
     std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     const auto it = soundNames_.find(key);
     return it == soundNames_.end() ? nullptr : sound(it->second);
+}
+
+std::optional<EmoteText> ClientDb::emote(std::string_view token, uint32_t race, uint32_t sex) const {
+    std::string key(token);
+    for (auto& c : key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    const auto it = emoteTokens_.find(key);
+    if (it == emoteTokens_.end()) return std::nullopt;
+    // EmotesText: ID, Name, EmoteID, EmoteText[16] (EmotesTextData ids; 2: theirs at a target, 6: theirs alone).
+    // Emotes: ID, EmoteSlashCommand, AnimID, EmoteFlags, EmoteSpecProc, ... EmotesTextSound: ID, text, race, sex, sound.
+    EmoteText out;
+    out.id = emotesText_->u32(it->second, 0);
+    const auto text = [&](uint32_t index) {
+        const auto row = emotesTextData_ ? emotesTextData_->rowOf(emotesText_->u32(it->second, 3 + index)) : std::nullopt;
+        return row ? std::string(emotesTextData_->str(*row, 1)) : std::string();
+    };
+    out.atTarget = text(2);
+    out.alone = text(6);
+    if (const auto row = emotes_ ? emotes_->rowOf(emotesText_->u32(it->second, 2)) : std::nullopt) {
+        out.anim = emotes_->u32(*row, 2);
+        out.specProc = emotes_->u32(*row, 4);
+        out.standState = emotes_->u32(*row, 5);
+    }
+    if (emotesTextSound_) for (uint32_t r = 0; r < emotesTextSound_->rows(); ++r) {
+        if (emotesTextSound_->u32(r, 1) == out.id && emotesTextSound_->u32(r, 2) == race && emotesTextSound_->u32(r, 3) == sex) {
+            out.sound = emotesTextSound_->u32(r, 4);
+            break;
+        }
+    }
+    return out;
 }
 
 std::optional<LevelUpEffect> ClientDb::levelUpEffect() const {
@@ -314,6 +372,9 @@ const SpellInfo* ClientDb::spell(uint32_t id) const {
     i.baseLevel = s.u32(*r, spell::BaseLevel);
     i.spellLevel = s.u32(*r, spell::SpellLevel);
     i.manaCostPct = s.u32(*r, spell::ManaCostPct);
+    i.stackAmount = s.u32(*r, spell::StackAmount);
+    i.maxTargetLevel = s.u32(*r, spell::MaxTargetLevel);
+    i.maxTargets = s.u32(*r, spell::MaxAffectedTargets);
     for (uint32_t e = 0; e < 3; ++e) {
         SpellEffect& f = i.effects[e];
         f.effect = s.u32(*r, spell::Effect + e);
@@ -326,6 +387,8 @@ const SpellInfo* ClientDb::spell(uint32_t id) const {
         f.chainTargets = s.u32(*r, spell::EffectChainTargets + e);
         f.chainAmplitude = s.f32(*r, spell::EffectChainAmplitude + e);
         f.misc = s.i32(*r, spell::EffectMiscValue + e);
+        f.multiple = s.f32(*r, spell::EffectMultipleValue + e);
+        f.comboPoints = s.f32(*r, spell::EffectPointsPerComboPoint + e);
         if (const auto g = radius_->rowOf(s.u32(*r, spell::EffectRadiusIndex + e))) f.radius = radius_->f32(*g, 1);
     }
     for (uint32_t k = 0; k < 8; ++k)

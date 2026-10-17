@@ -1,4 +1,5 @@
 #include "Integration.h"
+#include "Distribution.h"
 #include "RE/S/SendHUDMessage.h"
 #include "Avatar.h"
 #include "Bridge.h"
@@ -7,6 +8,8 @@
 #include "Gear.h"
 #include "Input.h"
 #include "LuaText.h"
+#include "wowcore/dbc.hpp"
+#include "wowcore/mpq.hpp"
 #include "ui/WowUi.h"
 
 namespace Integration
@@ -16,12 +19,22 @@ namespace Integration
         State g_state;
         std::atomic<bool> g_pumpQueued = false;
         std::atomic<bool> g_active = true;
+        std::atomic<bool> g_chooseClass = false;
         std::atomic<std::uint64_t> g_epoch = 0;
-        enum class Step { None, Offer, Sex, Name };
+        enum class Step { None, Offer, Class, Race, Sex, Name };
         Step g_next = Step::None;
         bool g_box = false, g_creator = false;
         bool g_waitingForControls = false;
+        std::uint64_t g_customizeShown = 0; // the interface generation the customization window last opened in
         std::string g_name;
+        std::uint32_t g_class = 11, g_race = 4;
+
+        const wowcore::CharacterClass* SelectedClass()
+        {
+            const auto& classes = Character::Classes();
+            const auto c = std::ranges::find(classes,g_class,&wowcore::CharacterClass::id);
+            return c == classes.end() ? nullptr : &*c;
+        }
 
         void SetActive(bool active)
         {
@@ -39,11 +52,15 @@ namespace Integration
         {
             ++g_epoch; // late native callbacks belong to the old save
             g_state.Load(mode);
+            UpdateClassChoice();
             g_next = Step::None;
             g_box = g_creator = false;
             g_waitingForControls = false; // only a successful post-load may activate the restored player
             g_name.clear();
+            g_class = Character::Get().classId; g_race = Character::Looks().race;
             SetActive(false);
+            g_customizeShown = 0;
+            WowUi::Run("__WBCustomizeClose()"); // a window opened for the old game owes it nothing
             logger::info("integration: reset to mode {}", static_cast<std::uint32_t>(mode));
         }
         class Callback final : public RE::IMessageBoxCallback
@@ -58,18 +75,29 @@ namespace Integration
                     auto* ui = RE::UI::GetSingleton();
                     if (g_creator && (!ui || !ui->IsMenuOpen(RE::RaceSexMenu::MENU_NAME))) return;
                     if (step == Step::Offer) {
-                        if (button == 0) g_next = Step::Sex;
-                        else if (button == 1) g_state.ChooseSkyrim();
+                        if (button == 0) g_next = CanChooseClass() ? Step::Class : Step::Race;
+                        else if (button == 1) { g_state.ChooseSkyrim(); Character::OfferCustomization(false); }
+                    } else if (step == Step::Class) {
+                        if (button <= 1 && CanChooseClass()) { g_class = button == 0 ? 11 : 2; g_next = Step::Race; }
+                        else if (ClassBack(g_state.mode,g_creator)) g_next = Step::Offer;
+                    } else if (step == Step::Race) {
+                        const auto* c = SelectedClass();
+                        if (c && button < c->races.size()) { g_race = c->races[button]; g_next = Step::Sex; }
+                        else if (CanChooseClass()) g_next = Step::Class;
                     } else if (step == Step::Sex) {
                         if (button <= 1 && g_state.ChooseSex(button == 0 ? 1 : 0)) {
-                            if (!Character::SetSex(*g_state.selectedSex)) {
+                            if (!Character::SetIdentity(g_class,g_race,*g_state.selectedSex)) {
                                 g_state.selectedSex.reset(); g_next = Step::Sex;
-                                RE::SendHUDMessage::ShowHUDMessage("That WoWBridge preset is unavailable. Choose another preset.");
+                                RE::SendHUDMessage::ShowHUDMessage("That WoWBridge body is unavailable. Choose another.");
                                 return;
-                            } // co-save the preset while Skyrim's opening keeps controls disabled
+                            }
+                            Distribution::SetClass(g_class);   // their class's books roll from now on // co-save the preset while Skyrim's opening keeps controls disabled
+                            // Choosing WoWBridge (not another body for a WoWBridge save) offers WoW's character
+                            // customization once the interface is up; the save keeps the offer until it is answered.
+                            if (g_state.mode != Mode::WoW) Character::OfferCustomization(true);
                             if (g_creator) g_next = Step::Name;
-                            else { g_state.Finish(); g_waitingForControls = true; }
-                        } else if (g_creator && g_state.mode != Mode::WoW) g_next = Step::Offer;
+                            else { g_state.Finish(); UpdateClassChoice(); g_waitingForControls = true; }
+                        } else g_next = Step::Race;
                     }
                 });
             }
@@ -82,14 +110,41 @@ namespace Integration
             RE::BSString message;
             RE::BSTArray<RE::BSString> buttons;
             if (step == Step::Offer) {
-                message = "Play this character with WoWBridge?\n\nWoWBridge uses a night elf druid, WoW spells and the WoW interface. You will choose a preset and a name, then continue Skyrim's opening story.\n\nYou can also start later with the console command: wb start";
+                message = "Play this character with WoWBridge?\n\nWoWBridge plays Skyrim with the WoW interface. Choose a class (Druid or Paladin), one of its races (Druid: Night Elf or Tauren; Paladin: Human or Dwarf), female or male, and a name. Skin, face and hair follow in WoW's character customization once Skyrim's opening returns control to you.\n\nYou can also start later with the console command: wb start";
                 buttons.push_back("Play WoWBridge");
                 buttons.push_back("Use Skyrim character creation");
+            } else if (step == Step::Class) {
+                message = "WoWBridge: choose a class";
+                for (const auto id : {11u,2u}) {
+                    const auto& classes = Character::Classes();
+                    const auto c = std::ranges::find(classes,id,&wowcore::CharacterClass::id);
+                    if (c == classes.end()) return false;
+                    buttons.push_back(c->name.c_str());
+                }
+                buttons.push_back(ClassBack(g_state.mode,g_creator) ? "Back" : "Cancel");
+            } else if (step == Step::Race) {
+                message = "WoWBridge: choose a race";
+                // Names from ChrRaces, also used by the embedded creation screen.
+                const wowcore::Mpq mpq(Config::ClientData());
+                const auto races = wowcore::Dbc::load(mpq,R"(DBFilesClient\ChrRaces.dbc)");
+                if (!races) return false;
+                const auto* c = SelectedClass();
+                if (!c) return false;
+                for (const auto race : c->races) {
+                    const auto row = races->rowOf(race);
+                    if (!row) return false;
+                    buttons.push_back(races->str(*row,17));
+                }
+                buttons.push_back(CanChooseClass() ? "Back" : "Cancel");
             } else {
-                const auto text = "WoWBridge: Night Elf Druid\n\nChoose an appearance preset. Your character's name will also appear in the WoW interface.\n\n" +
-                    (g_creator ? std::string("Enter a name on the next screen. Dragonborn is the default.") : "Name: " + PlayerName());
+                // Before WoWBridge has started, customization follows; for a WoWBridge save, a new body takes its preset look.
+                const std::string body = g_state.mode != Mode::WoW ?
+                    "Choose female or male. You will customize skin, face and hair in the WoW interface." :
+                    "Choose female or male. The other body starts from its preset look; to change skin, face or hair, use the console command: wb appearance";
+                const auto text = std::string("WoWBridge\n\n") + body + "\n\n" +
+                    (g_creator ? std::string("Enter a name on the next screen (Dragonborn by default); the WoW interface shows it too.") : "Name: " + PlayerName());
                 message = text.c_str();
-                buttons.push_back("Female"); buttons.push_back("Male"); buttons.push_back(g_creator && g_state.mode != Mode::WoW ? "Back" : "Cancel");
+                buttons.push_back("Female"); buttons.push_back("Male"); buttons.push_back("Back");
             }
             RE::BSTSmartPointer<RE::IMessageBoxCallback> callback(new Callback(step, g_epoch));
             return RE::MessageBoxMenu::Create(message, callback, 0, 0, 4, buttons);
@@ -161,10 +216,11 @@ namespace Integration
                     } else {
                         if (g_creator && g_state.Finish()) {
                             g_waitingForControls = true;
-                            RE::SendHUDMessage::ShowHUDMessage("WoWBridge selected. It will start when Skyrim returns control to you.");
+                            RE::SendHUDMessage::ShowHUDMessage("WoWBridge selected. It starts, with WoW character customization, when Skyrim returns control to you.");
                         } else if (g_state.mode == Mode::Intro) {
                             g_state.ChooseSkyrim(); // creator was completed before accepting our popup
                         }
+                        UpdateClassChoice();
                         ++g_epoch; // a dismissed creator invalidates any unanswered popup callback
                         g_creator = false; g_next = Step::None; g_box = false;
                     }
@@ -181,6 +237,8 @@ namespace Integration
         CreatorUpdate::func = table.write_vfunc(5, CreatorUpdate::thunk);
     }
     bool Active() { return g_active; }
+    bool CanChooseClass() { return g_chooseClass.load(); }
+    void UpdateClassChoice() { g_chooseClass = CanChooseClass(g_state.mode,Character::CustomizationOffered()); }
     std::string PlayerName()
     {
         const auto* player = RE::PlayerCharacter::GetSingleton();
@@ -206,7 +264,8 @@ namespace Integration
             return true;
         }
         if (!g_state.Offer(g_creator, true)) return false;
-        g_next = g_creator && g_state.mode != Mode::WoW ? Step::Offer : Step::Sex;
+        g_class = Character::Get().classId; g_race = Character::Looks().race;
+        g_next = g_creator && g_state.mode != Mode::WoW ? Step::Offer : CanChooseClass() ? Step::Class : Step::Race;
         logger::info("integration: manual setup requested (creator={})", g_creator);
         return true;
     }
@@ -237,8 +296,15 @@ namespace Integration
             SetActive(true);
             if (sex) Character::SetSex(*sex);
             else Character::OnGameLoaded();
-            Gear::OnGameLoaded();
+            Gear::OnGameLoaded();   // their worn gear read again (the Druid's starter kit is given only to a Druid)
             logger::info("integration: active as {}", PlayerName());
+        }
+        // WoW's character customization once the interface is up, after WoWBridge was chosen; again in a fresh
+        // interface (ReloadUI, another profile) while it is unanswered.
+        if (Active() && WowUi::Ready() && Character::CustomizationOffered() && g_customizeShown != WowUi::Generation()) {
+            g_customizeShown = WowUi::Generation();
+            WowUi::Run("__WBCustomizeAppearance()");
+            logger::info("integration: character customization offered");
         }
         if (Active()) {
             const auto name = PlayerName();
@@ -258,8 +324,9 @@ namespace Integration
         std::uint32_t mode = 0;
         if (version != kRecordVersion || length != sizeof(mode) || intfc->ReadRecordData(mode) != sizeof(mode) || !State::Valid(mode)) {
             logger::warn("integration: invalid saved mode; using Skyrim until wb start");
-            g_state.Load(Mode::Skyrim); return;
+            g_state.Load(Mode::Skyrim); UpdateClassChoice(); return;
         }
         g_state.Load(static_cast<Mode>(mode));
+        UpdateClassChoice();
     }
 }

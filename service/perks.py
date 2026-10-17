@@ -140,7 +140,7 @@ class Perks:
         from service.skyrim import melee_skill
         white_skill = 'one_handed' if ch.form in ('cat', 'bear', 'dire_bear') else (
             'two_handed' if melee_skill(self.cat, ch) == 'TwoHanded' else 'one_handed')
-        mods = list(ch.mods)
+        mods = F.SpellMods(ch.mods, getattr(ch.mods, 'family', F.SPELLFAMILY_DRUID))
         for rule, rank, key in self.selected(taken):
             if rule.get('condition') == 'unarmored' and caster.get('wearing_armor', True):
                 continue  # missing equipment state never grants Mage Armor

@@ -1,6 +1,7 @@
 #include "wowcore/minimap.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cctype>
 #include <limits>
@@ -183,6 +184,79 @@ std::optional<MinimapPoiPlacement> minimapPoi(const MinimapView& view, MapPoint 
                                true, std::atan2(d->x, d->y)};
 }
 
+namespace {
+// The inscribed 64-sided mask's corners, once.
+const std::array<MapPoint, 64>& rim() {
+    static const auto points = [] {
+        std::array<MapPoint, 64> p;
+        for (int i = 0; i < 64; ++i) p[i] = {std::cos(i * 2 * std::numbers::pi / 64), std::sin(i * 2 * std::numbers::pi / 64)};
+        return p;
+    }();
+    return points;
+}
+
+// A convex polygon clipped to the inscribed 64-sided mask; untouched when it lies inside the mask's inner circle.
+std::vector<MapPoint> clipToDisc(std::vector<MapPoint> polygon) {
+    static const double inner = std::cos(std::numbers::pi / 64);
+    if (std::ranges::all_of(polygon, [](MapPoint p) { return p.x * p.x + p.y * p.y <= inner * inner; })) return polygon;
+    for (int edge = 0; edge < 64 && !polygon.empty(); ++edge) {
+        const MapPoint from = rim()[edge], to = rim()[(edge + 1) % 64];
+        const auto distance = [&](MapPoint p) { return (to.x - from.x) * (p.y - from.y) - (to.y - from.y) * (p.x - from.x); };
+        std::vector<MapPoint> clipped;
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            const auto p = polygon[i], q = polygon[(i + 1) % polygon.size()];
+            const double dp = distance(p), dq = distance(q);
+            if (dp >= 0) clipped.push_back(p);
+            if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
+                const double t = dp / (dp - dq);
+                clipped.push_back({p.x + t * (q.x - p.x), p.y + t * (q.y - p.y)});
+            }
+        }
+        polygon = std::move(clipped);
+    }
+    return polygon;
+}
+
+void fan(const std::vector<MapPoint>& polygon, std::vector<MapPoint>& out) {
+    for (size_t i = 1; i + 1 < polygon.size(); ++i) {
+        out.push_back(polygon[0]); out.push_back(polygon[i]); out.push_back(polygon[i + 1]);
+    }
+}
+}
+
+std::vector<MapPoint> minimapDiscTriangles() {
+    std::vector<MapPoint> out;
+    fan({rim().begin(), rim().end()}, out);
+    return out;
+}
+
+MinimapFloorMesh minimapFloorMesh(const MinimapView& v, const std::vector<MinimapFloorTriangle>& floor, double z,
+                                  double wallHalfWidth) {
+    MinimapFloorMesh mesh;
+    if (!valid(v) || !std::isfinite(z) || !std::isfinite(wallHalfWidth) || wallHalfWidth < 0) return mesh;
+    for (const auto& t : floor) {
+        if (!std::isfinite(t.z) || std::abs(t.z - z) > 3 + std::max(t.rise, 0.0)) continue;   // another storey
+        const auto a = minimapProject(v, t.a), b = minimapProject(v, t.b), c = minimapProject(v, t.c);
+        if (!a || !b || !c) continue;
+        if (std::min({a->x, b->x, c->x}) > 1 || std::max({a->x, b->x, c->x}) < -1 ||
+            std::min({a->y, b->y, c->y}) > 1 || std::max({a->y, b->y, c->y}) < -1) continue;
+        // Counter-clockwise, as the clipper keeps the inside of each rim edge.
+        const bool ccw = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x) >= 0;
+        fan(clipToDisc(ccw ? std::vector<MapPoint>{*a, *b, *c} : std::vector<MapPoint>{*a, *c, *b}), mesh.floor);
+        const std::array<MapPoint, 3> corner = {*a, *b, *c};
+        for (int e = 0; e < 3; ++e) {
+            if (!(t.walls & (1u << e)) || wallHalfWidth <= 0) continue;
+            const auto p = corner[e], q = corner[(e + 1) % 3];
+            const double length = std::hypot(q.x - p.x, q.y - p.y);
+            if (length <= 0) continue;
+            const MapPoint n{-(q.y - p.y) / length * wallHalfWidth, (q.x - p.x) / length * wallHalfWidth};
+            fan(clipToDisc({{p.x - n.x, p.y - n.y}, {q.x - n.x, q.y - n.y}, {q.x + n.x, q.y + n.y}, {p.x + n.x, p.y + n.y}}),
+                mesh.walls);
+        }
+    }
+    return mesh;
+}
+
 std::vector<MinimapVertex> minimapGlyphTriangles(MapPoint centre, MapPoint half, MapPoint uvLow, MapPoint uvHigh,
                                                double heading) {
     if (!minimapContains(centre) || !finite(half) || half.x <= 0 || half.y <= 0 ||
@@ -197,22 +271,7 @@ std::vector<MinimapVertex> minimapGlyphTriangles(MapPoint centre, MapPoint half,
     }
     // Same inscribed 64-sided mask as terrain. Clip the glyph, rather than
     // hiding in-range units whose glyph touches the rim.
-    for (int edge = 0; edge < 64 && !polygon.empty(); ++edge) {
-        const double a = edge * 2 * std::numbers::pi / 64, b = (edge + 1) * 2 * std::numbers::pi / 64;
-        const MapPoint from{std::cos(a), std::sin(a)}, to{std::cos(b), std::sin(b)};
-        const auto distance = [&](MapPoint p) { return (to.x - from.x) * (p.y - from.y) - (to.y - from.y) * (p.x - from.x); };
-        std::vector<MapPoint> clipped;
-        for (size_t i = 0; i < polygon.size(); ++i) {
-            const auto p = polygon[i], q = polygon[(i + 1) % polygon.size()];
-            const double dp = distance(p), dq = distance(q);
-            if (dp >= 0) clipped.push_back(p);
-            if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
-                const double t = dp / (dp - dq);
-                clipped.push_back({p.x + t * (q.x - p.x), p.y + t * (q.y - p.y)});
-            }
-        }
-        polygon = std::move(clipped);
-    }
+    polygon = clipToDisc(std::move(polygon));
     std::vector<MinimapVertex> result;
     const auto vertex = [&](MapPoint p) {
         const double x = p.x - centre.x, y = p.y - centre.y;

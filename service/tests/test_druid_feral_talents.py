@@ -6,6 +6,7 @@ wow_talents_feral; these tests do not claim to execute native actor effects.
 """
 import unittest
 
+from service import formulas as F
 from data import dbc
 from data.build_catalog import DBC_DIR
 from service.catalog import Catalog
@@ -122,7 +123,9 @@ class DruidFeralTalents(unittest.TestCase):
             self.assertEqual((out['cost'], out['power'], out['cooldown_ms']), (5, 'rage', 15000))
             self.assertEqual(out['events'][0]['type'], 'charge')
             self.assertEqual(next(e for e in out['events'] if e['type'] == 'interrupt')['school_lockout_ms'], 4000)
-            self.assertEqual(next(a for a in out['auras'] if a['type'] == 'root')['duration_ms'], 4000)
+            root = next(a for a in out['auras'] if a['type'] == 'root')
+            self.assertEqual(root['duration_ms'], 4000)
+            self.assertFalse(root['single_target'])   # Feral Charge Effect: no mechanic, no family flags
         for form in ('cat', 'none'):
             with self.assertRaisesRegex(Exception, 'SHAPESHIFT'):
                 self.cast(804, 1, 16979, form=form, target={**TARGET, 'distance_yd': 10})
@@ -204,12 +207,18 @@ class DruidFeralTalents(unittest.TestCase):
             base = self.cast(805, 0, spell, form=form)
             for rank in self.each(805):
                 out = self.cast(805, rank, spell, form=form)
-                self.assertGreater(out['tooltip']['effects'][0][0], base['tooltip']['effects'][0][0])
                 if spell == 9881:
+                    # The queued flat bonus precedes Savage Fury; the actual
+                    # swing below applies its damage modifier to the whole hit.
+                    self.assertEqual(out['tooltip']['effects'][0], [out['events'][0]['bonus_damage']] * 2)
+                    native = self.cast(805, rank, spell, form=form, skyrim={})
+                    self.assertEqual(native['events'][0]['bonus_damage'],
+                                     round(native['tooltip']['effects'][0][0] * native['tooltip']['health_factor']))
                     out = self.swing(805, rank, form=form, next_swing=spell)
                     original = self.swing(805, 0, form=form, next_swing=spell)
                     amount, original_amount = out['damage'], original['damage']
                 else:
+                    self.assertGreater(out['tooltip']['effects'][0][0], base['tooltip']['effects'][0][0])
                     amount, original_amount = out['events'][0]['amount'], base['events'][0]['amount']
                 self.assertAlmostEqual(amount, original_amount * (1 + .1 * rank), delta=2)
                 if spell == 9904:
@@ -245,9 +254,9 @@ class DruidFeralTalents(unittest.TestCase):
             for form in ('none', 'cat', 'bear', 'dire_bear', 'travel'):
                 base = self.stats(808, 0, form=form)['stats']
                 stats = self.stats(808, rank, form=form)['stats']
-                self.assertEqual(stats['int'], int(base['int'] * (1 + .04 * rank)))
-                self.assertEqual(stats['str'], int(base['str'] * (1 + .04 * rank)) if form == 'cat' else base['str'])
-                self.assertEqual(stats['sta'], int(base['sta'] * (1 + .04 * rank)) if form in ('bear', 'dire_bear') else base['sta'])
+                self.assertEqual(stats['int'], F.stat_total(base['int'], 0, (), [4 * rank]))
+                self.assertEqual(stats['str'], F.stat_total(base['str'], 0, (), [4 * rank]) if form == 'cat' else base['str'])
+                self.assertEqual(stats['sta'], F.stat_total(base['sta'], 0, (), [4 * rank]) if form in ('bear', 'dire_bear') else base['sta'])
 
     def test_heart_native_stat_gains_with_october_10_equipment(self):
         # The native probe must measure the mapped Skyrim values rather than
